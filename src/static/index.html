@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>gptload-rs Admin</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; }
+    h1 { margin: 0 0 10px 0; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px; }
+    .card h2 { margin: 0 0 8px 0; font-size: 16px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left; font-size: 13px; }
+    th { background: #fafafa; position: sticky; top: 0; }
+    input, select, textarea, button { font-size: 14px; }
+    textarea { width: 100%; min-height: 180px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .muted { color: #666; font-size: 12px; }
+    .ok { color: #0a7; }
+    .bad { color: #c00; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .small { font-size: 12px; }
+    pre { background: #0b1020; color: #d7e3ff; padding: 10px; border-radius: 8px; overflow: auto; }
+    .btn { padding: 6px 10px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer; }
+    .btn:hover { background: #f6f6f6; }
+  </style>
+</head>
+<body>
+  <h1>gptload-rs Admin</h1>
+  <div class="muted">路径：<span class="mono">/admin</span> ｜ API：<span class="mono">/admin/api/v1</span></div>
+
+  <div class="row" style="margin-top: 14px;">
+    <div class="card" style="flex: 1; min-width: 320px;">
+      <h2>登录 / Token</h2>
+      <div class="muted">管理 API 需要 admin token（<span class="mono">X-Admin-Token</span> 或 <span class="mono">?token=</span>）。</div>
+      <div style="margin-top: 8px; display:flex; gap:8px;">
+        <input id="token" type="password" placeholder="输入 admin token" style="flex:1; padding:6px 8px;" />
+        <button class="btn" id="saveToken">保存</button>
+        <button class="btn" id="clearToken">清除</button>
+      </div>
+      <div id="authStatus" class="small muted" style="margin-top:8px;"></div>
+    </div>
+
+    <div class="card" style="flex: 2; min-width: 480px;">
+      <h2>实时 Stats</h2>
+      <div class="muted">每秒推送一次（SSE）。</div>
+      <pre id="stats" class="small"></pre>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top: 14px;">
+    <div class="card" style="flex: 2; min-width: 520px;">
+      <h2>请求统计</h2>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <select id="requestsWindow" style="padding:6px 8px;">
+          <option value="minute">最近 60 分钟</option>
+          <option value="hour">最近 48 小时</option>
+          <option value="day">最近 30 天</option>
+        </select>
+        <button class="btn" id="refreshRequestsChart">刷新</button>
+        <span id="requestsChartInfo" class="muted small"></span>
+      </div>
+      <canvas id="requestsChart" style="width:100%; height:180px; margin-top:8px;"></canvas>
+      <div class="muted small" style="margin-top:6px;">蓝线=总请求，绿线=成功(2xx)，灰线=失败。</div>
+    </div>
+
+    <div class="card" style="flex: 2; min-width: 520px;">
+      <h2>最近请求</h2>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button class="btn" id="refreshRequests">刷新</button>
+        <span id="requestsInfo" class="muted small"></span>
+      </div>
+      <div style="overflow:auto; max-height: 360px; margin-top: 8px;">
+        <table id="requestsTable">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>IP</th>
+              <th>模型</th>
+              <th>状态</th>
+              <th>耗时(ms)</th>
+              <th>Tokens</th>
+              <th>Bytes</th>
+              <th>Upstream</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top: 14px;">
+    <div class="card" style="flex: 1; min-width: 360px;">
+      <h2>计费 Keys</h2>
+      <div class="muted">请求必须带 <span class="mono">Authorization</span> 或 <span class="mono">X-Api-Key</span>。</div>
+      <div style="margin-top: 8px;">
+        <label class="small muted">Key</label><br/>
+        <input id="billingKey" type="text" placeholder="bk-..." style="width:100%; padding:6px 8px;" />
+      </div>
+      <div style="margin-top: 8px;">
+        <label class="small muted">初始余额</label><br/>
+        <input id="billingBalance" type="number" step="1" placeholder="0" style="width:100%; padding:6px 8px;" />
+      </div>
+      <div style="display:flex; gap:8px; margin-top: 8px; flex-wrap: wrap;">
+        <button class="btn" id="billingCreate">创建</button>
+        <button class="btn" id="billingQuery">查询余额</button>
+        <button class="btn" id="billingGenerate">生成随机</button>
+      </div>
+      <div style="margin-top: 8px;">
+        <label class="small muted">余额调整 (delta)</label><br/>
+        <input id="billingDelta" type="number" step="1" placeholder="-100" style="width:100%; padding:6px 8px;" />
+      </div>
+      <div style="display:flex; gap:8px; margin-top: 8px;">
+        <button class="btn" id="billingAdjust">变更余额</button>
+      </div>
+      <pre id="billingResult" class="small" style="margin-top:8px;"></pre>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top: 14px;">
+    <div class="card" style="flex: 2; min-width: 520px;">
+      <h2>Upstreams</h2>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button class="btn" id="refreshUpstreams">刷新</button>
+        <span id="upstreamsInfo" class="muted small"></span>
+      </div>
+      <div style="overflow:auto; max-height: 360px; margin-top: 8px;">
+        <table id="upstreamsTable">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Base URL</th>
+              <th>Weight</th>
+              <th>Keys</th>
+              <th>Cooldown(ms)</th>
+              <th>Selected</th>
+              <th>2xx</th>
+              <th>4xx</th>
+              <th>5xx</th>
+              <th>NetErr</th>
+              <th>Timeout</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card" style="flex: 1; min-width: 360px;">
+      <h2>Keys 管理</h2>
+      <div class="muted">支持 <b>批量粘贴</b>（每行一个 key）。推荐一次性粘贴/上传大量 keys，而不是频繁小批量。</div>
+
+      <div style="margin-top: 8px;">
+        <label class="small muted">Upstream</label><br/>
+        <select id="upstreamSelect" style="width:100%; padding:6px 8px;"></select>
+      </div>
+
+      <div style="margin-top: 8px; display:flex; gap:10px; align-items:center;">
+        <label><input type="radio" name="mode" value="add" checked /> Add</label>
+        <label><input type="radio" name="mode" value="replace" /> Replace</label>
+        <label><input type="radio" name="mode" value="delete" /> Delete</label>
+      </div>
+
+      <div style="margin-top: 8px;">
+        <textarea id="keysInput" placeholder="sk-xxx...\n每行一个"></textarea>
+      </div>
+
+      <div style="display:flex; gap:8px; margin-top: 8px;">
+        <button class="btn" id="submitKeys">提交</button>
+        <button class="btn" id="clearKeys">清空</button>
+      </div>
+
+      <pre id="keysResult" class="small" style="margin-top:8px;"></pre>
+    </div>
+
+    <div class="card" style="flex: 1; min-width: 360px;">
+      <h2>Upstream 管理</h2>
+      <div class="muted">增删改 upstream，不影响主业务请求路径。</div>
+      <div style="margin-top: 8px;">
+        <label class="small muted">已有 upstream</label><br/>
+        <select id="upstreamManageSelect" style="width:100%; padding:6px 8px;"></select>
+      </div>
+      <div style="margin-top: 8px;">
+        <label class="small muted">ID</label><br/>
+        <input id="upstreamId" type="text" placeholder="openai" style="width:100%; padding:6px 8px;" />
+      </div>
+      <div style="margin-top: 8px;">
+        <label class="small muted">Base URL</label><br/>
+        <input id="upstreamBaseUrl" type="text" placeholder="https://api.openai.com" style="width:100%; padding:6px 8px;" />
+      </div>
+      <div style="margin-top: 8px;">
+        <label class="small muted">Weight</label><br/>
+        <input id="upstreamWeight" type="number" min="1" step="1" placeholder="1" style="width:100%; padding:6px 8px;" />
+      </div>
+      <div style="display:flex; gap:8px; margin-top: 8px; flex-wrap: wrap;">
+        <button class="btn" id="addUpstream">新增</button>
+        <button class="btn" id="updateUpstream">更新</button>
+        <button class="btn" id="deleteUpstream">删除</button>
+        <label class="small muted" style="display:flex; align-items:center; gap:4px;">
+          <input type="checkbox" id="deleteUpstreamKeys" /> 删除 keys
+        </label>
+      </div>
+      <pre id="upstreamResult" class="small" style="margin-top:8px;"></pre>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top: 14px;">
+    <div class="card" style="flex: 2; min-width: 520px;">
+      <h2>模型路由</h2>
+      <div class="muted">只使用 <span class="mono">models_routes.json</span> 中的路由。未匹配模型会返回 404。</div>
+      <div style="display:flex; gap:8px; align-items:center; margin-top: 8px;">
+        <button class="btn" id="loadRoutes">加载路由</button>
+        <button class="btn" id="saveRoutes">保存路由</button>
+        <span id="routesInfo" class="muted small"></span>
+      </div>
+      <div style="margin-top: 8px;">
+        <textarea id="routesInput" placeholder='{"upstreams":{"openai":["gpt-4","gpt-3.5-turbo"]}}'></textarea>
+      </div>
+      <pre id="routesResult" class="small" style="margin-top:8px;"></pre>
+    </div>
+
+    <div class="card" style="flex: 1; min-width: 360px;">
+      <h2>模型发现</h2>
+      <div class="muted">只拉取模型列表，不会自动写入路由。</div>
+      <div style="margin-top: 8px;">
+        <label class="small muted">Upstream</label><br/>
+        <select id="modelUpstreamSelect" style="width:100%; padding:6px 8px;"></select>
+      </div>
+      <div style="display:flex; gap:8px; margin-top: 8px;">
+        <button class="btn" id="refreshModels">拉取 models</button>
+        <button class="btn" id="applyModels">应用到路由</button>
+        <button class="btn" id="selectAllModels">全选</button>
+        <button class="btn" id="selectNoneModels">全不选</button>
+      </div>
+      <div id="modelsInfo" class="muted small" style="margin-top:6px;"></div>
+      <div id="modelsList" style="margin-top:8px; max-height:260px; overflow:auto; border:1px solid #eee; border-radius:6px; padding:6px;"></div>
+    </div>
+  </div>
+
+<script src="/admin/app.js"></script>
+</body>
+</html>
