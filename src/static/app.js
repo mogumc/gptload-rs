@@ -94,13 +94,10 @@
     opts = opts || {};
     opts.headers = opts.headers || {};
     const t = getToken();
-    let url = path;
     if (t) {
       opts.headers['X-Admin-Token'] = t;
-      const sep = path.includes('?') ? '&' : '?';
-      url = `${path}${sep}token=${encodeURIComponent(t)}`;
     }
-    const res = await fetch(url, opts);
+    const res = await fetch(path, opts);
     const text = await res.text();
     let json = null;
     try { json = JSON.parse(text); } catch (_) {}
@@ -621,10 +618,51 @@
     }[c]));
   }
 
-  // Stats stream
-  let es = null;
+  // Stats stream (fetch + ReadableStream with X-Admin-Token)
+  let statsAbort = null;
+  let statsRetryTimer = null;
 
-  function startStatsStream() {
+  function scheduleStatsRetry() {
+    if (statsRetryTimer) return;
+    statsRetryTimer = setTimeout(() => {
+      statsRetryTimer = null;
+      startStatsStream();
+    }, 2000);
+  }
+
+  function processSseBuffer(buf) {
+    buf = buf.replace(/\r\n/g, '\n');
+    let idx = buf.indexOf('\n\n');
+    while (idx !== -1) {
+      const raw = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      const lines = raw.split(/\r?\n/);
+      const dataLines = [];
+      for (const line of lines) {
+        if (line.startsWith('data:')) {
+          let payload = line.slice(5);
+          if (payload.startsWith(' ')) payload = payload.slice(1);
+          dataLines.push(payload);
+        }
+      }
+      if (dataLines.length > 0) {
+        const data = dataLines.join('\n');
+        try {
+          const json = JSON.parse(data);
+          statsPre.textContent = JSON.stringify(json, null, 2);
+        } catch (e) {
+          statsPre.textContent = data;
+        }
+      }
+      idx = buf.indexOf('\n\n');
+    }
+    if (buf.length > 1024 * 1024) {
+      buf = buf.slice(-512 * 1024);
+    }
+    return buf;
+  }
+
+  async function startStatsStream() {
     stopStatsStream();
     const t = getToken();
     if (!t) {
@@ -632,26 +670,66 @@
       return;
     }
 
-    es = new EventSource(`/admin/api/v1/stats/stream?token=${encodeURIComponent(t)}`);
-    es.onmessage = (ev) => {
-      try {
-        const data = JSON.parse(ev.data);
-        statsPre.textContent = JSON.stringify(data, null, 2);
-      } catch (e) {
-        statsPre.textContent = ev.data;
+    authStatus.textContent = 'Stats stream 连接中...';
+
+    const controller = new AbortController();
+    statsAbort = controller;
+
+    let res;
+    try {
+      res = await fetch('/admin/api/v1/stats/stream', {
+        headers: { 'X-Admin-Token': t },
+        signal: controller.signal
+      });
+    } catch (e) {
+      if (!controller.signal.aborted) {
+        authStatus.textContent = 'Stats stream 连接失败（将自动重连）。';
+        scheduleStatsRetry();
       }
-    };
-    es.onerror = () => {
-      // EventSource 会自动重连；这里轻量提示即可。
-      authStatus.textContent = 'Stats stream 连接异常（将自动重连）。';
-    };
+      return;
+    }
+
+    if (!res.ok || !res.body) {
+      authStatus.textContent = `Stats stream 失败: ${res.status}`;
+      return;
+    }
+
     authStatus.textContent = 'Stats stream 已连接。';
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) {
+          buf += decoder.decode(value, { stream: true });
+          buf = processSseBuffer(buf);
+        }
+      }
+      buf += decoder.decode();
+      buf = processSseBuffer(buf);
+      if (!controller.signal.aborted) {
+        authStatus.textContent = 'Stats stream 已结束（将自动重连）。';
+        scheduleStatsRetry();
+      }
+    } catch (e) {
+      if (!controller.signal.aborted) {
+        authStatus.textContent = 'Stats stream 连接异常（将自动重连）。';
+        scheduleStatsRetry();
+      }
+    }
   }
 
   function stopStatsStream() {
-    if (es) {
-      es.close();
-      es = null;
+    if (statsAbort) {
+      statsAbort.abort();
+      statsAbort = null;
+    }
+    if (statsRetryTimer) {
+      clearTimeout(statsRetryTimer);
+      statsRetryTimer = null;
     }
   }
 

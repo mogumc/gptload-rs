@@ -59,13 +59,7 @@ async fn handle_api(req: Request<Body>, state: Arc<RouterState>) -> Response<Bod
     let method = req.method().clone();
 
     // All admin API endpoints require admin token.
-    let admin_ok = if state.authorize_admin_header(&req) {
-        true
-    } else if let Some(t) = query_get(req.uri(), "token") {
-        state.authorize_admin_token_str(t)
-    } else {
-        false
-    };
+    let admin_ok = state.authorize_admin_header(&req);
     if !admin_ok {
         return RouterState::json_error(
             http::StatusCode::UNAUTHORIZED,

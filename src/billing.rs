@@ -91,13 +91,20 @@ impl BillingStore {
         let map = self.balances.read().ok()?;
         let balance = map.get(key)?.clone();
         drop(map);
-        let prev = balance.fetch_add(delta, Ordering::Relaxed);
-        let new_balance = prev.wrapping_add(delta);
-        let _ = self.persist_tx.send(PersistUpdate::Set {
-            key: key.to_string(),
-            balance: new_balance,
-        });
-        Some(new_balance)
+        let mut cur = balance.load(Ordering::Relaxed);
+        loop {
+            let new_balance = cur.saturating_add(delta);
+            match balance.compare_exchange(cur, new_balance, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => {
+                    let _ = self.persist_tx.send(PersistUpdate::Set {
+                        key: key.to_string(),
+                        balance: new_balance,
+                    });
+                    return Some(new_balance);
+                }
+                Err(v) => cur = v,
+            }
+        }
     }
 
     pub fn apply_usage(&self, key: &str, total_tokens: u64) -> Option<i64> {

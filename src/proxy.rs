@@ -493,6 +493,8 @@ fn proxy_upstream_response(
     tokio::spawn(async move {
         use hyper::body::HttpBody;
         const MAX_PARSE_BYTES: usize = 32 * 1024 * 1024;
+        const MAX_SSE_BUF_BYTES: usize = 2 * 1024 * 1024;
+        const MAX_DECOMPRESSED_BYTES: usize = 128 * 1024 * 1024;
 
         let mut resp_bytes = 0usize;
         let mut usage: Option<UsageTokens> = None;
@@ -500,6 +502,7 @@ fn proxy_upstream_response(
         let mut sse_buf = String::new();
         let mut json_buf: Vec<u8> = Vec::new();
         let mut json_overflow = false;
+        let mut decompressed_bytes = 0usize;
 
         let mut body = body;
         while let Some(chunk) = body.data().await {
@@ -530,7 +533,17 @@ fn proxy_upstream_response(
                         continue;
                     }
 
+                    if decompressed_bytes.saturating_add(parse_bytes.len()) > MAX_DECOMPRESSED_BYTES {
+                        parse_enabled = false;
+                        continue;
+                    }
+                    decompressed_bytes = decompressed_bytes.saturating_add(parse_bytes.len());
+
                     if want_sse_usage {
+                        if sse_buf.len().saturating_add(parse_bytes.len()) > MAX_SSE_BUF_BYTES {
+                            parse_enabled = false;
+                            continue;
+                        }
                         if let Some(found) = parse_sse_usage(&mut sse_buf, &parse_bytes) {
                             usage = Some(found);
                         }
