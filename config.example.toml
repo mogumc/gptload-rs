@@ -1,0 +1,47 @@
+# gptload-rs v0.2 config example
+
+# Where the proxy listens (HTTP only). Admin UI/API are served under /admin on the same port.
+listen_addr = "0.0.0.0:8080"
+
+# Tokio worker threads. If omitted, defaults to CPU core count.
+# worker_threads = 4
+
+# Hard timeout for upstream requests (connect + response).
+request_timeout_ms = 60000
+
+# Optional tokens for normal proxy traffic: clients must pass X-Proxy-Token.
+# If omitted or empty, proxy requests are allowed without token.
+# proxy_tokens = ["proxy-token-1"]
+
+# Tokens for Admin UI/API: requests must pass X-Admin-Token (API) or ?token= (SSE).
+# NOTE: If you expose this server publicly, set strong tokens.
+admin_tokens = ["admin-token-1"]
+
+# Where to store the embedded key database (sled). Will be created if missing.
+data_dir = "./data"
+
+# Enable stream usage injection for these upstream ids (adds stream_options.include_usage).
+# usage_inject_upstreams = ["openai"]
+
+[ban]
+# Base cooldowns (milliseconds). Exponential backoff is applied by fail streak.
+# - rate_limit_ms / auth_error_ms are applied at **key** level.
+# - server_error_ms / network_error_ms are applied at **upstream** level (circuit breaker).
+rate_limit_ms    = 30000     # HTTP 429
+server_error_ms  = 5000      # HTTP 5xx
+network_error_ms = 5000      # connect/reset/timeout
+auth_error_ms    = 86400000  # HTTP 401/403 (usually bad/expired key)
+
+# Maximum exponent for backoff doubling. 0 = no backoff, 6 = up to 64x.
+max_backoff_pow = 6
+
+[[upstreams]]
+id = "openai"
+base_url = "https://api.openai.com"
+weight = 1
+
+# Example: second upstream (OpenAI-compatible) weighted 2x
+[[upstreams]]
+id = "alt"
+base_url = "https://your-openai-compatible-upstream.example.com"
+weight = 2
