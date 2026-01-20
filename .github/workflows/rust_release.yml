@@ -5,7 +5,13 @@ on:
     # 当你推送以 v 开头的标签时（如 v1.0.0），触发自动发布
     tags:
       - 'v*'
-
+  workflow_dispatch:
+    # 你甚至可以添加输入参数，比如手动指定版本号
+    inputs:
+      version_name:
+        description: 'Manual Release Version'
+        required: false
+        default: 'manual-build'
 # 赋予 Action 写入 Release 的权限
 permissions:
   contents: write
