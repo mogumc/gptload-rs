@@ -9,6 +9,14 @@ listen_addr = "0.0.0.0:8080"
 # Hard timeout for upstream requests (connect + response).
 request_timeout_ms = 60000
 
+# Maximum retry attempts for retryable upstream responses.
+# Set to 0 to disable retries.
+max_retries = 5
+
+# Upstream status codes that should trigger retry.
+# Default is [429] when omitted.
+retry_status_codes = [429, 500, 502, 503, 504]
+
 # Optional tokens for normal proxy traffic: clients must pass X-Proxy-Token.
 # If omitted or empty, proxy requests are allowed without token.
 # proxy_tokens = ["proxy-token-1"]

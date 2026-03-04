@@ -25,6 +25,8 @@ pub const HDR_AUTHORIZATION: HeaderName = hyper::header::AUTHORIZATION;
 
 pub struct RouterState {
     pub request_timeout: Duration,
+    pub max_retries: usize,
+    pub retry_status_codes: Arc<AHashSet<u16>>,
     pub ban: BanConfig,
 
     pub proxy_tokens: Option<Arc<AHashSet<String>>>,
@@ -56,6 +58,8 @@ impl Clone for RouterState {
     fn clone(&self) -> Self {
         RouterState {
             request_timeout: self.request_timeout,
+            max_retries: self.max_retries,
+            retry_status_codes: self.retry_status_codes.clone(),
             ban: self.ban.clone(),
             proxy_tokens: self.proxy_tokens.clone(),
             admin_tokens: self.admin_tokens.clone(),
@@ -308,6 +312,9 @@ impl RequestMetrics {
 impl RouterState {
     pub fn new(cfg: Config) -> anyhow::Result<Self> {
         let request_timeout = Duration::from_millis(cfg.request_timeout_ms);
+        let max_retries = cfg.max_retries.unwrap_or(5);
+        let retry_status_codes = cfg.retry_status_codes.unwrap_or_else(|| vec![429]);
+        let retry_status_codes = Arc::new(retry_status_codes.into_iter().collect::<AHashSet<u16>>());
 
         let proxy_tokens = cfg.proxy_tokens.and_then(|v| {
             let mut set = AHashSet::with_capacity(v.len().max(1));
@@ -392,6 +399,8 @@ impl RouterState {
 
         Ok(Self {
             request_timeout,
+            max_retries,
+            retry_status_codes,
             ban: cfg.ban,
             proxy_tokens,
             admin_tokens,
@@ -444,6 +453,17 @@ impl RouterState {
             .as_ref()
             .map(|set| set.contains(upstream_id))
             .unwrap_or(false)
+    }
+
+    #[inline]
+    pub fn should_retry_status(&self, status: http::StatusCode) -> bool {
+        self.retry_status_codes.contains(&status.as_u16())
+    }
+
+    pub fn retry_status_codes_sorted(&self) -> Vec<u16> {
+        let mut v: Vec<u16> = self.retry_status_codes.iter().copied().collect();
+        v.sort_unstable();
+        v
     }
 
     #[inline]

@@ -532,6 +532,9 @@ struct StatsSnapshot {
     ts_ms: u64,
     uptime_s: u64,
 
+    max_retries: usize,
+    retry_status_codes: Vec<u16>,
+
     requests_total: u64,
     requests_inflight: u64,
     upstream_selected_total: u64,
@@ -589,6 +592,8 @@ fn build_snapshot(state: &RouterState) -> StatsSnapshot {
     StatsSnapshot {
         ts_ms: ts,
         uptime_s,
+        max_retries: state.max_retries,
+        retry_status_codes: state.retry_status_codes_sorted(),
         requests_total: state.stats.requests_total.load(std::sync::atomic::Ordering::Relaxed),
         requests_inflight: state.stats.requests_inflight.load(std::sync::atomic::Ordering::Relaxed),
         upstream_selected_total: state.stats.upstream_selected_total.load(std::sync::atomic::Ordering::Relaxed),

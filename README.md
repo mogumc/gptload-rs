@@ -92,6 +92,12 @@ worker_threads = 4
 # 上游请求超时（毫秒）
 request_timeout_ms = 60000
 
+# 命中可重试状态码时的最大重试次数（0 表示不重试）
+max_retries = 5
+
+# 触发重试的上游状态码（省略时默认为 [429]）
+retry_status_codes = [429, 500, 502, 503, 504]
+
 # 代理访问令牌（可选，留空则允许所有请求）
 proxy_tokens = ["proxy-token-1"]
 

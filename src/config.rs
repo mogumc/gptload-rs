@@ -14,6 +14,12 @@ pub struct Config {
     /// Upstream request timeout (ms).
     pub request_timeout_ms: u64,
 
+    /// Maximum retry attempts for retryable upstream responses.
+    pub max_retries: Option<usize>,
+
+    /// Upstream HTTP status codes that should trigger retry.
+    pub retry_status_codes: Option<Vec<u16>>,
+
     /// Optional list of tokens required in `X-Proxy-Token` for non-admin requests.
     pub proxy_tokens: Option<Vec<String>>,
 
@@ -83,6 +89,14 @@ impl Config {
                 self.usage_inject_upstreams = None;
             }
         }
+        if let Some(v) = &mut self.retry_status_codes {
+            v.retain(|code| *code >= 100 && *code <= 599);
+            v.sort_unstable();
+            v.dedup();
+            if v.is_empty() {
+                self.retry_status_codes = None;
+            }
+        }
         Ok(())
     }
 
@@ -101,6 +115,13 @@ impl Config {
                 anyhow::bail!(
                     "config: upstreams[{i}].base_url must start with http:// or https://"
                 );
+            }
+        }
+        if let Some(codes) = &self.retry_status_codes {
+            for code in codes {
+                if *code < 100 || *code > 599 {
+                    anyhow::bail!("config: retry_status_codes contains invalid status code: {code}");
+                }
             }
         }
         Ok(())

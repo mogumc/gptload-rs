@@ -308,8 +308,8 @@ async fn forward(
         }
     }
 
-    // Maximum retries on 429 (rate limit)
-    const MAX_RETRIES: usize = 5;
+    // Retry policy from config.
+    let max_retries = state.max_retries;
     let mut retry_count = 0;
 
     loop {
@@ -368,8 +368,8 @@ async fn forward(
                 let status = up_resp.status();
                 state.on_upstream_status(&sel, status, now_ms);
 
-                // Check if we should retry on 429 with another key
-                if status == http::StatusCode::TOO_MANY_REQUESTS && retry_count < MAX_RETRIES {
+                // Check if we should retry with another key based on status policy.
+                if state.should_retry_status(status) && retry_count < max_retries {
                     // Try to select an alternative key
                     let next = state.select_for_model(&model, now_ms);
                     if let Some(new_sel) = next {
