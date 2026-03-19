@@ -15,7 +15,7 @@ max_retries = 5
 
 # Upstream status codes that should trigger retry.
 # Default is [429] when omitted.
-retry_status_codes = [429, 500, 502, 503, 504]
+retry_status_codes = [429, 500, 502, 503, 504, 401, 403]
 
 # Optional tokens for normal proxy traffic: clients must pass X-Proxy-Token.
 # If omitted or empty, proxy requests are allowed without token.
@@ -41,7 +41,7 @@ network_error_ms = 5000      # connect/reset/timeout
 auth_error_ms    = 86400000  # HTTP 401/403 (usually bad/expired key)
 
 # Maximum exponent for backoff doubling. 0 = no backoff, 6 = up to 64x.
-max_backoff_pow = 6
+max_backoff_pow = 7
 
 [[upstreams]]
 id = "openai"

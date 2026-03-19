@@ -54,88 +54,61 @@ async fn handle(
     let start = Instant::now();
     let client_ip = client_addr.ip().to_string();
     let method = req.method().clone();
+    let base_log_ctx = RequestLogContext::new(
+        start,
+        client_ip.clone(),
+        method.to_string(),
+        path.clone(),
+        None,
+        None,
+        0,
+    );
 
     // Proxy traffic auth (optional).
     if !state.authorize_proxy(&req) {
-        let resp = RouterState::json_error(
+        return logged_json_error(
+            &state,
+            &base_log_ctx,
             http::StatusCode::UNAUTHORIZED,
             "missing or invalid X-Proxy-Token",
             "proxy_unauthorized",
         );
-        let ctx = RequestLogContext {
-            start,
-            client_ip,
-            method: method.to_string(),
-            path,
-            model: None,
-            upstream_id: None,
-            req_bytes: 0,
-        };
-        record_request(&state, &ctx, resp.status().as_u16(), 0, None);
-        return resp;
     }
 
     let billing_key = match extract_api_key(req.headers()) {
         Some(key) => key,
         None => {
-            let resp = RouterState::json_error(
+            return logged_json_error(
+                &state,
+                &base_log_ctx,
                 http::StatusCode::UNAUTHORIZED,
                 "missing api key",
                 "api_key_required",
             );
-            let ctx = RequestLogContext {
-                start,
-                client_ip,
-                method: method.to_string(),
-                path,
-                model: None,
-                upstream_id: None,
-                req_bytes: 0,
-            };
-            record_request(&state, &ctx, resp.status().as_u16(), 0, None);
-            return resp;
         }
     };
 
     let balance = match state.billing.get_balance(&billing_key) {
         Some(b) => b,
         None => {
-            let resp = RouterState::json_error(
+            return logged_json_error(
+                &state,
+                &base_log_ctx,
                 http::StatusCode::UNAUTHORIZED,
                 "invalid api key",
                 "api_key_invalid",
             );
-            let ctx = RequestLogContext {
-                start,
-                client_ip,
-                method: method.to_string(),
-                path,
-                model: None,
-                upstream_id: None,
-                req_bytes: 0,
-            };
-            record_request(&state, &ctx, resp.status().as_u16(), 0, None);
-            return resp;
         }
     };
 
     if balance < 0 {
-        let resp = RouterState::json_error(
+        return logged_json_error(
+            &state,
+            &base_log_ctx,
             http::StatusCode::UNAUTHORIZED,
             "insufficient balance",
             "balance_insufficient",
         );
-        let ctx = RequestLogContext {
-            start,
-            client_ip,
-            method: method.to_string(),
-            path,
-            model: None,
-            upstream_id: None,
-            req_bytes: 0,
-        };
-        record_request(&state, &ctx, resp.status().as_u16(), 0, None);
-        return resp;
     }
 
     // Stats: request start.
@@ -148,16 +121,7 @@ async fn handle(
         && (path == "/v1/models" || path == "/v1/models/")
     {
         let (resp, resp_bytes) = models_list(&state);
-        let ctx = RequestLogContext {
-            start,
-            client_ip,
-            method: method.to_string(),
-            path,
-            model: None,
-            upstream_id: None,
-            req_bytes: 0,
-        };
-        record_request(&state, &ctx, resp.status().as_u16(), resp_bytes, None);
+        record_request(&state, &base_log_ctx, resp.status().as_u16(), resp_bytes, None);
         resp
     } else {
         forward(
@@ -254,44 +218,44 @@ async fn forward(
         .unwrap_or(false);
     let is_chat_completions = path == "/v1/chat/completions" || path == "/v1/chat/completions/";
 
-    let mut log_ctx = RequestLogContext {
+    let mut log_ctx = RequestLogContext::new(
         start,
         client_ip,
-        method: method.to_string(),
+        method.to_string(),
         path,
-        model: model.clone(),
-        upstream_id: None,
+        model.clone(),
+        None,
         req_bytes,
-    };
+    );
 
     let Some(model) = model else {
-        let resp = RouterState::json_error(
+        return logged_json_error(
+            &state,
+            &log_ctx,
             http::StatusCode::BAD_REQUEST,
             "missing model",
             "model_required",
         );
-        record_request(&state, &log_ctx, resp.status().as_u16(), 0, None);
-        return resp;
     };
 
     let mut sel = if !state.model_exists(&model) {
-        let resp = RouterState::json_error(
+        return logged_json_error(
+            &state,
+            &log_ctx,
             http::StatusCode::NOT_FOUND,
             "model not found",
             "model_not_found",
         );
-        record_request(&state, &log_ctx, resp.status().as_u16(), 0, None);
-        return resp;
     } else if let Some(sel) = state.select_for_model(&model, now_ms) {
         sel
     } else {
-        let resp = RouterState::json_error(
+        return logged_json_error(
+            &state,
+            &log_ctx,
             http::StatusCode::SERVICE_UNAVAILABLE,
             "no available upstream keys for model",
             "model_unavailable",
         );
-        record_request(&state, &log_ctx, resp.status().as_u16(), 0, None);
-        return resp;
     };
 
     let mut body_bytes = body_bytes;
@@ -327,38 +291,18 @@ async fn forward(
             }
         };
 
-        // Build a new request for this attempt using the builder pattern
-        let mut builder = hyper::Request::builder()
-            .method(out_method.clone())
-            .uri(uri)
-            .version(version);
-
-        // Copy headers and sanitize
-        for (name, value) in headers.iter() {
-            builder = builder.header(name.clone(), value.clone());
-        }
-
-        let mut out_req = match builder.body(Body::from(body_bytes.clone())) {
+        let out_req = match build_upstream_request(
+            out_method.clone(),
+            uri,
+            version,
+            &headers,
+            body_bytes.clone(),
+            &sel,
+            injected,
+        ) {
             Ok(req) => req,
-            Err(_) => {
-                return RouterState::json_error(
-                    http::StatusCode::BAD_GATEWAY,
-                    "failed to build request",
-                    "request_build_error",
-                );
-            }
+            Err(resp) => return logged_response(&state, &log_ctx, resp),
         };
-
-        // Strip hop-by-hop headers & proxy/admin auth, and replace Authorization.
-        sanitize_hop_headers(out_req.headers_mut());
-        out_req.headers_mut().remove(HDR_AUTHORIZATION);
-        out_req.headers_mut().insert(HDR_AUTHORIZATION, sel.key.auth_header.clone());
-        if injected {
-            out_req.headers_mut().remove(CONTENT_LENGTH);
-            if let Ok(v) = http::HeaderValue::from_str(&body_bytes.len().to_string()) {
-                out_req.headers_mut().insert(CONTENT_LENGTH, v);
-            }
-        }
 
         // Enforce timeout.
         let res = tokio::time::timeout(state.request_timeout, state.client.request(out_req)).await;
@@ -368,11 +312,8 @@ async fn forward(
                 let status = up_resp.status();
                 state.on_upstream_status(&sel, status, now_ms);
 
-                // Retry on: auth errors (401/403 = bad key), rate limit, configurable codes.
-                // 401/403 always retry (key is now banned, next select picks a different one).
-                let should_retry = status == http::StatusCode::UNAUTHORIZED
-                    || status == http::StatusCode::FORBIDDEN
-                    || state.should_retry_status(status);
+                // Retry on auth errors, rate limit, and configurable status codes.
+                let should_retry = should_retry_status(&state, status);
 
                 if should_retry && retry_count < max_retries {
                     if let Some(new_sel) = state.select_for_model(&model, now_ms) {
@@ -420,8 +361,7 @@ async fn forward(
                     "upstream request failed",
                     "upstream_error",
                 );
-                record_request(&state, &log_ctx, resp.status().as_u16(), 0, None);
-                return resp;
+                return logged_response(&state, &log_ctx, resp);
             }
             Err(_) => {
                 state.on_timeout(&sel, now_ms);
@@ -446,8 +386,7 @@ async fn forward(
                     "upstream request timeout",
                     "upstream_timeout",
                 );
-                record_request(&state, &log_ctx, resp.status().as_u16(), 0, None);
-                return resp;
+                return logged_response(&state, &log_ctx, resp);
             }
         }
     }
@@ -462,6 +401,28 @@ struct RequestLogContext {
     model: Option<String>,
     upstream_id: Option<String>,
     req_bytes: usize,
+}
+
+impl RequestLogContext {
+    fn new(
+        start: Instant,
+        client_ip: String,
+        method: String,
+        path: String,
+        model: Option<String>,
+        upstream_id: Option<String>,
+        req_bytes: usize,
+    ) -> Self {
+        Self {
+            start,
+            client_ip,
+            method,
+            path,
+            model,
+            upstream_id,
+            req_bytes,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -494,6 +455,73 @@ fn record_request(
         total_tokens: usage.map(|u| u.total),
     };
     state.record_request(entry);
+}
+
+fn logged_json_error(
+    state: &RouterState,
+    ctx: &RequestLogContext,
+    status: http::StatusCode,
+    message: &str,
+    code: &str,
+) -> Response<Body> {
+    let resp = RouterState::json_error(status, message, code);
+    logged_response(state, ctx, resp)
+}
+
+fn logged_response(
+    state: &RouterState,
+    ctx: &RequestLogContext,
+    resp: Response<Body>,
+) -> Response<Body> {
+    record_request(state, ctx, resp.status().as_u16(), 0, None);
+    resp
+}
+
+fn build_upstream_request(
+    method: hyper::Method,
+    uri: http::Uri,
+    version: http::Version,
+    headers: &hyper::HeaderMap,
+    body_bytes: bytes::Bytes,
+    sel: &crate::state::Selected,
+    injected: bool,
+) -> Result<Request<Body>, Response<Body>> {
+    let mut builder = hyper::Request::builder()
+        .method(method)
+        .uri(uri)
+        .version(version);
+
+    for (name, value) in headers.iter() {
+        builder = builder.header(name.clone(), value.clone());
+    }
+
+    let mut out_req = builder.body(Body::from(body_bytes.clone())).map_err(|_| {
+        RouterState::json_error(
+            http::StatusCode::BAD_GATEWAY,
+            "failed to build request",
+            "request_build_error",
+        )
+    })?;
+
+    sanitize_hop_headers(out_req.headers_mut());
+    out_req.headers_mut().remove(HDR_AUTHORIZATION);
+    out_req
+        .headers_mut()
+        .insert(HDR_AUTHORIZATION, sel.key.auth_header.clone());
+    if injected {
+        out_req.headers_mut().remove(CONTENT_LENGTH);
+        if let Ok(v) = http::HeaderValue::from_str(&body_bytes.len().to_string()) {
+            out_req.headers_mut().insert(CONTENT_LENGTH, v);
+        }
+    }
+
+    Ok(out_req)
+}
+
+fn should_retry_status(state: &RouterState, status: http::StatusCode) -> bool {
+    status == http::StatusCode::UNAUTHORIZED
+        || status == http::StatusCode::FORBIDDEN
+        || state.should_retry_status(status)
 }
 
 fn proxy_upstream_response(
