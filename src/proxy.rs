@@ -368,14 +368,23 @@ async fn forward(
                 let status = up_resp.status();
                 state.on_upstream_status(&sel, status, now_ms);
 
-                // Check if we should retry with another key based on status policy.
-                if state.should_retry_status(status) && retry_count < max_retries {
-                    // Try to select an alternative key
-                    let next = state.select_for_model(&model, now_ms);
-                    if let Some(new_sel) = next {
+                // Retry on: auth errors (401/403 = bad key), rate limit, configurable codes.
+                // 401/403 always retry (key is now banned, next select picks a different one).
+                let should_retry = status == http::StatusCode::UNAUTHORIZED
+                    || status == http::StatusCode::FORBIDDEN
+                    || state.should_retry_status(status);
+
+                if should_retry && retry_count < max_retries {
+                    if let Some(new_sel) = state.select_for_model(&model, now_ms) {
                         retry_count += 1;
+                        tracing::debug!(
+                            status = %status,
+                            retry = retry_count,
+                            old_upstream = %sel.upstream.id,
+                            new_upstream = %new_sel.upstream.id,
+                            "retrying with different key/upstream"
+                        );
                         sel = new_sel;
-                        // Continue loop to retry with new key
                         continue;
                     }
                 }
@@ -390,6 +399,22 @@ async fn forward(
             }
             Ok(Err(_e)) => {
                 state.on_network_error(&sel, now_ms);
+
+                // Retry on network error (upstream is now banned, next select picks a different one).
+                if retry_count < max_retries {
+                    if let Some(new_sel) = state.select_for_model(&model, now_ms) {
+                        retry_count += 1;
+                        tracing::debug!(
+                            retry = retry_count,
+                            old_upstream = %sel.upstream.id,
+                            new_upstream = %new_sel.upstream.id,
+                            "retrying after network error"
+                        );
+                        sel = new_sel;
+                        continue;
+                    }
+                }
+
                 let resp = RouterState::json_error(
                     http::StatusCode::BAD_GATEWAY,
                     "upstream request failed",
@@ -400,6 +425,22 @@ async fn forward(
             }
             Err(_) => {
                 state.on_timeout(&sel, now_ms);
+
+                // Retry on timeout (upstream is now banned, next select picks a different one).
+                if retry_count < max_retries {
+                    if let Some(new_sel) = state.select_for_model(&model, now_ms) {
+                        retry_count += 1;
+                        tracing::debug!(
+                            retry = retry_count,
+                            old_upstream = %sel.upstream.id,
+                            new_upstream = %new_sel.upstream.id,
+                            "retrying after timeout"
+                        );
+                        sel = new_sel;
+                        continue;
+                    }
+                }
+
                 let resp = RouterState::json_error(
                     http::StatusCode::GATEWAY_TIMEOUT,
                     "upstream request timeout",

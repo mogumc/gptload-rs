@@ -490,6 +490,8 @@ struct UpstreamInfo {
     base_url: String,
     weight: usize,
     keys_total: usize,
+    keys_healthy: usize,
+    keys_banned: usize,
     upstream_cooldown_until_ms: u64,
     upstream_fail_streak: u32,
 
@@ -503,27 +505,35 @@ struct UpstreamInfo {
     errors_network: u64,
 }
 
+fn build_upstream_info(u: &crate::state::Upstream, now: u64) -> UpstreamInfo {
+    let keys_arc = u.keys.load_full();
+    let total = keys_arc.len();
+    let banned = keys_arc.iter().filter(|k| {
+        k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed) > now
+    }).count();
+    UpstreamInfo {
+        id: u.id.to_string(),
+        base_url: u.base_url.to_string(),
+        weight: u.weight,
+        keys_total: total,
+        keys_healthy: total.saturating_sub(banned),
+        keys_banned: banned,
+        upstream_cooldown_until_ms: u.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed),
+        upstream_fail_streak: u.fail_streak.load(std::sync::atomic::Ordering::Relaxed),
+        selected_total: u.stats.selected_total.load(std::sync::atomic::Ordering::Relaxed),
+        responses_2xx: u.stats.responses_2xx.load(std::sync::atomic::Ordering::Relaxed),
+        responses_3xx: u.stats.responses_3xx.load(std::sync::atomic::Ordering::Relaxed),
+        responses_4xx: u.stats.responses_4xx.load(std::sync::atomic::Ordering::Relaxed),
+        responses_5xx: u.stats.responses_5xx.load(std::sync::atomic::Ordering::Relaxed),
+        errors_timeout: u.stats.errors_timeout.load(std::sync::atomic::Ordering::Relaxed),
+        errors_network: u.stats.errors_network.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
 async fn api_list_upstreams(state: Arc<RouterState>) -> Response<Body> {
     let snap = state.snapshot.load_full();
-    let mut ups: Vec<UpstreamInfo> = Vec::with_capacity(snap.upstreams.len());
-    for u in snap.upstreams.iter() {
-        ups.push(UpstreamInfo {
-            id: u.id.to_string(),
-            base_url: u.base_url.to_string(),
-            weight: u.weight,
-            keys_total: u.keys_len(),
-            upstream_cooldown_until_ms: u.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed),
-            upstream_fail_streak: u.fail_streak.load(std::sync::atomic::Ordering::Relaxed),
-            selected_total: u.stats.selected_total.load(std::sync::atomic::Ordering::Relaxed),
-            responses_2xx: u.stats.responses_2xx.load(std::sync::atomic::Ordering::Relaxed),
-            responses_3xx: u.stats.responses_3xx.load(std::sync::atomic::Ordering::Relaxed),
-            responses_4xx: u.stats.responses_4xx.load(std::sync::atomic::Ordering::Relaxed),
-            responses_5xx: u.stats.responses_5xx.load(std::sync::atomic::Ordering::Relaxed),
-            errors_timeout: u.stats.errors_timeout.load(std::sync::atomic::Ordering::Relaxed),
-            errors_network: u.stats.errors_network.load(std::sync::atomic::Ordering::Relaxed),
-        });
-    }
-
+    let now = now_ms();
+    let ups: Vec<UpstreamInfo> = snap.upstreams.iter().map(|u| build_upstream_info(u, now)).collect();
     json_ok(&ups)
 }
 
@@ -570,24 +580,8 @@ fn build_snapshot(state: &RouterState) -> StatsSnapshot {
     let latency_max_ms = (latency_max as f64) / 1_000_000.0;
 
     let snap = state.snapshot.load_full();
-    let mut ups: Vec<UpstreamInfo> = Vec::with_capacity(snap.upstreams.len());
-    for u in snap.upstreams.iter() {
-        ups.push(UpstreamInfo {
-            id: u.id.to_string(),
-            base_url: u.base_url.to_string(),
-            weight: u.weight,
-            keys_total: u.keys_len(),
-            upstream_cooldown_until_ms: u.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed),
-            upstream_fail_streak: u.fail_streak.load(std::sync::atomic::Ordering::Relaxed),
-            selected_total: u.stats.selected_total.load(std::sync::atomic::Ordering::Relaxed),
-            responses_2xx: u.stats.responses_2xx.load(std::sync::atomic::Ordering::Relaxed),
-            responses_3xx: u.stats.responses_3xx.load(std::sync::atomic::Ordering::Relaxed),
-            responses_4xx: u.stats.responses_4xx.load(std::sync::atomic::Ordering::Relaxed),
-            responses_5xx: u.stats.responses_5xx.load(std::sync::atomic::Ordering::Relaxed),
-            errors_timeout: u.stats.errors_timeout.load(std::sync::atomic::Ordering::Relaxed),
-            errors_network: u.stats.errors_network.load(std::sync::atomic::Ordering::Relaxed),
-        });
-    }
+    let now = ts;
+    let ups: Vec<UpstreamInfo> = snap.upstreams.iter().map(|u| build_upstream_info(u, now)).collect();
 
     StatsSnapshot {
         ts_ms: ts,
@@ -877,7 +871,9 @@ async fn api_delete_keys(req: Request<Body>, state: Arc<RouterState>, upstream_i
 struct KeyInfo {
     key: String,
     cooldown_until_ms: u64,
+    cooldown_remaining_ms: i64,
     fail_streak: u32,
+    status: &'static str,
 }
 
 async fn api_list_keys(state: Arc<RouterState>, upstream_id: &str, uri: &http::Uri) -> Response<Body> {
@@ -902,10 +898,16 @@ async fn api_list_keys(state: Arc<RouterState>, upstream_id: &str, uri: &http::U
 
     let mut out: Vec<KeyInfo> = Vec::with_capacity(end.saturating_sub(offset));
     for k in keys.iter().skip(offset).take(end - offset) {
+        let cd = k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let remaining = if cd > now { (cd - now) as i64 } else { 0 };
+        let streak = k.fail_streak.load(std::sync::atomic::Ordering::Relaxed);
+        let status = if cd > now { "banned" } else { "ok" };
         out.push(KeyInfo {
             key: k.key.to_string(),
-            cooldown_until_ms: k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed),
-            fail_streak: k.fail_streak.load(std::sync::atomic::Ordering::Relaxed),
+            cooldown_until_ms: cd,
+            cooldown_remaining_ms: remaining,
+            fail_streak: streak,
+            status,
         });
     }
 

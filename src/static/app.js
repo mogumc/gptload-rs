@@ -110,12 +110,18 @@
     upstreamsTableBody.innerHTML = '';
     for (const u of lastUpstreams) {
       const tr = document.createElement('tr');
+      const healthy = u.keys_healthy != null ? u.keys_healthy : u.keys_total;
+      const banned = u.keys_banned || 0;
+      const keysClass = banned > 0 ? 'bad' : 'ok';
+      const cdMs = u.upstream_cooldown_until_ms || 0;
+      const cdText = cdMs > Date.now() ? formatDuration(cdMs - Date.now()) : '-';
+      const cdClass = cdMs > Date.now() ? 'bad' : 'muted';
       tr.innerHTML = `
         <td class="mono">${escapeHtml(u.id)}</td>
         <td class="mono small">${escapeHtml(u.base_url)}</td>
         <td>${u.weight}</td>
-        <td>${u.keys_total}</td>
-        <td class="mono small">${u.upstream_cooldown_until_ms || 0}</td>
+        <td class="${keysClass}">${healthy}/${banned}</td>
+        <td class="${cdClass} mono small">${cdText}</td>
         <td class="mono small">${u.selected_total || 0}</td>
         <td class="mono small">${u.responses_2xx || 0}</td>
         <td class="mono small">${u.responses_4xx || 0}</td>
@@ -611,6 +617,18 @@
     const cbs = modelsList.querySelectorAll('input[type="checkbox"]');
     for (const cb of cbs) cb.checked = false;
   };
+
+  function formatDuration(ms) {
+    if (ms <= 0) return '-';
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return s + 's';
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + 'm' + (s % 60) + 's';
+    const h = Math.floor(m / 60);
+    if (h < 24) return h + 'h' + (m % 60) + 'm';
+    const d = Math.floor(h / 24);
+    return d + 'd' + (h % 24) + 'h';
+  }
 
   function escapeHtml(s) {
     return (s || '').replace(/[&<>"']/g, c => ({
