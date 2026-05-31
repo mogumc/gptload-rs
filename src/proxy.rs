@@ -44,7 +44,26 @@ async fn handle(
 
     // Health check.
     if req.method() == hyper::Method::GET && path == "/health" {
-        return Response::new(Body::from("ok"));
+        let snap = state.snapshot.load_full();
+        let mut total_keys = 0usize;
+        let mut active_keys = 0usize;
+        for u in snap.upstreams.iter() {
+            let keys = u.keys.load_full();
+            total_keys += keys.len();
+            active_keys += keys.iter().filter(|k| k.is_active()).count();
+        }
+        let body = serde_json::json!({
+            "status": "ok",
+            "upstreams": snap.upstreams.len(),
+            "keys_total": total_keys,
+            "keys_active": active_keys,
+            "requests_inflight": state.stats.requests_inflight.load(std::sync::atomic::Ordering::Relaxed),
+        });
+        return Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
     }
 
     // Admin UI/API.
