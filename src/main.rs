@@ -48,6 +48,7 @@ fn main() -> anyhow::Result<()> {
         let addr: SocketAddr = cfg.listen_addr.parse()?;
         let state = Arc::new(state::RouterState::new(cfg)?);
         state.refresh_missing_models_routes().await;
+        state.start_revalidation();
         tracing::info!(%addr, "listening (admin at /admin/)");
         proxy::serve_http(addr, state).await
     })

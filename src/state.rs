@@ -693,6 +693,124 @@ impl RouterState {
             .body(Body::from(body))
             .unwrap_or_else(|_| Response::new(Body::from("proxy_error")))
     }
+
+    /// Spawn a background task that periodically re-validates invalid keys.
+    /// Invalid keys are tested against their upstream; if the upstream responds
+    /// with anything other than 401/403, the key is restored to active.
+    pub fn start_revalidation(self: &Arc<RouterState>) {
+        let state = Arc::clone(self);
+        let interval_secs = state.key_config.revalidation_interval_secs.max(60);
+        let timeout_secs = state.key_config.revalidation_timeout_secs.max(5);
+
+        tokio::spawn(async move {
+            // Wait a bit before first run to let the system stabilise.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            loop {
+                tracing::debug!("revalidation: checking invalid keys...");
+                let start = now_ms();
+
+                let snap = state.snapshot.load_full();
+                let mut total_checked = 0u32;
+                let mut total_restored = 0u32;
+
+                for upstream in snap.upstreams.iter() {
+                    let invalid_keys: Vec<Arc<KeyState>> = upstream
+                        .keys
+                        .load_full()
+                        .iter()
+                        .filter(|k| !k.is_active())
+                        .cloned()
+                        .collect();
+
+                    if invalid_keys.is_empty() {
+                        continue;
+                    }
+
+                    for key in invalid_keys {
+                        total_checked += 1;
+                        match validate_key(
+                            &state.client,
+                            upstream,
+                            &key,
+                            Duration::from_secs(timeout_secs),
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                key.failure_count.store(0, Ordering::Relaxed);
+                                key.status.store(KEY_STATUS_ACTIVE, Ordering::Relaxed);
+                                upstream.rebuild_active_keys();
+                                total_restored += 1;
+                                tracing::info!(
+                                    key = %key.key,
+                                    upstream = %upstream.id,
+                                    "revalidation: key restored"
+                                );
+                            }
+                            Ok(false) => {
+                                tracing::debug!(
+                                    key = %key.key,
+                                    upstream = %upstream.id,
+                                    "revalidation: key still invalid"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    key = %key.key,
+                                    upstream = %upstream.id,
+                                    error = %e,
+                                    "revalidation: request failed"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let elapsed_ms = now_ms().saturating_sub(start);
+                if total_checked > 0 {
+                    tracing::info!(
+                        checked = total_checked,
+                        restored = total_restored,
+                        elapsed_ms,
+                        "revalidation cycle complete"
+                    );
+                }
+
+                tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+            }
+        });
+    }
+}
+
+/// Test a single key by calling the upstream's /v1/models endpoint.
+/// Returns Ok(true) if the key is valid (not 401/403), Ok(false) if invalid.
+async fn validate_key(
+    client: &hyper::Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
+    upstream: &Upstream,
+    key: &KeyState,
+    timeout: Duration,
+) -> anyhow::Result<bool> {
+    let uri = upstream.build_uri(&PathAndQuery::from_static("/v1/models"))?;
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Body::empty())?;
+    req.headers_mut()
+        .insert(HDR_AUTHORIZATION, key.auth_header.clone());
+
+    let resp = match tokio::time::timeout(timeout, client.request(req)).await {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => anyhow::bail!("validation request timeout"),
+    };
+
+    let status = resp.status();
+    // Drain the body to free the connection.
+    drop(resp);
+
+    // 401/403 = key is still invalid. Anything else = key is probably fine.
+    Ok(status != http::StatusCode::UNAUTHORIZED && status != http::StatusCode::FORBIDDEN)
 }
 
 impl KeyState {
