@@ -548,12 +548,16 @@ impl RouterState {
     }
 
     /// Select an upstream + key that supports the given model.
+    /// Falls back to the least-cooldown'd upstream/key when all are in cooldown.
     pub fn select_for_model(&self, model: &str, now_ms: u64) -> Option<Selected> {
         let snap = self.snapshot.load_full();
         let sched_len = snap.schedule.len();
         if sched_len == 0 {
             return None;
         }
+
+        // Track the best fallback when all options are in cooldown.
+        let mut fallback: Option<(u64, Selected)> = None;
 
         for _ in 0..sched_len {
             let rr = self.sched_rr.as_ref().fetch_add(1, Ordering::Relaxed);
@@ -566,19 +570,51 @@ impl RouterState {
 
             let u_until = u.cooldown_until_ms.load(Ordering::Relaxed);
             if u_until > now_ms {
+                // Upstream is in cooldown — track as fallback.
+                if let Some(k) = u.select_key(now_ms) {
+                    let worst = u_until.max(
+                        k.cooldown_until_ms.load(Ordering::Relaxed),
+                    );
+                    match fallback {
+                        Some((best, _)) if worst >= best => {}
+                        _ => fallback = Some((worst, Selected {
+                            upstream: u.clone(),
+                            key: k,
+                        })),
+                    }
+                }
                 continue;
             }
+
+            // Upstream is healthy.
             if let Some(k) = u.select_key(now_ms) {
-                self.stats.upstream_selected_total.fetch_add(1, Ordering::Relaxed);
-                u.stats.selected_total.fetch_add(1, Ordering::Relaxed);
-                return Some(Selected {
-                    upstream: u.clone(),
-                    key: k,
-                });
+                let k_until = k.cooldown_until_ms.load(Ordering::Relaxed);
+                if k_until <= now_ms {
+                    // Key is healthy — use it immediately.
+                    self.stats.upstream_selected_total.fetch_add(1, Ordering::Relaxed);
+                    u.stats.selected_total.fetch_add(1, Ordering::Relaxed);
+                    return Some(Selected {
+                        upstream: u.clone(),
+                        key: k,
+                    });
+                }
+                // All keys are banned — track as fallback.
+                match fallback {
+                    Some((best, _)) if k_until >= best => {}
+                    _ => fallback = Some((k_until, Selected {
+                        upstream: u.clone(),
+                        key: k,
+                    })),
+                }
             }
         }
 
-        None
+        // All upstreams/keys are in cooldown — use the best fallback.
+        fallback.map(|(_, sel)| {
+            self.stats.upstream_selected_total.fetch_add(1, Ordering::Relaxed);
+            sel.upstream.stats.selected_total.fetch_add(1, Ordering::Relaxed);
+            sel
+        })
     }
 
     pub fn model_exists(&self, model: &str) -> bool {
@@ -674,17 +710,18 @@ impl RouterState {
         // Global per-status stats
         self.inc_global_status(status);
 
-        // Clear upstream cooldown and streak — but NOT for key-level errors.
-        // 429/401/403 mean the upstream is responding but rejecting this specific
-        // key; they don't indicate the upstream has recovered from a prior 5xx
-        // or network issue. A concurrent request might have just set a 5xx
-        // cooldown; clearing it here would erase that.
-        if !matches!(
+        // Clear upstream cooldown and streak — but for key-level errors (429/401/403)
+        // only clear if the cooldown has already expired. A 429 is a valid response
+        // (upstream is reachable), so an expired cooldown should be cleared. But an
+        // *active* cooldown should be preserved: a concurrent request may have just
+        // set a 5xx cooldown, and clearing it here would erase that.
+        let is_key_error = matches!(
             status,
             http::StatusCode::TOO_MANY_REQUESTS
                 | http::StatusCode::UNAUTHORIZED
-                | http::StatusCode::FORBIDDEN
-        ) {
+                | http::StatusCode::FORBIDDEN,
+        );
+        if !is_key_error || u.cooldown_until_ms.load(Ordering::Relaxed) <= now_ms {
             u.fail_streak.store(0, Ordering::Relaxed);
             u.cooldown_until_ms.store(0, Ordering::Relaxed);
         }
