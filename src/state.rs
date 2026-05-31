@@ -450,11 +450,6 @@ impl RouterState {
     }
 
     #[inline]
-    pub fn authorize_admin_token_str(&self, token: &str) -> bool {
-        self.admin_tokens.contains(token)
-    }
-
-    #[inline]
     pub fn should_inject_usage(&self, upstream_id: &str) -> bool {
         self.usage_inject_upstreams
             .as_ref()
