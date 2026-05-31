@@ -712,9 +712,14 @@ impl RouterState {
             // Upstream 5xx: prefer upstream cooldown, not key cooldown.
             self.ban_upstream(u, self.ban.server_error_ms, now_ms);
         } else {
-            // Success or other 4xx: reset key streak.
-            sel.key.fail_streak.store(0, Ordering::Relaxed);
-            sel.key.clear_last_ban_info();
+            // Success or other 4xx: reset key streak only if the key is no longer
+            // in cooldown. A concurrent request may have just banned this key;
+            // blindly clearing would erase that ban info.
+            let cd = sel.key.cooldown_until_ms.load(Ordering::Relaxed);
+            if cd <= now_ms {
+                sel.key.fail_streak.store(0, Ordering::Relaxed);
+                sel.key.clear_last_ban_info();
+            }
         }
         None
     }
