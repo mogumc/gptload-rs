@@ -176,25 +176,9 @@ struct BillingAdjustBody {
 }
 
 async fn api_billing_create_key(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
-    let body = match read_body_limit(req, 256 * 1024).await {
-        Ok(b) => b,
-        Err(e) => {
-            return RouterState::json_error(
-                http::StatusCode::BAD_REQUEST,
-                &format!("read body: {e}"),
-                "bad_request",
-            )
-        }
-    };
-    let payload: BillingCreateBody = match serde_json::from_slice(&body) {
+    let payload: BillingCreateBody = match parse_json_body(req).await {
         Ok(v) => v,
-        Err(e) => {
-            return RouterState::json_error(
-                http::StatusCode::BAD_REQUEST,
-                &format!("invalid json: {e}"),
-                "bad_request",
-            )
-        }
+        Err(resp) => return resp,
     };
     let key = payload.key.trim();
     if key.is_empty() {
