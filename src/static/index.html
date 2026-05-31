@@ -206,6 +206,58 @@
   </div>
 
   <div class="row" style="margin-top: 14px;">
+    <div class="card" style="flex: 2; min-width: 640px;">
+      <h2>Keys 状态</h2>
+      <div class="muted">查看每个 key 的封禁状态，可单独释放/封禁，或一键释放全部 / 一键封禁全部。封禁状态仅存内存，重启后清除。</div>
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top: 8px;">
+        <select id="keyStatusUpstreamSelect" style="padding:6px 8px; min-width:160px;"></select>
+        <button class="btn" id="loadKeyStatus">查看 / 刷新</button>
+        <button class="btn" id="releaseAllKeys">一键释放全部</button>
+        <button class="btn" id="banAllKeys">一键封禁全部</button>
+        <label class="small muted">封禁时长</label>
+        <select id="banDuration" style="padding:6px 8px;">
+          <option value="300000">5 分钟</option>
+          <option value="1800000">30 分钟</option>
+          <option value="3600000" selected>1 小时</option>
+          <option value="21600000">6 小时</option>
+          <option value="86400000">24 小时</option>
+          <option value="">永久（手动释放）</option>
+        </select>
+        <span id="keyStatusInfo" class="muted small"></span>
+      </div>
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top: 8px;">
+        <button class="btn" id="keyStatusPrev">上一页</button>
+        <button class="btn" id="keyStatusNext">下一页</button>
+        <label class="small muted">每页</label>
+        <select id="keyStatusPageSize" style="padding:6px 8px;">
+          <option value="50">50</option>
+          <option value="100" selected>100</option>
+          <option value="200">200</option>
+          <option value="500">500</option>
+        </select>
+        <span id="keyStatusPageInfo" class="muted small"></span>
+      </div>
+      <div style="overflow:auto; max-height: 420px; margin-top: 8px;">
+        <table id="keyStatusTable">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Key</th>
+              <th>状态</th>
+              <th>剩余冷却</th>
+              <th>失败次数</th>
+              <th>最后封禁信息</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <pre id="keyStatusResult" class="small" style="margin-top:8px;"></pre>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top: 14px;">
     <div class="card" style="flex: 2; min-width: 520px;">
       <h2>模型路由</h2>
       <div class="muted">只使用 <span class="mono">models_routes.json</span> 中的路由。未匹配模型会返回 404。</div>

@@ -322,17 +322,38 @@ async fn handle_upstream_subroutes(
             .unwrap();
     }
 
-    match *req.method() {
-        Method::POST => api_add_keys(req, state, upstream_id).await,
-        Method::PUT => api_replace_keys(req, state, upstream_id).await,
-        Method::DELETE => api_delete_keys(req, state, upstream_id).await,
-        Method::GET => api_list_keys(state, upstream_id, req.uri()).await,
+    // Third segment selects a key sub-action: "" (CRUD), "release", or "ban".
+    let action = parts.next().unwrap_or("");
+    match action {
+        "" => match *req.method() {
+            Method::POST => api_add_keys(req, state, upstream_id).await,
+            Method::PUT => api_replace_keys(req, state, upstream_id).await,
+            Method::DELETE => api_delete_keys(req, state, upstream_id).await,
+            Method::GET => api_list_keys(state, upstream_id, req.uri()).await,
+            _ => method_not_allowed(),
+        },
+        "release" => match *req.method() {
+            Method::POST => api_release_keys(req, state, upstream_id).await,
+            _ => method_not_allowed(),
+        },
+        "ban" => match *req.method() {
+            Method::POST => api_ban_keys(req, state, upstream_id).await,
+            _ => method_not_allowed(),
+        },
         _ => Response::builder()
-            .status(405)
+            .status(404)
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"error":"method_not_allowed"}"#))
+            .body(Body::from(r#"{"error":"not_found"}"#))
             .unwrap(),
     }
+}
+
+fn method_not_allowed() -> Response<Body> {
+    Response::builder()
+        .status(405)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"error":"method_not_allowed"}"#))
+        .unwrap()
 }
 
 async fn api_get_model_routes(state: Arc<RouterState>) -> Response<Body> {
@@ -679,9 +700,17 @@ async fn api_reload_all(state: Arc<RouterState>) -> Response<Body> {
         let id_clone = id.clone();
         let store = state.store.clone();
         let u2 = u.clone();
+        let admin_write_lock = state.admin_write_lock.clone();
 
         // Reload in blocking thread.
         let res = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let _admin_guard = admin_write_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("admin write lock poisoned"))?;
+            let _guard = u2
+                .keys_update_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("key update lock poisoned"))?;
             let keys = store.load_all_keys(&id_clone)?;
             let ks = build_key_states(keys)?;
             let n = ks.len();
@@ -732,8 +761,16 @@ async fn api_add_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: 
     let store = state.store.clone();
     let id = upstream_id.to_string();
     let upstream2 = upstream.clone();
+    let admin_write_lock = state.admin_write_lock.clone();
 
     let res = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let _admin_guard = admin_write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("admin write lock poisoned"))?;
+        let _guard = upstream2
+            .keys_update_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("key update lock poisoned"))?;
         let add_res = store.add_keys(&id, &keys)?;
         let inserted = add_res.inserted;
         let existed = add_res.existed;
@@ -791,8 +828,16 @@ async fn api_replace_keys(req: Request<Body>, state: Arc<RouterState>, upstream_
     let store = state.store.clone();
     let id = upstream_id.to_string();
     let upstream2 = upstream.clone();
+    let admin_write_lock = state.admin_write_lock.clone();
 
     let res = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let _admin_guard = admin_write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("admin write lock poisoned"))?;
+        let _guard = upstream2
+            .keys_update_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("key update lock poisoned"))?;
         store.replace_keys(&id, &keys)?;
         let ks = build_key_states(keys)?;
         let n = ks.len();
@@ -835,8 +880,16 @@ async fn api_delete_keys(req: Request<Body>, state: Arc<RouterState>, upstream_i
     let store = state.store.clone();
     let id = upstream_id.to_string();
     let upstream2 = upstream.clone();
+    let admin_write_lock = state.admin_write_lock.clone();
 
     let res = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let _admin_guard = admin_write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("admin write lock poisoned"))?;
+        let _guard = upstream2
+            .keys_update_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("key update lock poisoned"))?;
         let keys = if dedupe { dedupe_keys(keys) } else { keys };
         let removed = store.delete_keys(&id, &keys)?;
 
@@ -867,6 +920,102 @@ async fn api_delete_keys(req: Request<Body>, state: Arc<RouterState>, upstream_i
     }
 }
 
+const MANUAL_BAN_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1000; // ~10 years: default "permanent" manual ban
+
+#[derive(Deserialize, Default)]
+struct KeyStatusBody {
+    #[serde(default)]
+    keys: Option<Vec<String>>,
+    #[serde(default)]
+    all: Option<bool>,
+    #[serde(default)]
+    duration_ms: Option<u64>,
+}
+
+async fn parse_key_status_body(req: Request<Body>) -> Result<KeyStatusBody, String> {
+    let body = read_body_limit(req, 50 * 1024 * 1024)
+        .await
+        .map_err(|e| e.to_string())?;
+    if body.is_empty() {
+        return Ok(KeyStatusBody::default());
+    }
+    serde_json::from_slice(&body).map_err(|e| format!("invalid json: {e}"))
+}
+
+enum KeyStatusScope {
+    All,
+    Keys(ahash::AHashSet<String>),
+}
+
+/// `all:true` selects all keys. Otherwise `keys` must contain at least one non-empty key.
+fn scoped_key_set(body: &KeyStatusBody) -> Result<KeyStatusScope, String> {
+    if matches!(body.all, Some(true)) {
+        return Ok(KeyStatusScope::All);
+    }
+    let keys = body
+        .keys
+        .as_ref()
+        .ok_or_else(|| "keys must be provided unless all is true".to_string())?;
+    let mut set = ahash::AHashSet::with_capacity(keys.len().max(1));
+    for k in keys {
+        let k = k.trim();
+        if !k.is_empty() {
+            set.insert(k.to_string());
+        }
+    }
+    if set.is_empty() {
+        Err("keys must contain at least one non-empty key unless all is true".to_string())
+    } else {
+        Ok(KeyStatusScope::Keys(set))
+    }
+}
+
+async fn api_release_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: &str) -> Response<Body> {
+    let Some((_idx, upstream)) = state.upstream_by_id(upstream_id) else {
+        return RouterState::json_error(http::StatusCode::NOT_FOUND, "unknown upstream id", "not_found");
+    };
+    let body = match parse_key_status_body(req).await {
+        Ok(b) => b,
+        Err(e) => return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request"),
+    };
+    let released = match scoped_key_set(&body) {
+        Ok(KeyStatusScope::Keys(set)) => upstream.release_keys(&set),
+        Ok(KeyStatusScope::All) => upstream.release_all_keys(),
+        Err(e) => return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request"),
+    };
+    json_ok(&serde_json::json!({
+        "ok": true,
+        "upstream": upstream_id,
+        "released": released,
+        "keys_total": upstream.keys_len()
+    }))
+}
+
+async fn api_ban_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: &str) -> Response<Body> {
+    let Some((_idx, upstream)) = state.upstream_by_id(upstream_id) else {
+        return RouterState::json_error(http::StatusCode::NOT_FOUND, "unknown upstream id", "not_found");
+    };
+    let body = match parse_key_status_body(req).await {
+        Ok(b) => b,
+        Err(e) => return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request"),
+    };
+    let now = now_ms();
+    let duration = body.duration_ms.unwrap_or(MANUAL_BAN_MS);
+    let until = now.saturating_add(duration);
+    let banned = match scoped_key_set(&body) {
+        Ok(KeyStatusScope::Keys(set)) => upstream.ban_keys(&set, until),
+        Ok(KeyStatusScope::All) => upstream.ban_all_keys(until),
+        Err(e) => return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request"),
+    };
+    json_ok(&serde_json::json!({
+        "ok": true,
+        "upstream": upstream_id,
+        "banned": banned,
+        "until_ms": until,
+        "keys_total": upstream.keys_len()
+    }))
+}
+
 #[derive(Serialize)]
 struct KeyInfo {
     key: String,
@@ -874,6 +1023,7 @@ struct KeyInfo {
     cooldown_remaining_ms: i64,
     fail_streak: u32,
     status: &'static str,
+    last_ban: Option<crate::state::KeyBanInfo>,
 }
 
 async fn api_list_keys(state: Arc<RouterState>, upstream_id: &str, uri: &http::Uri) -> Response<Body> {
@@ -894,7 +1044,8 @@ async fn api_list_keys(state: Arc<RouterState>, upstream_id: &str, uri: &http::U
     let keys_arc = upstream.keys.load_full();
     let keys = keys_arc.as_ref();
     let total = keys.len();
-    let end = (offset + limit).min(total);
+    let offset = offset.min(total);
+    let end = offset.saturating_add(limit).min(total);
 
     let mut out: Vec<KeyInfo> = Vec::with_capacity(end.saturating_sub(offset));
     for k in keys.iter().skip(offset).take(end - offset) {
@@ -902,12 +1053,14 @@ async fn api_list_keys(state: Arc<RouterState>, upstream_id: &str, uri: &http::U
         let remaining = if cd > now { (cd - now) as i64 } else { 0 };
         let streak = k.fail_streak.load(std::sync::atomic::Ordering::Relaxed);
         let status = if cd > now { "banned" } else { "ok" };
+        let last_ban = if cd > now { k.last_ban_info() } else { None };
         out.push(KeyInfo {
             key: k.key.to_string(),
             cooldown_until_ms: cd,
             cooldown_remaining_ms: remaining,
             fail_streak: streak,
             status,
+            last_ban,
         });
     }
 

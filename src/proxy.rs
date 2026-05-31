@@ -1,6 +1,7 @@
 
 use crate::admin;
-use crate::state::{sanitize_hop_headers, RequestLogEntry, RouterState, HDR_AUTHORIZATION};
+use crate::billing::ReserveResult;
+use crate::state::{sanitize_hop_headers, KeyBanEvent, RequestLogEntry, RouterState, HDR_AUTHORIZATION};
 use crate::util::now_ms;
 use flate2::{Decompress, FlushDecompress, Status};
 use hyper::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
@@ -101,7 +102,7 @@ async fn handle(
         }
     };
 
-    if balance < 0 {
+    if balance <= 0 {
         return logged_json_error(
             &state,
             &base_log_ctx,
@@ -116,7 +117,6 @@ async fn handle(
     state.stats.requests_inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let t0 = Instant::now();
 
-    let now = now_ms();
     let resp = if req.method() == hyper::Method::GET
         && (path == "/v1/models" || path == "/v1/models/")
     {
@@ -127,7 +127,6 @@ async fn handle(
         forward(
             req,
             state.clone(),
-            now,
             start,
             client_ip,
             method,
@@ -148,7 +147,6 @@ async fn handle(
 async fn forward(
     req: Request<Body>,
     state: Arc<RouterState>,
-    now_ms: u64,
     start: Instant,
     client_ip: String,
     method: hyper::Method,
@@ -238,6 +236,7 @@ async fn forward(
         );
     };
 
+    let now = now_ms();
     let mut sel = if !state.model_exists(&model) {
         return logged_json_error(
             &state,
@@ -246,7 +245,7 @@ async fn forward(
             "model not found",
             "model_not_found",
         );
-    } else if let Some(sel) = state.select_for_model(&model, now_ms) {
+    } else if let Some(sel) = state.select_for_model(&model, now) {
         sel
     } else {
         return logged_json_error(
@@ -275,14 +274,19 @@ async fn forward(
     // Retry policy from config.
     let max_retries = state.max_retries;
     let mut retry_count = 0;
+    let mut billing_reserved = false;
 
     loop {
+        let now = now_ms();
         log_ctx.upstream_id = Some(sel.upstream.id.to_string());
         let upstream = &sel.upstream;
 
         let uri = match upstream.build_uri(&original_pq) {
             Ok(u) => u,
             Err(_) => {
+                if billing_reserved {
+                    let _ = state.billing.release_reservation(&billing_key);
+                }
                 return RouterState::json_error(
                     http::StatusCode::BAD_GATEWAY,
                     "invalid upstream URI",
@@ -301,22 +305,68 @@ async fn forward(
             injected,
         ) {
             Ok(req) => req,
-            Err(resp) => return logged_response(&state, &log_ctx, resp),
+            Err(resp) => {
+                if billing_reserved {
+                    let _ = state.billing.release_reservation(&billing_key);
+                }
+                return logged_response(&state, &log_ctx, resp);
+            }
         };
+
+        if !billing_reserved {
+            match state.billing.reserve_request(&billing_key) {
+                ReserveResult::Reserved => {
+                    billing_reserved = true;
+                }
+                ReserveResult::Insufficient => {
+                    return logged_json_error(
+                        &state,
+                        &log_ctx,
+                        http::StatusCode::UNAUTHORIZED,
+                        "insufficient balance",
+                        "balance_insufficient",
+                    );
+                }
+                ReserveResult::Missing => {
+                    return logged_json_error(
+                        &state,
+                        &log_ctx,
+                        http::StatusCode::UNAUTHORIZED,
+                        "invalid api key",
+                        "api_key_invalid",
+                    );
+                }
+            }
+        }
 
         // Enforce timeout.
         let res = tokio::time::timeout(state.request_timeout, state.client.request(out_req)).await;
 
         match res {
             Ok(Ok(up_resp)) => {
+                let status_now = now_ms();
                 let status = up_resp.status();
-                state.on_upstream_status(&sel, status, now_ms);
+                let retry_after_ms = if status == http::StatusCode::TOO_MANY_REQUESTS {
+                    parse_retry_after(up_resp.headers())
+                } else {
+                    None
+                };
+                let ban_event = state.on_upstream_status(
+                    &sel,
+                    status,
+                    retry_after_ms,
+                    status_now,
+                    Some(up_resp.headers()),
+                );
 
                 // Retry on auth errors, rate limit, and configurable status codes.
                 let should_retry = should_retry_status(&state, status);
 
                 if should_retry && retry_count < max_retries {
-                    if let Some(new_sel) = state.select_for_model(&model, now_ms) {
+                    if let Some(new_sel) = state.select_for_model(&model, status_now) {
+                        if let Some(event) = ban_event {
+                            capture_ban_body_with_timeout(up_resp.into_body(), event, state.request_timeout).await;
+                        }
                         retry_count += 1;
                         tracing::debug!(
                             status = %status,
@@ -336,14 +386,15 @@ async fn forward(
                     log_ctx,
                     stream_request,
                     Some(billing_key.clone()),
+                    ban_event,
                 );
             }
             Ok(Err(_e)) => {
-                state.on_network_error(&sel, now_ms);
+                state.on_network_error(&sel, now);
 
                 // Retry on network error (upstream is now banned, next select picks a different one).
                 if retry_count < max_retries {
-                    if let Some(new_sel) = state.select_for_model(&model, now_ms) {
+                    if let Some(new_sel) = state.select_for_model(&model, now) {
                         retry_count += 1;
                         tracing::debug!(
                             retry = retry_count,
@@ -356,6 +407,9 @@ async fn forward(
                     }
                 }
 
+                if billing_reserved {
+                    let _ = state.billing.release_reservation(&billing_key);
+                }
                 let resp = RouterState::json_error(
                     http::StatusCode::BAD_GATEWAY,
                     "upstream request failed",
@@ -364,11 +418,11 @@ async fn forward(
                 return logged_response(&state, &log_ctx, resp);
             }
             Err(_) => {
-                state.on_timeout(&sel, now_ms);
+                state.on_timeout(&sel, now);
 
                 // Retry on timeout (upstream is now banned, next select picks a different one).
                 if retry_count < max_retries {
-                    if let Some(new_sel) = state.select_for_model(&model, now_ms) {
+                    if let Some(new_sel) = state.select_for_model(&model, now) {
                         retry_count += 1;
                         tracing::debug!(
                             retry = retry_count,
@@ -381,6 +435,9 @@ async fn forward(
                     }
                 }
 
+                if billing_reserved {
+                    let _ = state.billing.release_reservation(&billing_key);
+                }
                 let resp = RouterState::json_error(
                     http::StatusCode::GATEWAY_TIMEOUT,
                     "upstream request timeout",
@@ -524,12 +581,89 @@ fn should_retry_status(state: &RouterState, status: http::StatusCode) -> bool {
         || state.should_retry_status(status)
 }
 
+/// Parse an HTTP `Retry-After` header into milliseconds to wait from now.
+/// Handles both delta-seconds (e.g. `120`) and the HTTP-date form. Returns
+/// `None` when absent/unparseable; `Some(0)` for a date already in the past.
+fn parse_retry_after(headers: &hyper::HeaderMap) -> Option<u64> {
+    let s = headers.get(http::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // delta-seconds: the common case for OpenAI/Azure/Anthropic-style upstreams.
+    if let Ok(secs) = s.parse::<u64>() {
+        return Some(secs.saturating_mul(1000));
+    }
+    // HTTP-date form (RFC 7231).
+    if let Ok(when) = httpdate::parse_http_date(s) {
+        return Some(
+            when.duration_since(std::time::SystemTime::now())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        );
+    }
+    None
+}
+
+const BAN_BODY_CAPTURE_LIMIT: usize = 64 * 1024;
+
+fn append_limited_body(buf: &mut Vec<u8>, truncated: &mut bool, chunk: &bytes::Bytes) {
+    if *truncated {
+        return;
+    }
+    let remaining = BAN_BODY_CAPTURE_LIMIT.saturating_sub(buf.len());
+    if remaining == 0 {
+        *truncated = true;
+        return;
+    }
+    if chunk.len() > remaining {
+        buf.extend_from_slice(&chunk[..remaining]);
+        *truncated = true;
+    } else {
+        buf.extend_from_slice(chunk);
+    }
+}
+
+fn body_bytes_to_display(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).to_string()
+}
+
+async fn capture_ban_body_with_timeout(
+    body: Body,
+    event: KeyBanEvent,
+    timeout: std::time::Duration,
+) {
+    let _ = tokio::time::timeout(timeout, capture_ban_body(body, event)).await;
+}
+
+async fn capture_ban_body(mut body: Body, event: KeyBanEvent) {
+    use hyper::body::HttpBody;
+
+    let mut buf = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = body.data().await {
+        let Ok(chunk) = chunk else {
+            break;
+        };
+        append_limited_body(&mut buf, &mut truncated, &chunk);
+        if truncated {
+            break;
+        }
+    }
+    event.key.finish_last_ban_body(
+        event.ts_ms,
+        event.cooldown_until_ms,
+        body_bytes_to_display(&buf),
+        truncated,
+    );
+}
+
 fn proxy_upstream_response(
     up_resp: Response<Body>,
     state: Arc<RouterState>,
     log_ctx: RequestLogContext,
     stream_request: bool,
     billing_key: Option<String>,
+    ban_event: Option<KeyBanEvent>,
 ) -> Response<Body> {
     let (mut parts, body) = up_resp.into_parts();
     sanitize_hop_headers(&mut parts.headers);
@@ -572,12 +706,17 @@ fn proxy_upstream_response(
         let mut json_buf: Vec<u8> = Vec::new();
         let mut json_overflow = false;
         let mut decompressed_bytes = 0usize;
+        let mut ban_body = Vec::new();
+        let mut ban_body_truncated = false;
 
         let mut body = body;
         while let Some(chunk) = body.data().await {
             match chunk {
                 Ok(chunk) => {
                     resp_bytes = resp_bytes.saturating_add(chunk.len());
+                    if ban_event.is_some() {
+                        append_limited_body(&mut ban_body, &mut ban_body_truncated, &chunk);
+                    }
                     if tx.send(Ok(chunk.clone())).await.is_err() {
                         break;
                     }
@@ -632,8 +771,21 @@ fn proxy_upstream_response(
             usage = usage_from_json_bytes(&json_buf);
         }
 
-        if let (Some(key), Some(found)) = (billing_key.as_deref(), usage) {
-            let _ = state.billing.apply_usage(key, found.total);
+        if let Some(event) = ban_event {
+            event.key.finish_last_ban_body(
+                event.ts_ms,
+                event.cooldown_until_ms,
+                body_bytes_to_display(&ban_body),
+                ban_body_truncated,
+            );
+        }
+
+        if let Some(key) = billing_key.as_deref() {
+            if let Some(found) = usage {
+                let _ = state.billing.settle_reserved_usage(key, found.total);
+            } else {
+                let _ = state.billing.release_reservation(key);
+            }
         }
         record_request(&state, &log_ctx, status.as_u16(), resp_bytes, usage);
     });

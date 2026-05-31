@@ -45,6 +45,7 @@ pub struct RouterState {
 
     pub stats: Arc<Stats>,
     pub requests: Arc<RequestsLog>,
+    pub admin_write_lock: Arc<Mutex<()>>,
 }
 
 pub struct RouterSnapshot {
@@ -73,6 +74,7 @@ impl Clone for RouterState {
             client: self.client.clone(),
             stats: self.stats.clone(),
             requests: self.requests.clone(),
+            admin_write_lock: self.admin_write_lock.clone(),
         }
     }
 }
@@ -88,6 +90,7 @@ pub struct Upstream {
     pub weight: usize,
 
     pub keys: ArcSwap<Vec<Arc<KeyState>>>,
+    pub keys_update_lock: Mutex<()>,
     pub key_rr: AtomicUsize,
     pub models: ArcSwap<AHashSet<String>>,
 
@@ -103,6 +106,32 @@ pub struct KeyState {
     pub auth_header: hyper::header::HeaderValue,
     pub cooldown_until_ms: AtomicU64,
     pub fail_streak: AtomicU32,
+    pub last_ban: Mutex<Option<KeyBanInfo>>,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct KeyBanHeader {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct KeyBanInfo {
+    pub ts_ms: u64,
+    pub status: u16,
+    pub reason: String,
+    pub retry_after_ms: Option<u64>,
+    pub cooldown_until_ms: u64,
+    pub headers: Vec<KeyBanHeader>,
+    pub body: String,
+    pub body_truncated: bool,
+}
+
+#[derive(Clone)]
+pub struct KeyBanEvent {
+    pub key: Arc<KeyState>,
+    pub ts_ms: u64,
+    pub cooldown_until_ms: u64,
 }
 
 #[derive(Clone)]
@@ -414,6 +443,7 @@ impl RouterState {
             client,
             stats: Arc::new(Stats::new()),
             requests,
+            admin_write_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -628,7 +658,14 @@ impl RouterState {
         Ok(count)
     }
     #[inline]
-    pub fn on_upstream_status(&self, sel: &Selected, status: http::StatusCode, now_ms: u64) {
+    pub fn on_upstream_status(
+        &self,
+        sel: &Selected,
+        status: http::StatusCode,
+        retry_after_ms: Option<u64>,
+        now_ms: u64,
+        headers: Option<&hyper::HeaderMap>,
+    ) -> Option<KeyBanEvent> {
         let u = &sel.upstream;
 
         // HTTP response means upstream is reachable; clear upstream cooldown and streak.
@@ -642,18 +679,44 @@ impl RouterState {
         self.inc_global_status(status);
 
         if status == http::StatusCode::TOO_MANY_REQUESTS {
-            // Key-level rate limit.
-            self.ban_key(&sel.key, self.ban.rate_limit_ms, now_ms);
+            // Key-level rate limit. Honor the upstream's Retry-After when present
+            // (clamped to a sane ceiling); otherwise fall back to exponential backoff.
+            let until = match retry_after_ms {
+                Some(ms) if ms > 0 => {
+                    self.ban_key_for(&sel.key, ms.min(self.rate_limit_ceiling_ms()), now_ms)
+                }
+                _ => self.ban_key(&sel.key, self.ban.rate_limit_ms, now_ms),
+            };
+            return Some(record_key_ban_info(
+                &sel.key,
+                status,
+                "rate_limit",
+                retry_after_ms,
+                now_ms,
+                until,
+                headers,
+            ));
         } else if status == http::StatusCode::UNAUTHORIZED || status == http::StatusCode::FORBIDDEN {
             // Key invalid / forbidden.
-            self.ban_key(&sel.key, self.ban.auth_error_ms, now_ms);
+            let until = self.ban_key(&sel.key, self.ban.auth_error_ms, now_ms);
+            return Some(record_key_ban_info(
+                &sel.key,
+                status,
+                "auth_error",
+                retry_after_ms,
+                now_ms,
+                until,
+                headers,
+            ));
         } else if status.is_server_error() {
             // Upstream 5xx: prefer upstream cooldown, not key cooldown.
             self.ban_upstream(u, self.ban.server_error_ms, now_ms);
         } else {
             // Success or other 4xx: reset key streak.
             sel.key.fail_streak.store(0, Ordering::Relaxed);
+            sel.key.clear_last_ban_info();
         }
+        None
     }
 
     #[inline]
@@ -685,7 +748,7 @@ impl RouterState {
         }
     }
 
-    fn ban_key(&self, key: &KeyState, base_ms: u64, now_ms: u64) {
+    fn ban_key(&self, key: &KeyState, base_ms: u64, now_ms: u64) -> u64 {
         let streak = key.fail_streak.fetch_add(1, Ordering::Relaxed) + 1;
         let max_pow = self.ban.max_backoff_pow.min(30);
         let pow = (streak - 1).min(max_pow);
@@ -695,6 +758,25 @@ impl RouterState {
         let until = now_ms.saturating_add(ban_ms);
 
         key.cooldown_until_ms.store(until, Ordering::Relaxed);
+        until
+    }
+
+    /// Ban a key for an explicit cooldown (used when honoring `Retry-After`).
+    /// Still bumps the fail streak so a later header-less 429 backs off further.
+    fn ban_key_for(&self, key: &KeyState, cooldown_ms: u64, now_ms: u64) -> u64 {
+        key.fail_streak.fetch_add(1, Ordering::Relaxed);
+        let until = now_ms.saturating_add(cooldown_ms);
+        key.cooldown_until_ms.store(until, Ordering::Relaxed);
+        until
+    }
+
+    /// Upper bound for a key cooldown: the most the exponential backoff could
+    /// ever produce (`rate_limit_ms << max_backoff_pow`). Caps a hostile or
+    /// oversized `Retry-After` so one response can't sideline a key for days.
+    #[inline]
+    fn rate_limit_ceiling_ms(&self) -> u64 {
+        let max_pow = self.ban.max_backoff_pow.min(30);
+        self.ban.rate_limit_ms.saturating_mul(1u64 << max_pow)
     }
 
     fn ban_upstream(&self, u: &Upstream, base_ms: u64, now_ms: u64) {
@@ -743,6 +825,42 @@ impl RouterState {
     }
 }
 
+impl KeyState {
+    pub fn clear_last_ban_info(&self) {
+        if let Ok(mut info) = self.last_ban.lock() {
+            *info = None;
+        }
+    }
+
+    pub fn last_ban_info(&self) -> Option<KeyBanInfo> {
+        self.last_ban.lock().ok().and_then(|info| info.clone())
+    }
+
+    fn set_last_ban_info(&self, info: KeyBanInfo) {
+        if let Ok(mut last) = self.last_ban.lock() {
+            *last = Some(info);
+        }
+    }
+
+    pub fn finish_last_ban_body(
+        &self,
+        ts_ms: u64,
+        cooldown_until_ms: u64,
+        body: String,
+        body_truncated: bool,
+    ) {
+        if let Ok(mut last) = self.last_ban.lock() {
+            let Some(info) = last.as_mut() else {
+                return;
+            };
+            if info.ts_ms == ts_ms && info.cooldown_until_ms == cooldown_until_ms {
+                info.body = body;
+                info.body_truncated = body_truncated;
+            }
+        }
+    }
+}
+
 impl Upstream {
     fn select_key(&self, now_ms: u64) -> Option<Arc<KeyState>> {
         let keys_arc = self.keys.load_full();
@@ -762,6 +880,56 @@ impl Upstream {
             }
         }
         None
+    }
+
+    /// Clear cooldown + fail streak for keys whose value is in `set`. Returns the count matched.
+    pub fn release_keys(&self, set: &AHashSet<String>) -> usize {
+        let keys = self.keys.load_full();
+        let mut n = 0;
+        for k in keys.iter() {
+            if set.contains(k.key.as_ref()) {
+                k.cooldown_until_ms.store(0, Ordering::Relaxed);
+                k.fail_streak.store(0, Ordering::Relaxed);
+                k.clear_last_ban_info();
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Clear cooldown + fail streak for all keys. Returns the count cleared.
+    pub fn release_all_keys(&self) -> usize {
+        let keys = self.keys.load_full();
+        for k in keys.iter() {
+            k.cooldown_until_ms.store(0, Ordering::Relaxed);
+            k.fail_streak.store(0, Ordering::Relaxed);
+            k.clear_last_ban_info();
+        }
+        keys.len()
+    }
+
+    /// Ban keys whose value is in `set` until `until_ms`. Returns the count matched.
+    pub fn ban_keys(&self, set: &AHashSet<String>, until_ms: u64) -> usize {
+        let keys = self.keys.load_full();
+        let mut n = 0;
+        for k in keys.iter() {
+            if set.contains(k.key.as_ref()) {
+                k.cooldown_until_ms.store(until_ms, Ordering::Relaxed);
+                k.clear_last_ban_info();
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Ban all keys until `until_ms`. Returns the count banned.
+    pub fn ban_all_keys(&self, until_ms: u64) -> usize {
+        let keys = self.keys.load_full();
+        for k in keys.iter() {
+            k.cooldown_until_ms.store(until_ms, Ordering::Relaxed);
+            k.clear_last_ban_info();
+        }
+        keys.len()
     }
 
     /// Builds an absolute URI to upstream by combining base scheme+authority and request path/query.
@@ -833,6 +1001,43 @@ fn inc_status(stats: &UpstreamStats, status: http::StatusCode) {
     }
 }
 
+fn record_key_ban_info(
+    key: &Arc<KeyState>,
+    status: http::StatusCode,
+    reason: &str,
+    retry_after_ms: Option<u64>,
+    ts_ms: u64,
+    cooldown_until_ms: u64,
+    headers: Option<&hyper::HeaderMap>,
+) -> KeyBanEvent {
+    let info = KeyBanInfo {
+        ts_ms,
+        status: status.as_u16(),
+        reason: reason.to_string(),
+        retry_after_ms,
+        cooldown_until_ms,
+        headers: headers.map(capture_headers).unwrap_or_default(),
+        body: String::new(),
+        body_truncated: false,
+    };
+    key.set_last_ban_info(info);
+    KeyBanEvent {
+        key: key.clone(),
+        ts_ms,
+        cooldown_until_ms,
+    }
+}
+
+fn capture_headers(headers: &hyper::HeaderMap) -> Vec<KeyBanHeader> {
+    headers
+        .iter()
+        .map(|(name, value)| KeyBanHeader {
+            name: name.as_str().to_string(),
+            value: String::from_utf8_lossy(value.as_bytes()).to_string(),
+        })
+        .collect()
+}
+
 fn parse_upstream(u: UpstreamConfig, weight: usize) -> anyhow::Result<Arc<Upstream>> {
     let name_for_err = u.id.clone();
 
@@ -857,6 +1062,7 @@ fn parse_upstream(u: UpstreamConfig, weight: usize) -> anyhow::Result<Arc<Upstre
         base_path: Arc::<str>::from(base_path),
         weight,
         keys: ArcSwap::from_pointee(Vec::new()),
+        keys_update_lock: Mutex::new(()),
         key_rr: AtomicUsize::new(0),
         models: ArcSwap::from_pointee(AHashSet::new()),
         cooldown_until_ms: AtomicU64::new(0),
@@ -884,6 +1090,7 @@ pub fn build_key_states(keys: Vec<String>) -> anyhow::Result<Arc<Vec<Arc<KeyStat
             auth_header,
             cooldown_until_ms: AtomicU64::new(0),
             fail_streak: AtomicU32::new(0),
+            last_ban: Mutex::new(None),
         }));
     }
     Ok(Arc::new(out))
@@ -1004,6 +1211,10 @@ impl RouterState {
     }
 
     pub fn add_upstream(&self, cfg: UpstreamConfig) -> anyhow::Result<()> {
+        let _guard = self
+            .admin_write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("admin write lock poisoned"))?;
         let mut list = self.current_upstream_configs();
         if list.iter().any(|u| u.id == cfg.id) {
             anyhow::bail!("upstream id already exists");
@@ -1014,6 +1225,10 @@ impl RouterState {
     }
 
     pub fn update_upstream(&self, id: &str, base_url: String, weight: Option<usize>) -> anyhow::Result<()> {
+        let _guard = self
+            .admin_write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("admin write lock poisoned"))?;
         let mut list = self.current_upstream_configs();
         let mut found = false;
         for u in list.iter_mut() {
@@ -1032,6 +1247,10 @@ impl RouterState {
     }
 
     pub fn delete_upstream(&self, id: &str, delete_keys: bool) -> anyhow::Result<()> {
+        let _guard = self
+            .admin_write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("admin write lock poisoned"))?;
         let mut list = self.current_upstream_configs();
         let before = list.len();
         list.retain(|u| u.id != id);

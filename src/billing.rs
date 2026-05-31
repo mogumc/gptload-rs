@@ -11,6 +11,12 @@ pub struct BillingStore {
     persist_tx: Sender<PersistUpdate>,
 }
 
+pub enum ReserveResult {
+    Reserved,
+    Insufficient,
+    Missing,
+}
+
 enum PersistUpdate {
     Set { key: String, balance: i64 },
 }
@@ -107,12 +113,46 @@ impl BillingStore {
         }
     }
 
-    pub fn apply_usage(&self, key: &str, total_tokens: u64) -> Option<i64> {
+    pub fn reserve_request(&self, key: &str) -> ReserveResult {
+        let map = match self.balances.read() {
+            Ok(map) => map,
+            Err(_) => return ReserveResult::Missing,
+        };
+        let Some(balance) = map.get(key).cloned() else {
+            return ReserveResult::Missing;
+        };
+        drop(map);
+
+        let mut cur = balance.load(Ordering::Relaxed);
+        loop {
+            if cur <= 0 {
+                return ReserveResult::Insufficient;
+            }
+            let new_balance = cur.saturating_sub(1);
+            match balance.compare_exchange(cur, new_balance, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => {
+                    let _ = self.persist_tx.send(PersistUpdate::Set {
+                        key: key.to_string(),
+                        balance: new_balance,
+                    });
+                    return ReserveResult::Reserved;
+                }
+                Err(v) => cur = v,
+            }
+        }
+    }
+
+    pub fn release_reservation(&self, key: &str) -> Option<i64> {
+        self.adjust_balance(key, 1)
+    }
+
+    pub fn settle_reserved_usage(&self, key: &str, total_tokens: u64) -> Option<i64> {
         let delta = i64::try_from(total_tokens).ok()?;
-        if delta == 0 {
+        let adjustment = 1i64.saturating_sub(delta);
+        if adjustment == 0 {
             return self.get_balance(key);
         }
-        self.adjust_balance(key, -delta)
+        self.adjust_balance(key, adjustment)
     }
 }
 

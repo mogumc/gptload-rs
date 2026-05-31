@@ -56,10 +56,26 @@
   const selectNoneModelsBtn = document.getElementById('selectNoneModels');
   const modelsInfo = document.getElementById('modelsInfo');
   const modelsList = document.getElementById('modelsList');
+
+  const keyStatusUpstreamSelect = document.getElementById('keyStatusUpstreamSelect');
+  const loadKeyStatusBtn = document.getElementById('loadKeyStatus');
+  const releaseAllKeysBtn = document.getElementById('releaseAllKeys');
+  const banAllKeysBtn = document.getElementById('banAllKeys');
+  const banDurationSelect = document.getElementById('banDuration');
+  const keyStatusInfo = document.getElementById('keyStatusInfo');
+  const keyStatusPrevBtn = document.getElementById('keyStatusPrev');
+  const keyStatusNextBtn = document.getElementById('keyStatusNext');
+  const keyStatusPageSize = document.getElementById('keyStatusPageSize');
+  const keyStatusPageInfo = document.getElementById('keyStatusPageInfo');
+  const keyStatusTableBody = document.querySelector('#keyStatusTable tbody');
+  const keyStatusResult = document.getElementById('keyStatusResult');
+
   let lastModels = [];
   let lastUpstreams = [];
   let requestsTimer = null;
   let chartTimer = null;
+  let keyStatusOffset = 0;
+  let keyStatusTotal = 0;
 
   function getToken() {
     return localStorage.getItem('gptload_admin_token') || '';
@@ -162,6 +178,16 @@
       upstreamManageSelect.appendChild(opt);
     }
     if (currentManage) upstreamManageSelect.value = currentManage;
+
+    const currentKeyStatus = keyStatusUpstreamSelect.value;
+    keyStatusUpstreamSelect.innerHTML = '';
+    for (const u of lastUpstreams) {
+      const opt = document.createElement('option');
+      opt.value = u.id;
+      opt.textContent = `${u.id} (keys=${u.keys_total})`;
+      keyStatusUpstreamSelect.appendChild(opt);
+    }
+    if (currentKeyStatus) keyStatusUpstreamSelect.value = currentKeyStatus;
   }
 
   async function refreshUpstreams() {
@@ -616,6 +642,166 @@
   selectNoneModelsBtn.onclick = () => {
     const cbs = modelsList.querySelectorAll('input[type="checkbox"]');
     for (const cb of cbs) cb.checked = false;
+  };
+
+  function keyStatusPageSizeValue() {
+    return parseInt(keyStatusPageSize.value, 10) || 100;
+  }
+
+  function maskKey(k) {
+    k = k || '';
+    if (k.length <= 12) return k;
+    return k.slice(0, 6) + '…' + k.slice(-4);
+  }
+
+  function keyBanInfoHtml(info) {
+    if (!info) return '<span class="muted">-</span>';
+    const status = info.status || 0;
+    const reason = info.reason || 'ban';
+    const when = info.ts_ms ? new Date(info.ts_ms).toLocaleString() : '-';
+    const summary = status ? `HTTP ${status} ${reason}` : reason;
+    const detail = {
+      time: when,
+      status,
+      reason,
+      retry_after_ms: info.retry_after_ms || null,
+      cooldown_until: info.cooldown_until_ms ? new Date(info.cooldown_until_ms).toLocaleString() : null,
+      headers: info.headers || [],
+      body: info.body || '',
+      body_truncated: !!info.body_truncated
+    };
+    return `
+      <details>
+        <summary class="mono small">${escapeHtml(summary)}</summary>
+        <pre class="small" style="max-width: 680px; max-height: 220px;">${escapeHtml(JSON.stringify(detail, null, 2))}</pre>
+      </details>
+    `;
+  }
+
+  function renderKeyStatus(list, offset) {
+    keyStatusTableBody.innerHTML = '';
+    list.forEach((k, i) => {
+      const tr = document.createElement('tr');
+      const banned = k.status === 'banned' || (k.cooldown_remaining_ms || 0) > 0;
+      const statusClass = banned ? 'bad' : 'ok';
+      const remaining = (k.cooldown_remaining_ms || 0) > 0 ? formatDuration(k.cooldown_remaining_ms) : '-';
+      const banInfo = banned ? keyBanInfoHtml(k.last_ban) : '<span class="muted">-</span>';
+      tr.innerHTML = `
+        <td class="mono small">${offset + i + 1}</td>
+        <td class="mono small" title="${escapeHtml(k.key)}">${escapeHtml(maskKey(k.key))}</td>
+        <td class="${statusClass}">${banned ? 'banned' : 'ok'}</td>
+        <td class="mono small">${remaining}</td>
+        <td class="mono small">${k.fail_streak || 0}</td>
+        <td class="small">${banInfo}</td>
+      `;
+      const actionTd = document.createElement('td');
+      const relBtn = document.createElement('button');
+      relBtn.className = 'btn';
+      relBtn.textContent = '释放';
+      relBtn.dataset.key = k.key;
+      relBtn.onclick = () => keyAction('release', [relBtn.dataset.key]);
+      const banBtn = document.createElement('button');
+      banBtn.className = 'btn';
+      banBtn.textContent = '封禁';
+      banBtn.style.marginLeft = '6px';
+      banBtn.dataset.key = k.key;
+      banBtn.onclick = () => keyAction('ban', [banBtn.dataset.key]);
+      actionTd.appendChild(relBtn);
+      actionTd.appendChild(banBtn);
+      tr.appendChild(actionTd);
+      keyStatusTableBody.appendChild(tr);
+    });
+  }
+
+  async function loadKeyStatus() {
+    const upstream = keyStatusUpstreamSelect.value;
+    if (!upstream) return alert('请选择 upstream');
+    const limit = keyStatusPageSizeValue();
+    if (keyStatusOffset < 0) keyStatusOffset = 0;
+    keyStatusInfo.textContent = '加载中...';
+    const { res, json, text } = await apiFetch(
+      `/admin/api/v1/upstreams/${encodeURIComponent(upstream)}/keys?offset=${keyStatusOffset}&limit=${limit}`
+    );
+    if (!res.ok) {
+      keyStatusInfo.textContent = `失败 ${res.status}`;
+      keyStatusResult.textContent = text || '';
+      return;
+    }
+    keyStatusTotal = (json && json.total) || 0;
+    if (json && Number.isInteger(json.offset)) {
+      keyStatusOffset = json.offset;
+    }
+    // Clamp offset if it ran past the end (e.g. keys removed since last load).
+    if (keyStatusOffset >= keyStatusTotal && keyStatusTotal > 0) {
+      const nextOffset = Math.max(0, Math.floor((keyStatusTotal - 1) / limit) * limit);
+      if (nextOffset !== keyStatusOffset) {
+        keyStatusOffset = nextOffset;
+        return loadKeyStatus();
+      }
+    }
+    const list = (json && json.keys) || [];
+    renderKeyStatus(list, keyStatusOffset);
+    const end = keyStatusOffset + list.length;
+    keyStatusInfo.textContent = `total=${keyStatusTotal} ｜ ${new Date().toLocaleTimeString()}`;
+    keyStatusPageInfo.textContent = keyStatusTotal > 0 ? `${keyStatusOffset + 1}–${end} / ${keyStatusTotal}` : '0 / 0';
+  }
+
+  function banDurationBody(body) {
+    const d = banDurationSelect.value;
+    if (d) body.duration_ms = parseInt(d, 10);
+    return body;
+  }
+
+  async function postKeyAction(action, body) {
+    const upstream = keyStatusUpstreamSelect.value;
+    if (!upstream) return alert('请选择 upstream');
+    keyStatusResult.textContent = '提交中...';
+    const { res, json, text } = await apiFetch(
+      `/admin/api/v1/upstreams/${encodeURIComponent(upstream)}/keys/${action}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+    if (!res.ok) {
+      keyStatusResult.textContent = `失败 ${res.status}\n${text || ''}`;
+      return false;
+    }
+    keyStatusResult.textContent = JSON.stringify(json || {}, null, 2);
+    await loadKeyStatus();
+    await refreshUpstreams();
+    return true;
+  }
+
+  async function keyAction(action, keys) {
+    const body = action === 'ban' ? banDurationBody({ keys }) : { keys };
+    await postKeyAction(action, body);
+  }
+
+  async function bulkKeyAction(action) {
+    const upstream = keyStatusUpstreamSelect.value;
+    if (!upstream) return alert('请选择 upstream');
+    const verb = action === 'ban' ? '封禁' : '释放';
+    if (!confirm(`确认${verb} upstream "${upstream}" 的全部 keys?`)) return;
+    const body = action === 'ban' ? banDurationBody({ all: true }) : { all: true };
+    await postKeyAction(action, body);
+  }
+
+  if (loadKeyStatusBtn) loadKeyStatusBtn.onclick = () => { keyStatusOffset = 0; loadKeyStatus(); };
+  if (keyStatusUpstreamSelect) keyStatusUpstreamSelect.onchange = () => { keyStatusOffset = 0; loadKeyStatus(); };
+  if (keyStatusPageSize) keyStatusPageSize.onchange = () => { keyStatusOffset = 0; loadKeyStatus(); };
+  if (releaseAllKeysBtn) releaseAllKeysBtn.onclick = () => bulkKeyAction('release');
+  if (banAllKeysBtn) banAllKeysBtn.onclick = () => bulkKeyAction('ban');
+  if (keyStatusPrevBtn) keyStatusPrevBtn.onclick = () => {
+    const limit = keyStatusPageSizeValue();
+    keyStatusOffset = Math.max(0, keyStatusOffset - limit);
+    loadKeyStatus();
+  };
+  if (keyStatusNextBtn) keyStatusNextBtn.onclick = () => {
+    const limit = keyStatusPageSizeValue();
+    if (keyStatusOffset + limit < keyStatusTotal) {
+      keyStatusOffset += limit;
+      loadKeyStatus();
+    }
   };
 
   function formatDuration(ms) {
