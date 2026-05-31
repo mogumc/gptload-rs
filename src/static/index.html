@@ -132,8 +132,7 @@
               <th>ID</th>
               <th>Base URL</th>
               <th>Weight</th>
-              <th>Keys (ok/ban)</th>
-              <th>Cooldown</th>
+              <th>Keys (active/invalid)</th>
               <th>Selected</th>
               <th>2xx</th>
               <th>4xx</th>
@@ -208,21 +207,12 @@
   <div class="row" style="margin-top: 14px;">
     <div class="card" style="flex: 2; min-width: 640px;">
       <h2>Keys 状态</h2>
-      <div class="muted">查看每个 key 的封禁状态，可单独释放/封禁，或一键释放全部 / 一键封禁全部。封禁状态仅存内存，重启后清除。</div>
+      <div class="muted">查看每个 key 的状态，可单独恢复/失效，或一键恢复全部 / 一键失效全部。Invalid key 会被定时验证自动恢复。</div>
       <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top: 8px;">
         <select id="keyStatusUpstreamSelect" style="padding:6px 8px; min-width:160px;"></select>
         <button class="btn" id="loadKeyStatus">查看 / 刷新</button>
-        <button class="btn" id="releaseAllKeys">一键释放全部</button>
-        <button class="btn" id="banAllKeys">一键封禁全部</button>
-        <label class="small muted">封禁时长</label>
-        <select id="banDuration" style="padding:6px 8px;">
-          <option value="300000">5 分钟</option>
-          <option value="1800000">30 分钟</option>
-          <option value="3600000" selected>1 小时</option>
-          <option value="21600000">6 小时</option>
-          <option value="86400000">24 小时</option>
-          <option value="">永久（手动释放）</option>
-        </select>
+        <button class="btn" id="releaseAllKeys">一键恢复全部</button>
+        <button class="btn" id="banAllKeys">一键失效全部</button>
         <span id="keyStatusInfo" class="muted small"></span>
       </div>
       <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top: 8px;">
@@ -244,9 +234,7 @@
               <th>#</th>
               <th>Key</th>
               <th>状态</th>
-              <th>剩余冷却</th>
               <th>失败次数</th>
-              <th>最后封禁信息</th>
               <th>操作</th>
             </tr>
           </thead>
