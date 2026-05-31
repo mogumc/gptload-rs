@@ -31,17 +31,16 @@ data_dir = "./data"
 # Enable stream usage injection for these upstream ids (adds stream_options.include_usage).
 # usage_inject_upstreams = ["openai"]
 
-[ban]
-# Base cooldowns (milliseconds). Exponential backoff is applied by fail streak.
-# - rate_limit_ms / auth_error_ms are applied at **key** level.
-# - server_error_ms / network_error_ms are applied at **upstream** level (circuit breaker).
-rate_limit_ms    = 30000     # HTTP 429
-server_error_ms  = 5000      # HTTP 5xx
-network_error_ms = 5000      # connect/reset/timeout
-auth_error_ms    = 86400000  # HTTP 401/403 (usually bad/expired key)
+[key]
+# Number of auth failures (401/403) before a key is auto-invalidated.
+# 0 = disabled (keys are never auto-blacklisted).
+blacklist_threshold = 3
 
-# Maximum exponent for backoff doubling. 0 = no backoff, 6 = up to 64x.
-max_backoff_pow = 7
+# How often (seconds) to re-validate invalid keys for automatic recovery.
+revalidation_interval_secs = 300
+
+# Timeout (seconds) for each re-validation request.
+revalidation_timeout_secs = 20
 
 [[upstreams]]
 id = "openai"

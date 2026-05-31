@@ -1,7 +1,7 @@
 
 use crate::admin;
 use crate::billing::ReserveResult;
-use crate::state::{sanitize_hop_headers, KeyBanEvent, RequestLogEntry, RouterState, HDR_AUTHORIZATION};
+use crate::state::{sanitize_hop_headers, RequestLogEntry, RouterState, HDR_AUTHORIZATION};
 use crate::util::now_ms;
 use flate2::{Decompress, FlushDecompress, Status};
 use hyper::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
@@ -344,29 +344,17 @@ async fn forward(
 
         match res {
             Ok(Ok(up_resp)) => {
-                let status_now = now_ms();
                 let status = up_resp.status();
-                let retry_after_ms = if status == http::StatusCode::TOO_MANY_REQUESTS {
-                    parse_retry_after(up_resp.headers())
-                } else {
-                    None
-                };
-                let ban_event = state.on_upstream_status(
-                    &sel,
-                    status,
-                    retry_after_ms,
-                    status_now,
-                    Some(up_resp.headers()),
-                );
+                state.on_upstream_status(&sel, status);
 
                 // Retry on auth errors, rate limit, and configurable status codes.
                 let should_retry = should_retry_status(&state, status);
 
                 if should_retry && retry_count < max_retries {
-                    if let Some(new_sel) = state.select_for_model(&model, status_now) {
-                        if let Some(event) = ban_event {
-                            capture_ban_body_with_timeout(up_resp.into_body(), event, state.request_timeout).await;
-                        }
+                    let now = now_ms();
+                    if let Some(new_sel) = state.select_for_model(&model, now) {
+                        // Drain the error body before retrying.
+                        drop(up_resp);
                         retry_count += 1;
                         tracing::debug!(
                             status = %status,
@@ -386,7 +374,6 @@ async fn forward(
                     log_ctx,
                     stream_request,
                     Some(billing_key.clone()),
-                    ban_event,
                 );
             }
             Ok(Err(_e)) => {
@@ -581,89 +568,12 @@ fn should_retry_status(state: &RouterState, status: http::StatusCode) -> bool {
         || state.should_retry_status(status)
 }
 
-/// Parse an HTTP `Retry-After` header into milliseconds to wait from now.
-/// Handles both delta-seconds (e.g. `120`) and the HTTP-date form. Returns
-/// `None` when absent/unparseable; `Some(0)` for a date already in the past.
-fn parse_retry_after(headers: &hyper::HeaderMap) -> Option<u64> {
-    let s = headers.get(http::header::RETRY_AFTER)?.to_str().ok()?.trim();
-    if s.is_empty() {
-        return None;
-    }
-    // delta-seconds: the common case for OpenAI/Azure/Anthropic-style upstreams.
-    if let Ok(secs) = s.parse::<u64>() {
-        return Some(secs.saturating_mul(1000));
-    }
-    // HTTP-date form (RFC 7231).
-    if let Ok(when) = httpdate::parse_http_date(s) {
-        return Some(
-            when.duration_since(std::time::SystemTime::now())
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
-        );
-    }
-    None
-}
-
-const BAN_BODY_CAPTURE_LIMIT: usize = 64 * 1024;
-
-fn append_limited_body(buf: &mut Vec<u8>, truncated: &mut bool, chunk: &bytes::Bytes) {
-    if *truncated {
-        return;
-    }
-    let remaining = BAN_BODY_CAPTURE_LIMIT.saturating_sub(buf.len());
-    if remaining == 0 {
-        *truncated = true;
-        return;
-    }
-    if chunk.len() > remaining {
-        buf.extend_from_slice(&chunk[..remaining]);
-        *truncated = true;
-    } else {
-        buf.extend_from_slice(chunk);
-    }
-}
-
-fn body_bytes_to_display(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).to_string()
-}
-
-async fn capture_ban_body_with_timeout(
-    body: Body,
-    event: KeyBanEvent,
-    timeout: std::time::Duration,
-) {
-    let _ = tokio::time::timeout(timeout, capture_ban_body(body, event)).await;
-}
-
-async fn capture_ban_body(mut body: Body, event: KeyBanEvent) {
-    use hyper::body::HttpBody;
-
-    let mut buf = Vec::new();
-    let mut truncated = false;
-    while let Some(chunk) = body.data().await {
-        let Ok(chunk) = chunk else {
-            break;
-        };
-        append_limited_body(&mut buf, &mut truncated, &chunk);
-        if truncated {
-            break;
-        }
-    }
-    event.key.finish_last_ban_body(
-        event.ts_ms,
-        event.cooldown_until_ms,
-        body_bytes_to_display(&buf),
-        truncated,
-    );
-}
-
 fn proxy_upstream_response(
     up_resp: Response<Body>,
     state: Arc<RouterState>,
     log_ctx: RequestLogContext,
     stream_request: bool,
     billing_key: Option<String>,
-    ban_event: Option<KeyBanEvent>,
 ) -> Response<Body> {
     let (mut parts, body) = up_resp.into_parts();
     sanitize_hop_headers(&mut parts.headers);
@@ -706,17 +616,12 @@ fn proxy_upstream_response(
         let mut json_buf: Vec<u8> = Vec::new();
         let mut json_overflow = false;
         let mut decompressed_bytes = 0usize;
-        let mut ban_body = Vec::new();
-        let mut ban_body_truncated = false;
 
         let mut body = body;
         while let Some(chunk) = body.data().await {
             match chunk {
                 Ok(chunk) => {
                     resp_bytes = resp_bytes.saturating_add(chunk.len());
-                    if ban_event.is_some() {
-                        append_limited_body(&mut ban_body, &mut ban_body_truncated, &chunk);
-                    }
                     if tx.send(Ok(chunk.clone())).await.is_err() {
                         break;
                     }
@@ -769,15 +674,6 @@ fn proxy_upstream_response(
 
         if usage.is_none() && want_json_usage && !json_overflow {
             usage = usage_from_json_bytes(&json_buf);
-        }
-
-        if let Some(event) = ban_event {
-            event.key.finish_last_ban_body(
-                event.ts_ms,
-                event.cooldown_until_ms,
-                body_bytes_to_display(&ban_body),
-                ban_body_truncated,
-            );
         }
 
         if let Some(key) = billing_key.as_deref() {

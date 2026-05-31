@@ -32,18 +32,22 @@ pub struct Config {
     /// Upstream ids eligible for stream usage injection.
     pub usage_inject_upstreams: Option<Vec<String>>,
 
-    pub ban: BanConfig,
+    pub key: KeyConfig,
 
     pub upstreams: Vec<UpstreamConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct BanConfig {
-    pub rate_limit_ms: u64,
-    pub server_error_ms: u64,
-    pub network_error_ms: u64,
-    pub auth_error_ms: u64,
-    pub max_backoff_pow: u32,
+pub struct KeyConfig {
+    /// Number of auth failures (401/403) before a key is marked invalid.
+    /// 0 means disabled (keys are never auto-invalidated).
+    pub blacklist_threshold: u32,
+
+    /// How often (seconds) to re-validate invalid keys.
+    pub revalidation_interval_secs: u64,
+
+    /// Timeout (seconds) for each re-validation request.
+    pub revalidation_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -336,8 +336,8 @@ async fn handle_upstream_subroutes(
             Method::POST => api_release_keys(req, state, upstream_id).await,
             _ => method_not_allowed(),
         },
-        "ban" => match *req.method() {
-            Method::POST => api_ban_keys(req, state, upstream_id).await,
+        "invalidate" => match *req.method() {
+            Method::POST => api_invalidate_keys(req, state, upstream_id).await,
             _ => method_not_allowed(),
         },
         _ => Response::builder()
@@ -511,10 +511,8 @@ struct UpstreamInfo {
     base_url: String,
     weight: usize,
     keys_total: usize,
-    keys_healthy: usize,
-    keys_banned: usize,
-    upstream_cooldown_until_ms: u64,
-    upstream_fail_streak: u32,
+    keys_active: usize,
+    keys_invalid: usize,
 
     selected_total: u64,
 
@@ -526,21 +524,17 @@ struct UpstreamInfo {
     errors_network: u64,
 }
 
-fn build_upstream_info(u: &crate::state::Upstream, now: u64) -> UpstreamInfo {
+fn build_upstream_info(u: &crate::state::Upstream) -> UpstreamInfo {
     let keys_arc = u.keys.load_full();
     let total = keys_arc.len();
-    let banned = keys_arc.iter().filter(|k| {
-        k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed) > now
-    }).count();
+    let invalid = keys_arc.iter().filter(|k| !k.is_active()).count();
     UpstreamInfo {
         id: u.id.to_string(),
         base_url: u.base_url.to_string(),
         weight: u.weight,
         keys_total: total,
-        keys_healthy: total.saturating_sub(banned),
-        keys_banned: banned,
-        upstream_cooldown_until_ms: u.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed),
-        upstream_fail_streak: u.fail_streak.load(std::sync::atomic::Ordering::Relaxed),
+        keys_active: total.saturating_sub(invalid),
+        keys_invalid: invalid,
         selected_total: u.stats.selected_total.load(std::sync::atomic::Ordering::Relaxed),
         responses_2xx: u.stats.responses_2xx.load(std::sync::atomic::Ordering::Relaxed),
         responses_3xx: u.stats.responses_3xx.load(std::sync::atomic::Ordering::Relaxed),
@@ -553,8 +547,8 @@ fn build_upstream_info(u: &crate::state::Upstream, now: u64) -> UpstreamInfo {
 
 async fn api_list_upstreams(state: Arc<RouterState>) -> Response<Body> {
     let snap = state.snapshot.load_full();
-    let now = now_ms();
-    let ups: Vec<UpstreamInfo> = snap.upstreams.iter().map(|u| build_upstream_info(u, now)).collect();
+
+    let ups: Vec<UpstreamInfo> = snap.upstreams.iter().map(|u| build_upstream_info(u)).collect();
     json_ok(&ups)
 }
 
@@ -601,8 +595,8 @@ fn build_snapshot(state: &RouterState) -> StatsSnapshot {
     let latency_max_ms = (latency_max as f64) / 1_000_000.0;
 
     let snap = state.snapshot.load_full();
-    let now = ts;
-    let ups: Vec<UpstreamInfo> = snap.upstreams.iter().map(|u| build_upstream_info(u, now)).collect();
+    let _now = ts;
+    let ups: Vec<UpstreamInfo> = snap.upstreams.iter().map(|u| build_upstream_info(u)).collect();
 
     StatsSnapshot {
         ts_ms: ts,
@@ -920,16 +914,12 @@ async fn api_delete_keys(req: Request<Body>, state: Arc<RouterState>, upstream_i
     }
 }
 
-const MANUAL_BAN_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1000; // ~10 years: default "permanent" manual ban
-
 #[derive(Deserialize, Default)]
 struct KeyStatusBody {
     #[serde(default)]
     keys: Option<Vec<String>>,
     #[serde(default)]
     all: Option<bool>,
-    #[serde(default)]
-    duration_ms: Option<u64>,
 }
 
 async fn parse_key_status_body(req: Request<Body>) -> Result<KeyStatusBody, String> {
@@ -978,20 +968,20 @@ async fn api_release_keys(req: Request<Body>, state: Arc<RouterState>, upstream_
         Ok(b) => b,
         Err(e) => return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request"),
     };
-    let released = match scoped_key_set(&body) {
-        Ok(KeyStatusScope::Keys(set)) => upstream.release_keys(&set),
-        Ok(KeyStatusScope::All) => upstream.release_all_keys(),
+    let restored = match scoped_key_set(&body) {
+        Ok(KeyStatusScope::Keys(set)) => upstream.restore_keys(&set),
+        Ok(KeyStatusScope::All) => upstream.restore_all_keys(),
         Err(e) => return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request"),
     };
     json_ok(&serde_json::json!({
         "ok": true,
         "upstream": upstream_id,
-        "released": released,
+        "restored": restored,
         "keys_total": upstream.keys_len()
     }))
 }
 
-async fn api_ban_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: &str) -> Response<Body> {
+async fn api_invalidate_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: &str) -> Response<Body> {
     let Some((_idx, upstream)) = state.upstream_by_id(upstream_id) else {
         return RouterState::json_error(http::StatusCode::NOT_FOUND, "unknown upstream id", "not_found");
     };
@@ -999,19 +989,18 @@ async fn api_ban_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: 
         Ok(b) => b,
         Err(e) => return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request"),
     };
-    let now = now_ms();
-    let duration = body.duration_ms.unwrap_or(MANUAL_BAN_MS);
-    let until = now.saturating_add(duration);
-    let banned = match scoped_key_set(&body) {
-        Ok(KeyStatusScope::Keys(set)) => upstream.ban_keys(&set, until),
-        Ok(KeyStatusScope::All) => upstream.ban_all_keys(until),
+    let invalidated = match scoped_key_set(&body) {
+        Ok(KeyStatusScope::Keys(set)) => upstream.invalidate_keys(&set),
+        Ok(KeyStatusScope::All) => {
+            let all: ahash::AHashSet<String> = upstream.keys.load_full().iter().map(|k| k.key.to_string()).collect();
+            upstream.invalidate_keys(&all)
+        },
         Err(e) => return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request"),
     };
     json_ok(&serde_json::json!({
         "ok": true,
         "upstream": upstream_id,
-        "banned": banned,
-        "until_ms": until,
+        "invalidated": invalidated,
         "keys_total": upstream.keys_len()
     }))
 }
@@ -1019,11 +1008,8 @@ async fn api_ban_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: 
 #[derive(Serialize)]
 struct KeyInfo {
     key: String,
-    cooldown_until_ms: u64,
-    cooldown_remaining_ms: i64,
-    fail_streak: u32,
     status: &'static str,
-    last_ban: Option<crate::state::KeyBanInfo>,
+    failure_count: u32,
 }
 
 async fn api_list_keys(state: Arc<RouterState>, upstream_id: &str, uri: &http::Uri) -> Response<Body> {
@@ -1039,8 +1025,6 @@ async fn api_list_keys(state: Arc<RouterState>, upstream_id: &str, uri: &http::U
         .and_then(|s: &str| s.parse::<usize>().ok())
         .unwrap_or(0);
 
-    let now = now_ms();
-
     let keys_arc = upstream.keys.load_full();
     let keys = keys_arc.as_ref();
     let total = keys.len();
@@ -1049,18 +1033,12 @@ async fn api_list_keys(state: Arc<RouterState>, upstream_id: &str, uri: &http::U
 
     let mut out: Vec<KeyInfo> = Vec::with_capacity(end.saturating_sub(offset));
     for k in keys.iter().skip(offset).take(end - offset) {
-        let cd = k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed);
-        let remaining = if cd > now { (cd - now) as i64 } else { 0 };
-        let streak = k.fail_streak.load(std::sync::atomic::Ordering::Relaxed);
-        let status = if cd > now { "banned" } else { "ok" };
-        let last_ban = if cd > now { k.last_ban_info() } else { None };
+        let status = if k.is_active() { "active" } else { "invalid" };
+        let failure_count = k.failure_count.load(std::sync::atomic::Ordering::Relaxed);
         out.push(KeyInfo {
             key: k.key.to_string(),
-            cooldown_until_ms: cd,
-            cooldown_remaining_ms: remaining,
-            fail_streak: streak,
             status,
-            last_ban,
+            failure_count,
         });
     }
 
@@ -1069,7 +1047,6 @@ async fn api_list_keys(state: Arc<RouterState>, upstream_id: &str, uri: &http::U
         "total": total,
         "offset": offset,
         "limit": limit,
-        "now_ms": now,
         "keys": out
     }))
 }
