@@ -776,6 +776,7 @@ async fn api_add_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: 
         merged.extend(old.iter().cloned());
         merged.extend(inserted_states.iter().cloned());
         upstream2.keys.store(Arc::new(merged));
+        upstream2.rebuild_active_keys();
 
         Ok(serde_json::json!({
             "ok": true,
@@ -836,6 +837,7 @@ async fn api_replace_keys(req: Request<Body>, state: Arc<RouterState>, upstream_
         let ks = build_key_states(keys)?;
         let n = ks.len();
         upstream2.keys.store(ks);
+        upstream2.rebuild_active_keys();
         Ok(serde_json::json!({
             "ok": true,
             "upstream": id,
@@ -897,6 +899,7 @@ async fn api_delete_keys(req: Request<Body>, state: Arc<RouterState>, upstream_i
             }
         }
         upstream2.keys.store(Arc::new(kept));
+        upstream2.rebuild_active_keys();
 
         Ok(serde_json::json!({
             "ok": true,
