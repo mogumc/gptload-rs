@@ -876,6 +876,7 @@ impl Upstream {
         }
 
         let start = self.key_rr.fetch_add(1, Ordering::Relaxed);
+        let mut fallback: Option<(u64, usize)> = None;
         for i in 0..n {
             let idx = (start + i) % n;
             let k = &keys[idx];
@@ -883,8 +884,14 @@ impl Upstream {
             if until <= now_ms {
                 return Some(k.clone());
             }
+            // Track the key with the shortest remaining cooldown.
+            match fallback {
+                Some((best, _)) if until >= best => {}
+                _ => fallback = Some((until, idx)),
+            }
         }
-        None
+        // All keys are in cooldown — fall back to the one expiring soonest.
+        fallback.map(|(_, idx)| keys[idx].clone())
     }
 
     /// Clear cooldown + fail streak for keys whose value is in `set`. Returns the count matched.
