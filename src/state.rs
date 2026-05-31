@@ -791,6 +791,8 @@ async fn validate_key(
     key: &KeyState,
     timeout: Duration,
 ) -> anyhow::Result<bool> {
+    use hyper::body::HttpBody;
+
     let uri = upstream.build_uri(&PathAndQuery::from_static("/v1/models"))?;
     let mut req = Request::builder()
         .method(Method::GET)
@@ -799,15 +801,15 @@ async fn validate_key(
     req.headers_mut()
         .insert(HDR_AUTHORIZATION, key.auth_header.clone());
 
-    let resp = match tokio::time::timeout(timeout, client.request(req)).await {
+    let mut resp = match tokio::time::timeout(timeout, client.request(req)).await {
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => return Err(e.into()),
         Err(_) => anyhow::bail!("validation request timeout"),
     };
 
     let status = resp.status();
-    // Drain the body to free the connection.
-    drop(resp);
+    // Drain the body to allow connection reuse.
+    while let Some(Ok(_)) = resp.data().await {}
 
     // 401/403 = key is still invalid. Anything else = key is probably fine.
     Ok(status != http::StatusCode::UNAUTHORIZED && status != http::StatusCode::FORBIDDEN)
