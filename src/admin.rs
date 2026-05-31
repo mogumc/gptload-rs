@@ -1013,6 +1013,7 @@ struct KeyInfo {
     key: String,
     status: &'static str,
     failure_count: u32,
+    active_requests: u32,
 }
 
 async fn api_list_keys(state: Arc<RouterState>, upstream_id: &str, uri: &http::Uri) -> Response<Body> {
@@ -1038,10 +1039,12 @@ async fn api_list_keys(state: Arc<RouterState>, upstream_id: &str, uri: &http::U
     for k in keys.iter().skip(offset).take(end - offset) {
         let status = if k.is_active() { "active" } else { "invalid" };
         let failure_count = k.failure_count.load(std::sync::atomic::Ordering::Relaxed);
+        let active_requests = k.active_requests.load(std::sync::atomic::Ordering::Relaxed);
         out.push(KeyInfo {
             key: k.key.to_string(),
             status,
             failure_count,
+            active_requests,
         });
     }
 

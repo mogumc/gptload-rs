@@ -660,6 +660,7 @@
         <td class="mono small" title="${escapeHtml(k.key)}">${escapeHtml(maskKey(k.key))}</td>
         <td class="${statusClass}">${isInvalid ? 'invalid' : 'active'}</td>
         <td class="mono small">${k.failure_count || 0}</td>
+        <td class="mono small">${k.active_requests || 0}</td>
       `;
       const actionTd = document.createElement('td');
       const relBtn = document.createElement('button');

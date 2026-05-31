@@ -107,6 +107,7 @@ pub struct KeyState {
     pub auth_header: hyper::header::HeaderValue,
     pub failure_count: AtomicU32,
     pub status: AtomicU8,
+    pub active_requests: AtomicU32,
 }
 
 #[derive(Clone)]
@@ -499,6 +500,8 @@ impl RouterState {
             return None;
         }
 
+        let max_concurrent = self.key_config.max_concurrent_per_key;
+
         for _ in 0..sched_len {
             let rr = self.sched_rr.as_ref().fetch_add(1, Ordering::Relaxed);
             let u_idx = snap.schedule[rr % sched_len];
@@ -508,7 +511,7 @@ impl RouterState {
                 continue;
             }
 
-            if let Some(k) = u.select_key() {
+            if let Some(k) = u.select_key(max_concurrent) {
                 self.stats.upstream_selected_total.fetch_add(1, Ordering::Relaxed);
                 u.stats.selected_total.fetch_add(1, Ordering::Relaxed);
                 return Some(Selected {
@@ -822,15 +825,28 @@ impl KeyState {
 }
 
 impl Upstream {
-    /// Select an active key via atomic round-robin. Returns None if no active keys.
-    fn select_key(&self) -> Option<Arc<KeyState>> {
+    /// Select an active key via atomic round-robin, skipping keys at their
+    /// concurrency limit. Returns None if no active keys available.
+    fn select_key(&self, max_concurrent: u32) -> Option<Arc<KeyState>> {
         let keys = self.active_keys.load_full();
         let n = keys.len();
         if n == 0 {
             return None;
         }
-        let idx = self.key_rr.fetch_add(1, Ordering::Relaxed) % n;
-        Some(keys[idx].clone())
+        let start = self.key_rr.fetch_add(1, Ordering::Relaxed);
+        for i in 0..n {
+            let idx = (start + i) % n;
+            let k = &keys[idx];
+            // Skip keys at concurrency limit.
+            if max_concurrent > 0
+                && k.active_requests.load(Ordering::Relaxed) >= max_concurrent
+            {
+                continue;
+            }
+            return Some(k.clone());
+        }
+        // All keys at limit — return None to signal backpressure.
+        None
     }
 
     /// Rebuild the active_keys list from the full keys list based on current status.
@@ -1011,6 +1027,7 @@ pub fn build_key_states(keys: Vec<String>) -> anyhow::Result<Arc<Vec<Arc<KeyStat
             auth_header,
             failure_count: AtomicU32::new(0),
             status: AtomicU8::new(KEY_STATUS_ACTIVE),
+            active_requests: AtomicU32::new(0),
         }));
     }
     Ok(Arc::new(out))

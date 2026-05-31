@@ -43,6 +43,11 @@ pub struct KeyConfig {
     /// 0 means disabled (keys are never auto-invalidated).
     pub blacklist_threshold: u32,
 
+    /// Max concurrent requests per key. Keys at this limit are skipped
+    /// during selection. 0 means no limit.
+    #[serde(default)]
+    pub max_concurrent_per_key: u32,
+
     /// How often (seconds) to re-validate invalid keys.
     pub revalidation_interval_secs: u64,
 

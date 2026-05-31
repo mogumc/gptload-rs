@@ -36,6 +36,10 @@ data_dir = "./data"
 # 0 = disabled (keys are never auto-blacklisted).
 blacklist_threshold = 3
 
+# Max concurrent requests per key. Keys at this limit are skipped during selection.
+# Prevents upstream 429 from concurrent overload. 0 = no limit.
+max_concurrent_per_key = 5
+
 # How often (seconds) to re-validate invalid keys for automatic recovery.
 revalidation_interval_secs = 300
 

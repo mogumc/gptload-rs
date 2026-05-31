@@ -1,7 +1,7 @@
 
 use crate::admin;
 use crate::billing::ReserveResult;
-use crate::state::{sanitize_hop_headers, RequestLogEntry, RouterState, HDR_AUTHORIZATION};
+use crate::state::{sanitize_hop_headers, RequestLogEntry, RouterState, Selected, HDR_AUTHORIZATION};
 use crate::util::now_ms;
 use flate2::{Decompress, FlushDecompress, Status};
 use hyper::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
@@ -144,6 +144,181 @@ async fn handle(
     resp
 }
 
+enum AttemptResult {
+    /// Request completed (success or final failure) — return response to client.
+    Success(Response<Body>),
+    /// Retry with a different key/upstream.
+    Retry(Selected),
+}
+
+async fn execute_attempt(
+    state: &Arc<RouterState>,
+    sel: &Selected,
+    upstream: &Arc<crate::state::Upstream>,
+    original_pq: &http::uri::PathAndQuery,
+    out_method: &hyper::Method,
+    version: http::Version,
+    headers: &hyper::HeaderMap,
+    body_bytes: &bytes::Bytes,
+    injected: bool,
+    billing_reserved: &mut bool,
+    billing_key: &str,
+    log_ctx: &RequestLogContext,
+    stream_request: bool,
+) -> AttemptResult {
+    let now = now_ms();
+
+    let uri = match upstream.build_uri(original_pq) {
+        Ok(u) => u,
+        Err(_) => {
+            if *billing_reserved {
+                let _ = state.billing.release_reservation(billing_key);
+            }
+            return AttemptResult::Success(RouterState::json_error(
+                http::StatusCode::BAD_GATEWAY,
+                "invalid upstream URI",
+                "invalid_upstream_uri",
+            ));
+        }
+    };
+
+    let out_req = match build_upstream_request(
+        out_method.clone(),
+        uri,
+        version,
+        headers,
+        body_bytes.clone(),
+        sel,
+        injected,
+    ) {
+        Ok(req) => req,
+        Err(resp) => {
+            if *billing_reserved {
+                let _ = state.billing.release_reservation(billing_key);
+            }
+            return AttemptResult::Success(logged_response(state, log_ctx, resp));
+        }
+    };
+
+    if !*billing_reserved {
+        match state.billing.reserve_request(billing_key) {
+            ReserveResult::Reserved => {
+                *billing_reserved = true;
+            }
+            ReserveResult::Insufficient => {
+                return AttemptResult::Success(logged_json_error(
+                    state,
+                    log_ctx,
+                    http::StatusCode::UNAUTHORIZED,
+                    "insufficient balance",
+                    "balance_insufficient",
+                ));
+            }
+            ReserveResult::Missing => {
+                return AttemptResult::Success(logged_json_error(
+                    state,
+                    log_ctx,
+                    http::StatusCode::UNAUTHORIZED,
+                    "invalid api key",
+                    "api_key_invalid",
+                ));
+            }
+        }
+    }
+
+    let res = tokio::time::timeout(state.request_timeout, state.client.request(out_req)).await;
+
+    match res {
+        Ok(Ok(up_resp)) => {
+            let status = up_resp.status();
+            state.on_upstream_status(sel, status);
+
+            let should_retry = should_retry_status(state, status);
+
+            if should_retry {
+                let now = now_ms();
+                if let Some(new_sel) = state.select_for_model(
+                    &log_ctx.model.clone().unwrap_or_default(),
+                    now,
+                ) {
+                    drop(up_resp);
+                    tracing::debug!(
+                        status = %status,
+                        old_upstream = %sel.upstream.id,
+                        new_upstream = %new_sel.upstream.id,
+                        "retrying with different key/upstream"
+                    );
+                    return AttemptResult::Retry(new_sel);
+                }
+            }
+
+            AttemptResult::Success(proxy_upstream_response(
+                up_resp,
+                state.clone(),
+                log_ctx.clone(),
+                stream_request,
+                Some(billing_key.to_string()),
+            ))
+        }
+        Ok(Err(_e)) => {
+            state.on_network_error(sel, now);
+
+            if let Some(new_sel) = state.select_for_model(
+                &log_ctx.model.clone().unwrap_or_default(),
+                now,
+            ) {
+                tracing::debug!(
+                    old_upstream = %sel.upstream.id,
+                    new_upstream = %new_sel.upstream.id,
+                    "retrying after network error"
+                );
+                return AttemptResult::Retry(new_sel);
+            }
+
+            if *billing_reserved {
+                let _ = state.billing.release_reservation(billing_key);
+            }
+            AttemptResult::Success(logged_response(
+                state,
+                log_ctx,
+                RouterState::json_error(
+                    http::StatusCode::BAD_GATEWAY,
+                    "upstream request failed",
+                    "upstream_error",
+                ),
+            ))
+        }
+        Err(_) => {
+            state.on_timeout(sel, now);
+
+            if let Some(new_sel) = state.select_for_model(
+                &log_ctx.model.clone().unwrap_or_default(),
+                now,
+            ) {
+                tracing::debug!(
+                    old_upstream = %sel.upstream.id,
+                    new_upstream = %new_sel.upstream.id,
+                    "retrying after timeout"
+                );
+                return AttemptResult::Retry(new_sel);
+            }
+
+            if *billing_reserved {
+                let _ = state.billing.release_reservation(billing_key);
+            }
+            AttemptResult::Success(logged_response(
+                state,
+                log_ctx,
+                RouterState::json_error(
+                    http::StatusCode::GATEWAY_TIMEOUT,
+                    "upstream request timeout",
+                    "upstream_timeout",
+                ),
+            ))
+        }
+    }
+}
+
 async fn forward(
     req: Request<Body>,
     state: Arc<RouterState>,
@@ -277,160 +452,45 @@ async fn forward(
     let mut billing_reserved = false;
 
     loop {
-        let now = now_ms();
         log_ctx.upstream_id = Some(sel.upstream.id.to_string());
         let upstream = &sel.upstream;
 
-        let uri = match upstream.build_uri(&original_pq) {
-            Ok(u) => u,
-            Err(_) => {
-                if billing_reserved {
-                    let _ = state.billing.release_reservation(&billing_key);
-                }
-                return RouterState::json_error(
-                    http::StatusCode::BAD_GATEWAY,
-                    "invalid upstream URI",
-                    "invalid_upstream_uri",
-                );
-            }
-        };
+        // Track per-key concurrency for this attempt.
+        sel.key.active_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let out_req = match build_upstream_request(
-            out_method.clone(),
-            uri,
+        let result = execute_attempt(
+            &state,
+            &sel,
+            upstream,
+            &original_pq,
+            &out_method,
             version,
             &headers,
-            body_bytes.clone(),
-            &sel,
+            &body_bytes,
             injected,
-        ) {
-            Ok(req) => req,
-            Err(resp) => {
-                if billing_reserved {
-                    let _ = state.billing.release_reservation(&billing_key);
-                }
-                return logged_response(&state, &log_ctx, resp);
-            }
-        };
+            &mut billing_reserved,
+            &billing_key,
+            &log_ctx,
+            stream_request,
+        )
+        .await;
 
-        if !billing_reserved {
-            match state.billing.reserve_request(&billing_key) {
-                ReserveResult::Reserved => {
-                    billing_reserved = true;
-                }
-                ReserveResult::Insufficient => {
-                    return logged_json_error(
-                        &state,
-                        &log_ctx,
-                        http::StatusCode::UNAUTHORIZED,
-                        "insufficient balance",
-                        "balance_insufficient",
+        // Decrement per-key concurrency after each attempt.
+        sel.key.active_requests.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+        match result {
+            AttemptResult::Success(resp) => return resp,
+            AttemptResult::Retry(new_sel) => {
+                retry_count += 1;
+                if retry_count > max_retries {
+                    return RouterState::json_error(
+                        http::StatusCode::BAD_GATEWAY,
+                        "max retries exceeded",
+                        "max_retries",
                     );
                 }
-                ReserveResult::Missing => {
-                    return logged_json_error(
-                        &state,
-                        &log_ctx,
-                        http::StatusCode::UNAUTHORIZED,
-                        "invalid api key",
-                        "api_key_invalid",
-                    );
-                }
-            }
-        }
-
-        // Enforce timeout.
-        let res = tokio::time::timeout(state.request_timeout, state.client.request(out_req)).await;
-
-        match res {
-            Ok(Ok(up_resp)) => {
-                let status = up_resp.status();
-                state.on_upstream_status(&sel, status);
-
-                // Retry on auth errors, rate limit, and configurable status codes.
-                let should_retry = should_retry_status(&state, status);
-
-                if should_retry && retry_count < max_retries {
-                    let now = now_ms();
-                    if let Some(new_sel) = state.select_for_model(&model, now) {
-                        // Drain the error body before retrying.
-                        drop(up_resp);
-                        retry_count += 1;
-                        tracing::debug!(
-                            status = %status,
-                            retry = retry_count,
-                            old_upstream = %sel.upstream.id,
-                            new_upstream = %new_sel.upstream.id,
-                            "retrying with different key/upstream"
-                        );
-                        sel = new_sel;
-                        continue;
-                    }
-                }
-
-                return proxy_upstream_response(
-                    up_resp,
-                    state.clone(),
-                    log_ctx,
-                    stream_request,
-                    Some(billing_key.clone()),
-                );
-            }
-            Ok(Err(_e)) => {
-                state.on_network_error(&sel, now);
-
-                // Retry on network error (upstream is now banned, next select picks a different one).
-                if retry_count < max_retries {
-                    if let Some(new_sel) = state.select_for_model(&model, now) {
-                        retry_count += 1;
-                        tracing::debug!(
-                            retry = retry_count,
-                            old_upstream = %sel.upstream.id,
-                            new_upstream = %new_sel.upstream.id,
-                            "retrying after network error"
-                        );
-                        sel = new_sel;
-                        continue;
-                    }
-                }
-
-                if billing_reserved {
-                    let _ = state.billing.release_reservation(&billing_key);
-                }
-                let resp = RouterState::json_error(
-                    http::StatusCode::BAD_GATEWAY,
-                    "upstream request failed",
-                    "upstream_error",
-                );
-                return logged_response(&state, &log_ctx, resp);
-            }
-            Err(_) => {
-                state.on_timeout(&sel, now);
-
-                // Retry on timeout (upstream is now banned, next select picks a different one).
-                if retry_count < max_retries {
-                    if let Some(new_sel) = state.select_for_model(&model, now) {
-                        retry_count += 1;
-                        tracing::debug!(
-                            retry = retry_count,
-                            old_upstream = %sel.upstream.id,
-                            new_upstream = %new_sel.upstream.id,
-                            "retrying after timeout"
-                        );
-                        sel = new_sel;
-                        continue;
-                    }
-                }
-
-                if billing_reserved {
-                    let _ = state.billing.release_reservation(&billing_key);
-                }
-                let resp = RouterState::json_error(
-                    http::StatusCode::GATEWAY_TIMEOUT,
-                    "upstream request timeout",
-                    "upstream_timeout",
-                );
-                return logged_response(&state, &log_ctx, resp);
+                sel = new_sel;
+                continue;
             }
         }
     }
