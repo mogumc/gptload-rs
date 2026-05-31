@@ -668,15 +668,26 @@ impl RouterState {
     ) -> Option<KeyBanEvent> {
         let u = &sel.upstream;
 
-        // HTTP response means upstream is reachable; clear upstream cooldown and streak.
-        u.fail_streak.store(0, Ordering::Relaxed);
-        u.cooldown_until_ms.store(0, Ordering::Relaxed);
-
         // Upstream per-status stats
         inc_status(&u.stats, status);
 
         // Global per-status stats
         self.inc_global_status(status);
+
+        // Clear upstream cooldown and streak — but NOT for key-level errors.
+        // 429/401/403 mean the upstream is responding but rejecting this specific
+        // key; they don't indicate the upstream has recovered from a prior 5xx
+        // or network issue. A concurrent request might have just set a 5xx
+        // cooldown; clearing it here would erase that.
+        if !matches!(
+            status,
+            http::StatusCode::TOO_MANY_REQUESTS
+                | http::StatusCode::UNAUTHORIZED
+                | http::StatusCode::FORBIDDEN
+        ) {
+            u.fail_streak.store(0, Ordering::Relaxed);
+            u.cooldown_until_ms.store(0, Ordering::Relaxed);
+        }
 
         if status == http::StatusCode::TOO_MANY_REQUESTS {
             // Key-level rate limit. Honor the upstream's Retry-After when present
