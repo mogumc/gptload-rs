@@ -12,6 +12,27 @@ use tokio_stream::wrappers::ReceiverStream;
 const INDEX_HTML: &str = include_str!("static/index.html");
 const APP_JS: &str = include_str!("static/app.js");
 
+/// Read request body and parse as JSON. Returns error response on failure.
+async fn parse_json_body<T: serde::de::DeserializeOwned>(
+    req: Request<Body>,
+) -> Result<T, Response<Body>> {
+    let body = read_body_limit(req, 10 * 1024 * 1024)
+        .await
+        .map_err(|e| RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request"))?;
+    serde_json::from_slice(&body)
+        .map_err(|e| RouterState::json_error(http::StatusCode::BAD_REQUEST, &format!("invalid json: {e}"), "bad_request"))
+}
+
+/// Look up upstream by id. Returns error response if not found.
+fn get_upstream(
+    state: &RouterState,
+    id: &str,
+) -> Result<(usize, Arc<crate::state::Upstream>), Response<Body>> {
+    state.upstream_by_id(id).ok_or_else(|| {
+        RouterState::json_error(http::StatusCode::NOT_FOUND, "unknown upstream id", "not_found")
+    })
+}
+
 pub async fn handle_admin(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
     let path = req.uri().path();
 
@@ -367,28 +388,10 @@ struct ModelRoutesBody {
 }
 
 async fn api_put_model_routes(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
-    let body = match read_body_limit(req, 10 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(e) => {
-            return RouterState::json_error(
-                http::StatusCode::BAD_REQUEST,
-                &e.to_string(),
-                "bad_request",
-            )
-        }
-    };
-
-    let routes_body: ModelRoutesBody = match serde_json::from_slice(&body) {
+    let routes_body: ModelRoutesBody = match parse_json_body(req).await {
         Ok(v) => v,
-        Err(e) => {
-            return RouterState::json_error(
-                http::StatusCode::BAD_REQUEST,
-                &format!("invalid json: {e}"),
-                "bad_request",
-            )
-        }
+        Err(resp) => return resp,
     };
-
     match state.save_model_routes(routes_body.upstreams) {
         Ok(routes) => json_ok(&routes),
         Err(e) => RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request"),
@@ -420,19 +423,9 @@ struct UpstreamUpdateBody {
 }
 
 async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
-    let body = match read_body_limit(req, 256 * 1024).await {
-        Ok(b) => b,
-        Err(e) => return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request"),
-    };
-    let input: UpstreamBody = match serde_json::from_slice(&body) {
+    let input: UpstreamBody = match parse_json_body(req).await {
         Ok(v) => v,
-        Err(e) => {
-            return RouterState::json_error(
-                http::StatusCode::BAD_REQUEST,
-                &format!("invalid json: {e}"),
-                "bad_request",
-            )
-        }
+        Err(resp) => return resp,
     };
     if input.id.trim().is_empty() {
         return RouterState::json_error(http::StatusCode::BAD_REQUEST, "missing id", "bad_request");
@@ -449,33 +442,19 @@ async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Respon
     let state2 = state.clone();
     let res = tokio::task::spawn_blocking(move || state2.add_upstream(cfg)).await;
     match res {
-        Ok(Ok(_)) => {
-            let state3 = state.clone();
-            let id = input.id;
-            tokio::spawn(async move {
-                state3.refresh_missing_models_for_upstream(&id).await;
-            });
-            json_ok(&serde_json::json!({"ok": true}))
-        }
+        Ok(Ok(_)) => json_ok(&serde_json::json!({
+            "ok": true,
+            "upstreams": state.snapshot.load_full().upstreams.len(),
+        })),
         Ok(Err(e)) => RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request"),
         Err(e) => RouterState::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "internal_error"),
     }
 }
 
 async fn api_update_upstream(req: Request<Body>, state: Arc<RouterState>, upstream_id: &str) -> Response<Body> {
-    let body = match read_body_limit(req, 256 * 1024).await {
-        Ok(b) => b,
-        Err(e) => return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request"),
-    };
-    let input: UpstreamUpdateBody = match serde_json::from_slice(&body) {
+    let input: UpstreamUpdateBody = match parse_json_body(req).await {
         Ok(v) => v,
-        Err(e) => {
-            return RouterState::json_error(
-                http::StatusCode::BAD_REQUEST,
-                &format!("invalid json: {e}"),
-                "bad_request",
-            )
-        }
+        Err(resp) => return resp,
     };
     if input.base_url.trim().is_empty() {
         return RouterState::json_error(http::StatusCode::BAD_REQUEST, "missing base_url", "bad_request");
@@ -935,16 +914,6 @@ struct KeyStatusBody {
     all: Option<bool>,
 }
 
-async fn parse_key_status_body(req: Request<Body>) -> Result<KeyStatusBody, String> {
-    let body = read_body_limit(req, 50 * 1024 * 1024)
-        .await
-        .map_err(|e| e.to_string())?;
-    if body.is_empty() {
-        return Ok(KeyStatusBody::default());
-    }
-    serde_json::from_slice(&body).map_err(|e| format!("invalid json: {e}"))
-}
-
 enum KeyStatusScope {
     All,
     Keys(ahash::AHashSet<String>),
@@ -974,12 +943,13 @@ fn scoped_key_set(body: &KeyStatusBody) -> Result<KeyStatusScope, String> {
 }
 
 async fn api_release_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: &str) -> Response<Body> {
-    let Some((_idx, upstream)) = state.upstream_by_id(upstream_id) else {
-        return RouterState::json_error(http::StatusCode::NOT_FOUND, "unknown upstream id", "not_found");
+    let (_idx, upstream) = match get_upstream(&state, upstream_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
-    let body = match parse_key_status_body(req).await {
-        Ok(b) => b,
-        Err(e) => return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request"),
+    let body: KeyStatusBody = match parse_json_body(req).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
     let restored = match scoped_key_set(&body) {
         Ok(KeyStatusScope::Keys(set)) => upstream.restore_keys(&set),
@@ -995,12 +965,13 @@ async fn api_release_keys(req: Request<Body>, state: Arc<RouterState>, upstream_
 }
 
 async fn api_invalidate_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: &str) -> Response<Body> {
-    let Some((_idx, upstream)) = state.upstream_by_id(upstream_id) else {
-        return RouterState::json_error(http::StatusCode::NOT_FOUND, "unknown upstream id", "not_found");
+    let (_idx, upstream) = match get_upstream(&state, upstream_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
-    let body = match parse_key_status_body(req).await {
-        Ok(b) => b,
-        Err(e) => return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request"),
+    let body: KeyStatusBody = match parse_json_body(req).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
     let invalidated = match scoped_key_set(&body) {
         Ok(KeyStatusScope::Keys(set)) => upstream.invalidate_keys(&set),
