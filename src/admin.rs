@@ -444,6 +444,7 @@ async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Respon
         id: input.id.trim().to_string(),
         base_url: input.base_url.trim().to_string(),
         weight: input.weight,
+        max_concurrent_per_key: None,
     };
     let state2 = state.clone();
     let res = tokio::task::spawn_blocking(move || state2.add_upstream(cfg)).await;
@@ -510,6 +511,7 @@ struct UpstreamInfo {
     id: String,
     base_url: String,
     weight: usize,
+    max_concurrent_per_key: u32,
     keys_total: usize,
     keys_active: usize,
     keys_invalid: usize,
@@ -524,14 +526,20 @@ struct UpstreamInfo {
     errors_network: u64,
 }
 
-fn build_upstream_info(u: &crate::state::Upstream) -> UpstreamInfo {
+fn build_upstream_info(u: &crate::state::Upstream, global_max: u32) -> UpstreamInfo {
     let keys_arc = u.keys.load_full();
     let total = keys_arc.len();
     let invalid = keys_arc.iter().filter(|k| !k.is_active()).count();
+    let effective_max = if u.max_concurrent_per_key > 0 {
+        u.max_concurrent_per_key
+    } else {
+        global_max
+    };
     UpstreamInfo {
         id: u.id.to_string(),
         base_url: u.base_url.to_string(),
         weight: u.weight,
+        max_concurrent_per_key: effective_max,
         keys_total: total,
         keys_active: total.saturating_sub(invalid),
         keys_invalid: invalid,
@@ -547,8 +555,9 @@ fn build_upstream_info(u: &crate::state::Upstream) -> UpstreamInfo {
 
 async fn api_list_upstreams(state: Arc<RouterState>) -> Response<Body> {
     let snap = state.snapshot.load_full();
+    let global_max = state.key_config.max_concurrent_per_key;
 
-    let ups: Vec<UpstreamInfo> = snap.upstreams.iter().map(|u| build_upstream_info(u)).collect();
+    let ups: Vec<UpstreamInfo> = snap.upstreams.iter().map(|u| build_upstream_info(u, global_max)).collect();
     json_ok(&ups)
 }
 
@@ -595,8 +604,9 @@ fn build_snapshot(state: &RouterState) -> StatsSnapshot {
     let latency_max_ms = (latency_max as f64) / 1_000_000.0;
 
     let snap = state.snapshot.load_full();
+    let global_max = state.key_config.max_concurrent_per_key;
     let _now = ts;
-    let ups: Vec<UpstreamInfo> = snap.upstreams.iter().map(|u| build_upstream_info(u)).collect();
+    let ups: Vec<UpstreamInfo> = snap.upstreams.iter().map(|u| build_upstream_info(u, global_max)).collect();
 
     StatsSnapshot {
         ts_ms: ts,

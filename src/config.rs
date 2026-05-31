@@ -63,6 +63,10 @@ pub struct UpstreamConfig {
     pub base_url: String,
     /// Weighted round-robin (default 1).
     pub weight: Option<usize>,
+    /// Per-key concurrency limit for this upstream. Overrides global default.
+    /// 0 = use global default.
+    #[serde(default)]
+    pub max_concurrent_per_key: Option<u32>,
 }
 
 impl Config {

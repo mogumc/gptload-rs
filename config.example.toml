@@ -50,9 +50,13 @@ revalidation_timeout_secs = 20
 id = "openai"
 base_url = "https://api.openai.com"
 weight = 1
+# Per-upstream override for max concurrent requests per key.
+# Overrides the global [key].max_concurrent_per_key default.
+# max_concurrent_per_key = 5
 
 # Example: second upstream (OpenAI-compatible) weighted 2x
 [[upstreams]]
 id = "alt"
 base_url = "https://your-openai-compatible-upstream.example.com"
 weight = 2
+# max_concurrent_per_key = 10

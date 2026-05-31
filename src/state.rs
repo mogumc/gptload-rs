@@ -88,6 +88,7 @@ pub struct Upstream {
     pub base_path: Arc<str>,
 
     pub weight: usize,
+    pub max_concurrent_per_key: u32,
 
     pub keys: ArcSwap<Vec<Arc<KeyState>>>,
     pub active_keys: ArcSwap<Vec<Arc<KeyState>>>,
@@ -500,7 +501,7 @@ impl RouterState {
             return None;
         }
 
-        let max_concurrent = self.key_config.max_concurrent_per_key;
+        let global_max = self.key_config.max_concurrent_per_key;
 
         for _ in 0..sched_len {
             let rr = self.sched_rr.as_ref().fetch_add(1, Ordering::Relaxed);
@@ -511,7 +512,14 @@ impl RouterState {
                 continue;
             }
 
-            if let Some(k) = u.select_key(max_concurrent) {
+            // Per-upstream override, fallback to global default.
+            let max = if u.max_concurrent_per_key > 0 {
+                u.max_concurrent_per_key
+            } else {
+                global_max
+            };
+
+            if let Some(k) = u.select_key(max) {
                 self.stats.upstream_selected_total.fetch_add(1, Ordering::Relaxed);
                 u.stats.selected_total.fetch_add(1, Ordering::Relaxed);
                 return Some(Selected {
@@ -999,6 +1007,7 @@ fn parse_upstream(u: UpstreamConfig, weight: usize) -> anyhow::Result<Arc<Upstre
         base_authority: authority,
         base_path: Arc::<str>::from(base_path),
         weight,
+        max_concurrent_per_key: u.max_concurrent_per_key.unwrap_or(0),
         keys: ArcSwap::from_pointee(Vec::new()),
         active_keys: ArcSwap::from_pointee(Vec::new()),
         keys_update_lock: Mutex::new(()),
@@ -1262,6 +1271,11 @@ impl RouterState {
                 id: u.id.to_string(),
                 base_url: u.base_url.to_string(),
                 weight: Some(u.weight),
+                max_concurrent_per_key: if u.max_concurrent_per_key > 0 {
+                    Some(u.max_concurrent_per_key)
+                } else {
+                    None
+                },
             })
             .collect()
     }
