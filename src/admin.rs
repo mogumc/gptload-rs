@@ -1028,18 +1028,26 @@ async fn api_list_keys(state: Arc<RouterState>, upstream_id: &str, uri: &http::U
 
 /// Export all keys for an upstream as a downloadable txt file.
 /// Requires the separate `export_token` via `X-Export-Token` header.
+/// Disabled if export_token is not configured.
 async fn api_export_keys(
     req: Request<Body>,
     state: Arc<RouterState>,
     upstream_id: &str,
 ) -> Response<Body> {
+    let Some(ref expected) = state.export_token else {
+        return RouterState::json_error(
+            http::StatusCode::NOT_FOUND,
+            "export not configured",
+            "export_disabled",
+        );
+    };
     // Verify export token.
     let provided = req
         .headers()
         .get("x-export-token")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if provided.is_empty() || provided != state.export_token {
+    if provided.is_empty() || provided != expected.as_str() {
         return RouterState::json_error(
             http::StatusCode::UNAUTHORIZED,
             "missing or invalid export token",

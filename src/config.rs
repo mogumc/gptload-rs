@@ -26,8 +26,10 @@ pub struct Config {
     /// List of tokens required in `X-Admin-Token` for admin API requests.
     pub admin_tokens: Vec<String>,
 
-    /// Separate token for sensitive operations (key export). Required.
-    pub export_token: String,
+    /// Separate token for sensitive operations (key export). Optional.
+    /// If not set, export endpoints are disabled.
+    #[serde(default)]
+    pub export_token: Option<String>,
 
     /// Directory for persistent data (keys DB).
     pub data_dir: PathBuf,

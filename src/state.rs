@@ -31,7 +31,7 @@ pub struct RouterState {
 
     pub proxy_tokens: Option<Arc<AHashSet<String>>>,
     pub admin_tokens: Arc<AHashSet<String>>,
-    pub export_token: String,
+    pub export_token: Option<String>,
     pub usage_inject_upstreams: Option<Arc<AHashSet<String>>>,
 
     pub store: Arc<KeyStore>,
