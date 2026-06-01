@@ -697,17 +697,32 @@ pub async fn prometheus_metrics(state: Arc<RouterState>) -> Response<Body> {
     let _ = writeln!(buf, "# TYPE gptload_upstream_active_keys gauge");
     let _ = writeln!(buf, "# HELP gptload_upstream_invalid_keys Invalid keys per upstream");
     let _ = writeln!(buf, "# TYPE gptload_upstream_invalid_keys gauge");
+    let _ = writeln!(buf, "# HELP gptload_upstream_cooldown_keys Keys in 429 cooldown per upstream");
+    let _ = writeln!(buf, "# TYPE gptload_upstream_cooldown_keys gauge");
 
     for u in snap.upstreams.iter() {
         let id = u.id.as_ref();
         let keys_arc = u.keys.load_full();
         let total = keys_arc.len();
-        let invalid = keys_arc.iter().filter(|k| !k.is_active()).count();
-        let active = total.saturating_sub(invalid);
+        let mut invalid = 0usize;
+        let mut active = 0usize;
+        let mut cooldown = 0usize;
+        for k in keys_arc.iter() {
+            if k.is_active() {
+                active += 1;
+                let until = k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed);
+                if until > 0 && now < until {
+                    cooldown += 1;
+                }
+            } else {
+                invalid += 1;
+            }
+        }
 
         let _ = writeln!(buf, "gptload_upstream_keys{{upstream=\"{}\"}} {}", id, total);
         let _ = writeln!(buf, "gptload_upstream_active_keys{{upstream=\"{}\"}} {}", id, active);
         let _ = writeln!(buf, "gptload_upstream_invalid_keys{{upstream=\"{}\"}} {}", id, invalid);
+        let _ = writeln!(buf, "gptload_upstream_cooldown_keys{{upstream=\"{}\"}} {}", id, cooldown);
 
         let sel = u.stats.selected_total.load(std::sync::atomic::Ordering::Relaxed);
         let _ = writeln!(buf, "gptload_upstream_selected_total{{upstream=\"{}\"}} {}", id, sel);
@@ -730,10 +745,20 @@ pub async fn prometheus_metrics(state: Arc<RouterState>) -> Response<Body> {
     // Key status distribution (global)
     let mut total_keys = 0usize;
     let mut active_keys = 0usize;
+    let mut cooldown_keys = 0usize;
     for u in snap.upstreams.iter() {
         let keys = u.keys.load_full();
         total_keys += keys.len();
-        active_keys += keys.iter().filter(|k| k.is_active()).count();
+        for k in keys.iter() {
+            if k.is_active() {
+                active_keys += 1;
+                // Check if key is in 429 cooldown.
+                let until = k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed);
+                if until > 0 && now < until {
+                    cooldown_keys += 1;
+                }
+            }
+        }
     }
     let _ = writeln!(buf, "# HELP gptload_keys_total Total keys across all upstreams");
     let _ = writeln!(buf, "# TYPE gptload_keys_total gauge");
@@ -744,6 +769,9 @@ pub async fn prometheus_metrics(state: Arc<RouterState>) -> Response<Body> {
     let _ = writeln!(buf, "# HELP gptload_keys_invalid Invalid keys across all upstreams");
     let _ = writeln!(buf, "# TYPE gptload_keys_invalid gauge");
     let _ = writeln!(buf, "gptload_keys_invalid {}", total_keys.saturating_sub(active_keys));
+    let _ = writeln!(buf, "# HELP gptload_keys_cooldown Keys in 429 cooldown");
+    let _ = writeln!(buf, "# TYPE gptload_keys_cooldown gauge");
+    let _ = writeln!(buf, "gptload_keys_cooldown {}", cooldown_keys);
 
     Response::builder()
         .status(200)
@@ -1110,6 +1138,8 @@ struct KeyInfo {
     status: &'static str,
     failure_count: u32,
     active_requests: u32,
+    /// Unix ms timestamp when 429 cooldown expires. 0 = not in cooldown.
+    cooldown_until_ms: u64,
 }
 
 async fn api_list_keys(state: Arc<RouterState>, upstream_id: &str, uri: &http::Uri) -> Response<Body> {
@@ -1136,11 +1166,13 @@ async fn api_list_keys(state: Arc<RouterState>, upstream_id: &str, uri: &http::U
         let status = if k.is_active() { "active" } else { "invalid" };
         let failure_count = k.failure_count.load(std::sync::atomic::Ordering::Relaxed);
         let active_requests = k.active_requests.load(std::sync::atomic::Ordering::Relaxed);
+        let cooldown_until_ms = k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed);
         out.push(KeyInfo {
             key: k.key.to_string(),
             status,
             failure_count,
             active_requests,
+            cooldown_until_ms,
         });
     }
 

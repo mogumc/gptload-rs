@@ -111,6 +111,8 @@ pub struct KeyState {
     pub failure_count: AtomicU32,
     pub status: AtomicU8,
     pub active_requests: AtomicU32,
+    /// Unix ms timestamp when the 429 cooldown expires. 0 = not in cooldown.
+    pub cooldown_until_ms: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -607,8 +609,7 @@ impl RouterState {
         Ok(count)
     }
     /// Handle an upstream response status. Only auth errors (401/403) count as
-    /// key failures. 429 (rate limit) and 5xx are transient — the caller should
-    /// retry with a different key, but the current key is not penalised.
+    /// key failures. 429 (rate limit) sets a short cooldown on the key.
     #[inline]
     pub fn on_upstream_status(&self, sel: &Selected, status: http::StatusCode) {
         let u = &sel.upstream;
@@ -619,6 +620,13 @@ impl RouterState {
         // Only count auth errors as key failures (matches gpt-load behaviour).
         if status == http::StatusCode::UNAUTHORIZED || status == http::StatusCode::FORBIDDEN {
             self.handle_auth_failure(sel);
+        } else if status == http::StatusCode::TOO_MANY_REQUESTS {
+            // Set short cooldown so we don't keep hammering the same rate-limited key.
+            let cooldown_ms = self.key_config.rate_limit_cooldown_ms;
+            if cooldown_ms > 0 {
+                let until = now_ms() + cooldown_ms;
+                sel.key.cooldown_until_ms.store(until, Ordering::Relaxed);
+            }
         }
     }
 
@@ -832,17 +840,28 @@ impl KeyState {
 
 impl Upstream {
     /// Select an active key via atomic round-robin, skipping keys at their
-    /// concurrency limit. Returns None if no active keys available.
+    /// concurrency limit and keys in 429 cooldown. Returns None if no active
+    /// keys available.
     fn select_key(&self, max_concurrent: u32) -> Option<Arc<KeyState>> {
         let keys = self.active_keys.load_full();
         let n = keys.len();
         if n == 0 {
             return None;
         }
+        let now = now_ms();
         let start = self.key_rr.fetch_add(1, Ordering::Relaxed);
         for i in 0..n {
             let idx = (start + i) % n;
             let k = &keys[idx];
+            // Skip keys in 429 cooldown.
+            let until = k.cooldown_until_ms.load(Ordering::Relaxed);
+            if until > 0 && now < until {
+                continue;
+            }
+            // Clear expired cooldown (no-op if already 0).
+            if until > 0 && now >= until {
+                k.cooldown_until_ms.store(0, Ordering::Relaxed);
+            }
             // Skip keys at concurrency limit.
             if max_concurrent > 0
                 && k.active_requests.load(Ordering::Relaxed) >= max_concurrent
@@ -851,7 +870,7 @@ impl Upstream {
             }
             return Some(k.clone());
         }
-        // All keys at limit — return None to signal backpressure.
+        // All keys at limit or in cooldown — return None to signal backpressure.
         None
     }
 
@@ -1035,6 +1054,7 @@ pub fn build_key_states(keys: Vec<String>) -> anyhow::Result<Arc<Vec<Arc<KeyStat
             failure_count: AtomicU32::new(0),
             status: AtomicU8::new(KEY_STATUS_ACTIVE),
             active_requests: AtomicU32::new(0),
+            cooldown_until_ms: AtomicU64::new(0),
         }));
     }
     Ok(Arc::new(out))

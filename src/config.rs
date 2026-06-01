@@ -53,11 +53,20 @@ pub struct KeyConfig {
     #[serde(default)]
     pub max_concurrent_per_key: u32,
 
+    /// Cooldown (ms) after a 429 rate-limit response before the key can be
+    /// selected again. 0 = disabled.
+    #[serde(default = "default_rate_limit_cooldown_ms")]
+    pub rate_limit_cooldown_ms: u64,
+
     /// How often (seconds) to re-validate invalid keys.
     pub revalidation_interval_secs: u64,
 
     /// Timeout (seconds) for each re-validation request.
     pub revalidation_timeout_secs: u64,
+}
+
+fn default_rate_limit_cooldown_ms() -> u64 {
+    3000
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
