@@ -61,6 +61,7 @@
   const loadKeyStatusBtn = document.getElementById('loadKeyStatus');
   const releaseAllKeysBtn = document.getElementById('releaseAllKeys');
   const banAllKeysBtn = document.getElementById('banAllKeys');
+  const exportKeysBtn = document.getElementById('exportKeys');
   const keyStatusInfo = document.getElementById('keyStatusInfo');
   const keyStatusPrevBtn = document.getElementById('keyStatusPrev');
   const keyStatusNextBtn = document.getElementById('keyStatusNext');
@@ -753,6 +754,26 @@
   if (keyStatusPageSize) keyStatusPageSize.onchange = () => { keyStatusOffset = 0; loadKeyStatus(); };
   if (releaseAllKeysBtn) releaseAllKeysBtn.onclick = () => bulkKeyAction('release');
   if (banAllKeysBtn) banAllKeysBtn.onclick = () => bulkKeyAction('invalidate');
+  if (exportKeysBtn) exportKeysBtn.onclick = () => {
+    const upstream = keyStatusUpstreamSelect.value;
+    if (!upstream) return alert('请选择 upstream');
+    const exportToken = prompt('请输入导出密码（Export Token）:');
+    if (!exportToken) return;
+    const url = `/admin/api/v1/upstreams/${encodeURIComponent(upstream)}/keys/export`;
+    fetch(url, { headers: { 'X-Admin-Token': getToken(), 'X-Export-Token': exportToken } })
+      .then(resp => {
+        if (!resp.ok) return resp.json().then(d => { throw new Error(d.error?.message || resp.statusText); });
+        return resp.blob();
+      })
+      .then(blob => {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `${upstream}_keys_${Math.floor(Date.now()/1000)}.txt`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+      })
+      .catch(e => alert('导出失败: ' + e.message));
+  };
   if (keyStatusPrevBtn) keyStatusPrevBtn.onclick = () => {
     const limit = keyStatusPageSizeValue();
     keyStatusOffset = Math.max(0, keyStatusOffset - limit);

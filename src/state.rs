@@ -31,6 +31,7 @@ pub struct RouterState {
 
     pub proxy_tokens: Option<Arc<AHashSet<String>>>,
     pub admin_tokens: Arc<AHashSet<String>>,
+    pub export_token: String,
     pub usage_inject_upstreams: Option<Arc<AHashSet<String>>>,
 
     pub store: Arc<KeyStore>,
@@ -64,6 +65,7 @@ impl Clone for RouterState {
             key_config: self.key_config.clone(),
             proxy_tokens: self.proxy_tokens.clone(),
             admin_tokens: self.admin_tokens.clone(),
+            export_token: self.export_token.clone(),
             usage_inject_upstreams: self.usage_inject_upstreams.clone(),
             store: self.store.clone(),
             billing: self.billing.clone(),
@@ -410,6 +412,7 @@ impl RouterState {
             key_config: cfg.key,
             proxy_tokens,
             admin_tokens,
+            export_token: cfg.export_token,
             usage_inject_upstreams,
             store,
             billing,

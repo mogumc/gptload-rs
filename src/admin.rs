@@ -345,6 +345,10 @@ async fn handle_upstream_subroutes(
             Method::POST => api_invalidate_keys(req, state, upstream_id).await,
             _ => method_not_allowed(),
         },
+        "export" => match *req.method() {
+            Method::GET => api_export_keys(req, state, upstream_id).await,
+            _ => method_not_allowed(),
+        },
         _ => Response::builder()
             .status(404)
             .header("content-type", "application/json")
@@ -1020,6 +1024,58 @@ async fn api_list_keys(state: Arc<RouterState>, upstream_id: &str, uri: &http::U
         "limit": limit,
         "keys": out
     }))
+}
+
+/// Export all keys for an upstream as a downloadable txt file.
+/// Requires the separate `export_token` via `X-Export-Token` header.
+async fn api_export_keys(
+    req: Request<Body>,
+    state: Arc<RouterState>,
+    upstream_id: &str,
+) -> Response<Body> {
+    // Verify export token.
+    let provided = req
+        .headers()
+        .get("x-export-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if provided.is_empty() || provided != state.export_token {
+        return RouterState::json_error(
+            http::StatusCode::UNAUTHORIZED,
+            "missing or invalid export token",
+            "export_unauthorized",
+        );
+    }
+
+    let (_idx, upstream) = match get_upstream(&state, upstream_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let keys = upstream.keys.load_full();
+    let total = keys.len();
+
+    let mut body = String::with_capacity(total * 60);
+    for k in keys.iter() {
+        body.push_str(k.key.as_ref());
+        body.push('\n');
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let filename = format!("{}_keys_{}.txt", upstream_id, now);
+
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/plain; charset=utf-8")
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .body(Body::from(body))
+        .unwrap()
 }
 
 async fn parse_keys_body(req: Request<Body>) -> Result<(Vec<String>, bool), String> {

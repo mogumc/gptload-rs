@@ -25,6 +25,10 @@ retry_status_codes = [429, 500, 502, 503, 504, 401, 403]
 # NOTE: If you expose this server publicly, set strong tokens.
 admin_tokens = ["admin-token-1"]
 
+# Separate token for sensitive operations (key export).
+# Clients must pass X-Export-Token header for export endpoints.
+export_token = "your-export-secret"
+
 # Where to store the embedded key database (sled). Will be created if missing.
 data_dir = "./data"
 
