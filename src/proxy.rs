@@ -66,6 +66,11 @@ async fn handle(
             .unwrap();
     }
 
+    // Prometheus metrics.
+    if req.method() == hyper::Method::GET && path == "/metrics" {
+        return admin::prometheus_metrics(state).await;
+    }
+
     // Admin UI/API.
     if path.starts_with("/admin") {
         return admin::handle_admin(req, state).await;
