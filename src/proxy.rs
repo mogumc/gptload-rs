@@ -184,6 +184,7 @@ async fn execute_attempt(
     billing_key: &str,
     log_ctx: &RequestLogContext,
     stream_request: bool,
+    can_retry: bool,
 ) -> AttemptResult {
     let now = now_ms();
 
@@ -254,7 +255,7 @@ async fn execute_attempt(
 
             let should_retry = should_retry_status(state, status);
 
-            if should_retry {
+            if can_retry && should_retry {
                 let now = now_ms();
                 if let Some(new_sel) = state.select_for_model(
                     &log_ctx.model.clone().unwrap_or_default(),
@@ -282,16 +283,18 @@ async fn execute_attempt(
         Ok(Err(_e)) => {
             state.on_network_error(sel, now);
 
-            if let Some(new_sel) = state.select_for_model(
-                &log_ctx.model.clone().unwrap_or_default(),
-                now,
-            ) {
-                tracing::debug!(
-                    old_upstream = %sel.upstream.id,
-                    new_upstream = %new_sel.upstream.id,
-                    "retrying after network error"
-                );
-                return AttemptResult::Retry(new_sel);
+            if can_retry {
+                if let Some(new_sel) = state.select_for_model(
+                    &log_ctx.model.clone().unwrap_or_default(),
+                    now,
+                ) {
+                    tracing::debug!(
+                        old_upstream = %sel.upstream.id,
+                        new_upstream = %new_sel.upstream.id,
+                        "retrying after network error"
+                    );
+                    return AttemptResult::Retry(new_sel);
+                }
             }
 
             if *billing_reserved {
@@ -310,16 +313,18 @@ async fn execute_attempt(
         Err(_) => {
             state.on_timeout(sel, now);
 
-            if let Some(new_sel) = state.select_for_model(
-                &log_ctx.model.clone().unwrap_or_default(),
-                now,
-            ) {
-                tracing::debug!(
-                    old_upstream = %sel.upstream.id,
-                    new_upstream = %new_sel.upstream.id,
-                    "retrying after timeout"
-                );
-                return AttemptResult::Retry(new_sel);
+            if can_retry {
+                if let Some(new_sel) = state.select_for_model(
+                    &log_ctx.model.clone().unwrap_or_default(),
+                    now,
+                ) {
+                    tracing::debug!(
+                        old_upstream = %sel.upstream.id,
+                        new_upstream = %new_sel.upstream.id,
+                        "retrying after timeout"
+                    );
+                    return AttemptResult::Retry(new_sel);
+                }
             }
 
             if *billing_reserved {
@@ -491,6 +496,7 @@ async fn forward(
             &billing_key,
             &log_ctx,
             stream_request,
+            retry_count < max_retries,
         )
         .await;
 
