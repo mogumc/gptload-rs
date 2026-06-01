@@ -1,10 +1,11 @@
 use crate::billing::BillingStore;
-use crate::config::{Config, KeyConfig, UpstreamConfig};
+use crate::config::{Config, KeyConfig, ServerConfig, UpstreamConfig, UpstreamFormat};
 use crate::storage::KeyStore;
+use crate::upstream_client::UpstreamClient;
 use crate::util::now_ms;
 use ahash::{AHashMap, AHashSet};
 use arc_swap::ArcSwap;
-use http::uri::{Authority, PathAndQuery, Scheme};
+use http::uri::{Authority, Scheme};
 use hyper::client::HttpConnector;
 use hyper::header::{
     HeaderName, CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER,
@@ -15,15 +16,17 @@ use hyper_rustls::HttpsConnectorBuilder;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc, Notify, Semaphore, SemaphorePermit};
 
 pub const HDR_AUTHORIZATION: HeaderName = hyper::header::AUTHORIZATION;
 
 pub struct RouterState {
+    pub runtime: ArcSwap<RuntimeConfig>,
+
     pub request_timeout: Duration,
     pub max_retries: usize,
     pub retry_status_codes: Arc<AHashSet<u16>>,
@@ -47,6 +50,38 @@ pub struct RouterState {
     pub stats: Arc<Stats>,
     pub requests: Arc<RequestsLog>,
     pub admin_write_lock: Arc<Mutex<()>>,
+    pub shutting_down: AtomicBool,
+    pub queue_notify: Notify,
+    pub queue_slots: Semaphore,
+    pub config_path: Option<PathBuf>,
+    pub listen_addr: String,
+    pub worker_threads: Option<usize>,
+    pub data_dir: PathBuf,
+}
+
+#[derive(Clone)]
+pub struct RuntimeConfig {
+    pub request_timeout: Duration,
+    pub max_retries: usize,
+    pub retry_status_codes: Arc<AHashSet<u16>>,
+    pub key_config: KeyConfig,
+    pub proxy_tokens: Option<Arc<AHashSet<String>>>,
+    pub admin_tokens: Arc<AHashSet<String>>,
+    pub export_token: Option<String>,
+    pub usage_inject_upstreams: Option<Arc<AHashSet<String>>>,
+    pub server: ServerConfig,
+    pub preview: serde_json::Value,
+}
+
+pub struct QueueGuard<'a> {
+    state: &'a RouterState,
+    _permit: SemaphorePermit<'a>,
+}
+
+impl Drop for QueueGuard<'_> {
+    fn drop(&mut self) {
+        self.state.stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 pub struct RouterSnapshot {
@@ -59,6 +94,7 @@ pub struct RouterSnapshot {
 impl Clone for RouterState {
     fn clone(&self) -> Self {
         RouterState {
+            runtime: ArcSwap::from(self.runtime.load_full()),
             request_timeout: self.request_timeout,
             max_retries: self.max_retries,
             retry_status_codes: self.retry_status_codes.clone(),
@@ -72,11 +108,20 @@ impl Clone for RouterState {
             model_routes_path: self.model_routes_path.clone(),
             upstreams_path: self.upstreams_path.clone(),
             snapshot: ArcSwap::from(self.snapshot.load_full()),
-            sched_rr: Arc::new(AtomicUsize::new(self.sched_rr.load(std::sync::atomic::Ordering::Relaxed))),
+            sched_rr: Arc::new(AtomicUsize::new(
+                self.sched_rr.load(std::sync::atomic::Ordering::Relaxed),
+            )),
             client: self.client.clone(),
             stats: self.stats.clone(),
             requests: self.requests.clone(),
             admin_write_lock: self.admin_write_lock.clone(),
+            shutting_down: AtomicBool::new(self.shutting_down.load(Ordering::Relaxed)),
+            queue_notify: Notify::new(),
+            queue_slots: Semaphore::new(self.server_config().queue_max_depth),
+            config_path: self.config_path.clone(),
+            listen_addr: self.listen_addr.clone(),
+            worker_threads: self.worker_threads,
+            data_dir: self.data_dir.clone(),
         }
     }
 }
@@ -91,6 +136,9 @@ pub struct Upstream {
 
     pub weight: usize,
     pub max_concurrent_per_key: u32,
+    pub format: UpstreamFormat,
+    pub proxy: Option<String>,
+    pub client: UpstreamClient,
 
     pub keys: ArcSwap<Vec<Arc<KeyState>>>,
     pub active_keys: ArcSwap<Vec<Arc<KeyState>>>,
@@ -113,6 +161,7 @@ pub struct KeyState {
     pub active_requests: AtomicU32,
     /// Unix ms timestamp when the 429 cooldown expires. 0 = not in cooldown.
     pub cooldown_until_ms: AtomicU64,
+    pub latencies_ms: Mutex<VecDeque<u64>>,
 }
 
 #[derive(Clone)]
@@ -137,6 +186,9 @@ pub struct Stats {
 
     pub errors_timeout: AtomicU64,
     pub errors_network: AtomicU64,
+
+    pub queue_depth: AtomicU64,
+    pub queue_timeout_total: AtomicU64,
 
     pub latency_ns_total: AtomicU64,
     pub latency_count: AtomicU64,
@@ -181,6 +233,8 @@ impl Stats {
             responses_5xx: AtomicU64::new(0),
             errors_timeout: AtomicU64::new(0),
             errors_network: AtomicU64::new(0),
+            queue_depth: AtomicU64::new(0),
+            queue_timeout_total: AtomicU64::new(0),
             latency_ns_total: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             latency_ns_max: AtomicU64::new(0),
@@ -190,6 +244,7 @@ impl Stats {
 
 #[derive(Clone, serde::Serialize)]
 pub struct RequestLogEntry {
+    pub id: u64,
     pub ts_ms: u64,
     pub client_ip: String,
     pub method: String,
@@ -203,6 +258,17 @@ pub struct RequestLogEntry {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    pub request_headers: Option<BTreeMap<String, String>>,
+    pub request_body: Option<String>,
+    pub timing: RequestTiming,
+}
+
+#[derive(Clone, Default, serde::Serialize)]
+pub struct RequestTiming {
+    pub queue_ms: u64,
+    pub upstream_ms: u64,
+    pub total_ms: u64,
+    pub attempts: u32,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -244,19 +310,23 @@ pub struct RequestsLog {
     metrics: Mutex<RequestMetrics>,
     cap: usize,
     tx: Option<mpsc::Sender<RequestLogEntry>>,
+    broadcast_tx: broadcast::Sender<RequestLogEntry>,
 }
 
 impl RequestsLog {
     pub fn new(cap: usize, tx: Option<mpsc::Sender<RequestLogEntry>>) -> Self {
+        let (broadcast_tx, _rx) = broadcast::channel(1024);
         Self {
             entries: Mutex::new(VecDeque::with_capacity(cap)),
             metrics: Mutex::new(RequestMetrics::new()),
             cap,
             tx,
+            broadcast_tx,
         }
     }
 
     pub fn record(&self, entry: RequestLogEntry) {
+        let _ = self.broadcast_tx.send(entry.clone());
         if let Some(tx) = &self.tx {
             let _ = tx.try_send(entry.clone());
         }
@@ -284,6 +354,10 @@ impl RequestsLog {
         let metrics = self.metrics.lock().unwrap();
         metrics.snapshot(window)
     }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<RequestLogEntry> {
+        self.broadcast_tx.subscribe()
+    }
 }
 
 pub struct RequestMetrics {
@@ -305,9 +379,33 @@ impl RequestMetrics {
         let (success, failure, ignored) = classify_status(entry.status);
         let ts_ms = entry.ts_ms;
 
-        update_bucket(&mut self.minute, ts_ms, 60_000, 60, success, failure, ignored);
-        update_bucket(&mut self.hour, ts_ms, 3_600_000, 48, success, failure, ignored);
-        update_bucket(&mut self.day, ts_ms, 86_400_000, 30, success, failure, ignored);
+        update_bucket(
+            &mut self.minute,
+            ts_ms,
+            60_000,
+            60,
+            success,
+            failure,
+            ignored,
+        );
+        update_bucket(
+            &mut self.hour,
+            ts_ms,
+            3_600_000,
+            48,
+            success,
+            failure,
+            ignored,
+        );
+        update_bucket(
+            &mut self.day,
+            ts_ms,
+            86_400_000,
+            30,
+            success,
+            failure,
+            ignored,
+        );
     }
 
     pub fn snapshot(&self, window: MetricsWindow) -> Vec<MetricsBucket> {
@@ -319,14 +417,16 @@ impl RequestMetrics {
     }
 }
 
-impl RouterState {
-    pub fn new(cfg: Config) -> anyhow::Result<Self> {
-        let request_timeout = Duration::from_millis(cfg.request_timeout_ms);
-        let max_retries = cfg.max_retries.unwrap_or(5);
-        let retry_status_codes = cfg.retry_status_codes.unwrap_or_else(|| vec![429]);
-        let retry_status_codes = Arc::new(retry_status_codes.into_iter().collect::<AHashSet<u16>>());
+impl RuntimeConfig {
+    pub fn from_config(cfg: &Config) -> Self {
+        let retry_status_codes = cfg
+            .retry_status_codes
+            .clone()
+            .unwrap_or_else(|| vec![429])
+            .into_iter()
+            .collect::<AHashSet<u16>>();
 
-        let proxy_tokens = cfg.proxy_tokens.and_then(|v| {
+        let proxy_tokens = cfg.proxy_tokens.clone().and_then(|v| {
             let mut set = AHashSet::with_capacity(v.len().max(1));
             for t in v {
                 let t = t.trim();
@@ -342,14 +442,13 @@ impl RouterState {
         });
 
         let mut admin_set = AHashSet::with_capacity(cfg.admin_tokens.len().max(1));
-        for t in cfg.admin_tokens {
+        for t in cfg.admin_tokens.iter() {
             if !t.is_empty() {
-                admin_set.insert(t);
+                admin_set.insert(t.clone());
             }
         }
-        let admin_tokens = Arc::new(admin_set);
 
-        let usage_inject_upstreams = cfg.usage_inject_upstreams.and_then(|v| {
+        let usage_inject_upstreams = cfg.usage_inject_upstreams.clone().and_then(|v| {
             let mut set = AHashSet::with_capacity(v.len().max(1));
             for id in v {
                 let id = id.trim();
@@ -364,8 +463,34 @@ impl RouterState {
             }
         });
 
+        Self {
+            request_timeout: Duration::from_millis(cfg.request_timeout_ms),
+            max_retries: cfg.max_retries.unwrap_or(5),
+            retry_status_codes: Arc::new(retry_status_codes),
+            key_config: cfg.key.clone(),
+            proxy_tokens,
+            admin_tokens: Arc::new(admin_set),
+            export_token: cfg.export_token.clone(),
+            usage_inject_upstreams,
+            server: cfg.server.clone(),
+            preview: config_preview(cfg),
+        }
+    }
+}
+
+impl RouterState {
+    pub fn new(cfg: Config, config_path: Option<PathBuf>) -> anyhow::Result<Self> {
+        let runtime = Arc::new(RuntimeConfig::from_config(&cfg));
+        let queue_max_depth = runtime.server.queue_max_depth;
+        let request_timeout = runtime.request_timeout;
+        let max_retries = runtime.max_retries;
+        let retry_status_codes = runtime.retry_status_codes.clone();
+        let proxy_tokens = runtime.proxy_tokens.clone();
+        let admin_tokens = runtime.admin_tokens.clone();
+        let usage_inject_upstreams = runtime.usage_inject_upstreams.clone();
+
         // Storage
-        let data_dir: PathBuf = cfg.data_dir;
+        let data_dir: PathBuf = cfg.data_dir.clone();
         let store = Arc::new(KeyStore::open(&data_dir)?);
         let billing = Arc::new(BillingStore::new(&store)?);
         let model_routes_path = data_dir.join("models_routes.json");
@@ -374,7 +499,7 @@ impl RouterState {
         let log_tx = start_request_log_writer(requests_log_path);
         let requests = Arc::new(RequestsLog::new(5000, log_tx));
 
-        let mut upstream_configs = cfg.upstreams;
+        let mut upstream_configs = cfg.upstreams.clone();
         if let Ok(list) = load_upstreams_override(&upstreams_path) {
             upstream_configs = list;
         } else if upstreams_path.exists() {
@@ -408,13 +533,14 @@ impl RouterState {
         }
 
         Ok(Self {
+            runtime: ArcSwap::from(runtime),
             request_timeout,
             max_retries,
             retry_status_codes,
-            key_config: cfg.key,
+            key_config: cfg.key.clone(),
             proxy_tokens,
             admin_tokens,
-            export_token: cfg.export_token,
+            export_token: cfg.export_token.clone(),
             usage_inject_upstreams,
             store,
             billing,
@@ -426,12 +552,20 @@ impl RouterState {
             stats: Arc::new(Stats::new()),
             requests,
             admin_write_lock: Arc::new(Mutex::new(())),
+            shutting_down: AtomicBool::new(false),
+            queue_notify: Notify::new(),
+            queue_slots: Semaphore::new(queue_max_depth),
+            config_path,
+            listen_addr: cfg.listen_addr.clone(),
+            worker_threads: cfg.worker_threads,
+            data_dir,
         })
     }
 
     #[inline]
     pub fn authorize_proxy(&self, req: &Request<Body>) -> bool {
-        let Some(tokens) = &self.proxy_tokens else {
+        let rt = self.runtime.load();
+        let Some(tokens) = &rt.proxy_tokens else {
             return true;
         };
         let Some(h) = req.headers().get("x-proxy-token") else {
@@ -449,14 +583,16 @@ impl RouterState {
             return false;
         };
         match h.to_str() {
-            Ok(s) => self.admin_tokens.contains(s),
+            Ok(s) => self.runtime.load().admin_tokens.contains(s),
             Err(_) => false,
         }
     }
 
     #[inline]
     pub fn should_inject_usage(&self, upstream_id: &str) -> bool {
-        self.usage_inject_upstreams
+        self.runtime
+            .load()
+            .usage_inject_upstreams
             .as_ref()
             .map(|set| set.contains(upstream_id))
             .unwrap_or(false)
@@ -464,11 +600,15 @@ impl RouterState {
 
     #[inline]
     pub fn should_retry_status(&self, status: http::StatusCode) -> bool {
-        self.retry_status_codes.contains(&status.as_u16())
+        self.runtime
+            .load()
+            .retry_status_codes
+            .contains(&status.as_u16())
     }
 
     pub fn retry_status_codes_sorted(&self) -> Vec<u16> {
-        let mut v: Vec<u16> = self.retry_status_codes.iter().copied().collect();
+        let rt = self.runtime.load();
+        let mut v: Vec<u16> = rt.retry_status_codes.iter().copied().collect();
         v.sort_unstable();
         v
     }
@@ -482,8 +622,58 @@ impl RouterState {
         self.requests.recent(limit)
     }
 
+    pub fn subscribe_requests(&self) -> broadcast::Receiver<RequestLogEntry> {
+        self.requests.subscribe()
+    }
+
     pub fn metrics_snapshot(&self, window: MetricsWindow) -> Vec<MetricsBucket> {
         self.requests.metrics_snapshot(window)
+    }
+
+    pub fn server_config(&self) -> ServerConfig {
+        self.runtime.load().server.clone()
+    }
+
+    pub fn request_timeout(&self) -> Duration {
+        self.runtime.load().request_timeout
+    }
+
+    pub fn max_retries(&self) -> usize {
+        self.runtime.load().max_retries
+    }
+
+    pub fn key_config(&self) -> KeyConfig {
+        self.runtime.load().key_config.clone()
+    }
+
+    pub fn export_token(&self) -> Option<String> {
+        self.runtime.load().export_token.clone()
+    }
+
+    pub fn config_preview(&self) -> serde_json::Value {
+        self.runtime.load().preview.clone()
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Relaxed)
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Relaxed);
+        self.queue_notify.notify_waiters();
+    }
+
+    pub fn notify_capacity(&self) {
+        self.queue_notify.notify_one();
+    }
+
+    pub fn queue_enter(&self) -> Option<QueueGuard<'_>> {
+        let permit = self.queue_slots.try_acquire().ok()?;
+        self.stats.queue_depth.fetch_add(1, Ordering::Relaxed);
+        Some(QueueGuard {
+            state: self,
+            _permit: permit,
+        })
     }
 
     pub fn upstream_by_id(&self, id: &str) -> Option<(usize, Arc<Upstream>)> {
@@ -495,13 +685,16 @@ impl RouterState {
     /// Select an upstream + key that supports the given model.
     /// Returns None only if no upstream has active keys for the model.
     pub fn select_for_model(&self, model: &str, _now_ms: u64) -> Option<Selected> {
+        if self.is_shutting_down() {
+            return None;
+        }
         let snap = self.snapshot.load_full();
         let sched_len = snap.schedule.len();
         if sched_len == 0 {
             return None;
         }
 
-        let global_max = self.key_config.max_concurrent_per_key;
+        let global_max = self.key_config().max_concurrent_per_key;
 
         for _ in 0..sched_len {
             let rr = self.sched_rr.as_ref().fetch_add(1, Ordering::Relaxed);
@@ -520,7 +713,9 @@ impl RouterState {
             };
 
             if let Some(k) = u.select_key(max) {
-                self.stats.upstream_selected_total.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .upstream_selected_total
+                    .fetch_add(1, Ordering::Relaxed);
                 u.stats.selected_total.fetch_add(1, Ordering::Relaxed);
                 return Some(Selected {
                     upstream: u.clone(),
@@ -534,7 +729,9 @@ impl RouterState {
 
     pub fn model_exists(&self, model: &str) -> bool {
         let snap = self.snapshot.load_full();
-        snap.upstreams.iter().any(|u| u.models.load().contains(model))
+        snap.upstreams
+            .iter()
+            .any(|u| u.models.load().contains(model))
     }
 
     pub fn any_models_loaded(&self) -> bool {
@@ -611,7 +808,12 @@ impl RouterState {
     /// Handle an upstream response status. Only auth errors (401/403) count as
     /// key failures. 429 (rate limit) sets a short cooldown on the key.
     #[inline]
-    pub fn on_upstream_status(&self, sel: &Selected, status: http::StatusCode) {
+    pub fn on_upstream_status(
+        &self,
+        sel: &Selected,
+        status: http::StatusCode,
+        retry_after_ms: Option<u64>,
+    ) {
         let u = &sel.upstream;
 
         inc_status(&u.stats, status);
@@ -621,8 +823,16 @@ impl RouterState {
         if status == http::StatusCode::UNAUTHORIZED || status == http::StatusCode::FORBIDDEN {
             self.handle_auth_failure(sel);
         } else if status == http::StatusCode::TOO_MANY_REQUESTS {
-            // Set short cooldown so we don't keep hammering the same rate-limited key.
-            let cooldown_ms = self.key_config.rate_limit_cooldown_ms;
+            let key_cfg = self.key_config();
+            let configured = key_cfg.rate_limit_cooldown_ms;
+            let cooldown_ms = retry_after_ms
+                .or(if configured > 0 {
+                    Some(configured)
+                } else {
+                    None
+                })
+                .unwrap_or(3000)
+                .min(key_cfg.max_rate_limit_cooldown_ms.max(1));
             if cooldown_ms > 0 {
                 let until = now_ms() + cooldown_ms;
                 sel.key.cooldown_until_ms.store(until, Ordering::Relaxed);
@@ -633,7 +843,7 @@ impl RouterState {
     /// Increment failure count; if threshold reached, mark key invalid and
     /// remove it from the upstream's active pool.
     fn handle_auth_failure(&self, sel: &Selected) {
-        let threshold = self.key_config.blacklist_threshold;
+        let threshold = self.key_config().blacklist_threshold;
         if threshold == 0 {
             return; // auto-blacklist disabled
         }
@@ -655,13 +865,19 @@ impl RouterState {
     #[inline]
     pub fn on_timeout(&self, sel: &Selected, _now_ms: u64) {
         self.stats.errors_timeout.fetch_add(1, Ordering::Relaxed);
-        sel.upstream.stats.errors_timeout.fetch_add(1, Ordering::Relaxed);
+        sel.upstream
+            .stats
+            .errors_timeout
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
     pub fn on_network_error(&self, sel: &Selected, _now_ms: u64) {
         self.stats.errors_network.fetch_add(1, Ordering::Relaxed);
-        sel.upstream.stats.errors_network.fetch_add(1, Ordering::Relaxed);
+        sel.upstream
+            .stats
+            .errors_network
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -677,9 +893,10 @@ impl RouterState {
         }
     }
 
-
     pub fn record_latency(&self, latency_ns: u64) {
-        self.stats.latency_ns_total.fetch_add(latency_ns, Ordering::Relaxed);
+        self.stats
+            .latency_ns_total
+            .fetch_add(latency_ns, Ordering::Relaxed);
         self.stats.latency_count.fetch_add(1, Ordering::Relaxed);
 
         // Update max with CAS loop.
@@ -716,14 +933,15 @@ impl RouterState {
     /// with anything other than 401/403, the key is restored to active.
     pub fn start_revalidation(self: &Arc<RouterState>) {
         let state = Arc::clone(self);
-        let interval_secs = state.key_config.revalidation_interval_secs.max(60);
-        let timeout_secs = state.key_config.revalidation_timeout_secs.max(5);
 
         tokio::spawn(async move {
             // Wait a bit before first run to let the system stabilise.
             tokio::time::sleep(Duration::from_secs(10)).await;
 
             loop {
+                let key_cfg = state.key_config();
+                let interval_secs = key_cfg.revalidation_interval_secs.max(60);
+                let timeout_secs = key_cfg.revalidation_timeout_secs.max(5);
                 tracing::debug!("revalidation: checking invalid keys...");
                 let start = now_ms();
 
@@ -746,13 +964,7 @@ impl RouterState {
 
                     for key in invalid_keys {
                         total_checked += 1;
-                        match validate_key(
-                            &state.client,
-                            upstream,
-                            &key,
-                            Duration::from_secs(timeout_secs),
-                        )
-                        .await
+                        match validate_key(upstream, &key, Duration::from_secs(timeout_secs)).await
                         {
                             Ok(true) => {
                                 key.failure_count.store(0, Ordering::Relaxed);
@@ -802,23 +1014,30 @@ impl RouterState {
 
 /// Test a single key by calling the upstream's /v1/models endpoint.
 /// Returns Ok(true) if the key is valid (not 401/403), Ok(false) if invalid.
-async fn validate_key(
-    client: &hyper::Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
+pub async fn validate_key(
     upstream: &Upstream,
     key: &KeyState,
     timeout: Duration,
 ) -> anyhow::Result<bool> {
     use hyper::body::HttpBody;
 
-    let uri = upstream.build_uri(&PathAndQuery::from_static("/v1/models"))?;
+    let pq: http::uri::PathAndQuery = match upstream.format {
+        UpstreamFormat::Openai | UpstreamFormat::Anthropic => {
+            http::uri::PathAndQuery::from_static("/v1/models")
+        }
+        UpstreamFormat::Gemini => {
+            let path = format!("/v1beta/models?key={}", url_encode(key.key.as_ref()));
+            path.parse()?
+        }
+    };
+    let uri = upstream.build_uri(&pq)?;
     let mut req = Request::builder()
         .method(Method::GET)
         .uri(uri)
         .body(Body::empty())?;
-    req.headers_mut()
-        .insert(HDR_AUTHORIZATION, key.auth_header.clone());
+    insert_key_headers(req.headers_mut(), upstream.format, key)?;
 
-    let mut resp = match tokio::time::timeout(timeout, client.request(req)).await {
+    let mut resp = match tokio::time::timeout(timeout, upstream.client.request(req)).await {
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => return Err(e.into()),
         Err(_) => anyhow::bail!("validation request timeout"),
@@ -835,6 +1054,32 @@ async fn validate_key(
 impl KeyState {
     pub fn is_active(&self) -> bool {
         self.status.load(Ordering::Relaxed) == KEY_STATUS_ACTIVE
+    }
+
+    pub fn record_latency_ms(&self, latency_ms: u64) {
+        let Ok(mut latencies) = self.latencies_ms.lock() else {
+            return;
+        };
+        latencies.push_back(latency_ms);
+        while latencies.len() > 256 {
+            latencies.pop_front();
+        }
+    }
+
+    pub fn latency_percentiles(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        let Ok(latencies) = self.latencies_ms.lock() else {
+            return (None, None, None);
+        };
+        if latencies.is_empty() {
+            return (None, None, None);
+        }
+        let mut values: Vec<u64> = latencies.iter().copied().collect();
+        values.sort_unstable();
+        (
+            Some(percentile(&values, 50)),
+            Some(percentile(&values, 90)),
+            Some(percentile(&values, 99)),
+        )
     }
 }
 
@@ -863,9 +1108,7 @@ impl Upstream {
                 k.cooldown_until_ms.store(0, Ordering::Relaxed);
             }
             // Skip keys at concurrency limit.
-            if max_concurrent > 0
-                && k.active_requests.load(Ordering::Relaxed) >= max_concurrent
-            {
+            if max_concurrent > 0 && k.active_requests.load(Ordering::Relaxed) >= max_concurrent {
                 continue;
             }
             return Some(k.clone());
@@ -1000,22 +1243,31 @@ fn inc_status(stats: &UpstreamStats, status: http::StatusCode) {
     }
 }
 
-
 fn parse_upstream(u: UpstreamConfig, weight: usize) -> anyhow::Result<Arc<Upstream>> {
     let name_for_err = u.id.clone();
 
     let base: Uri = u.base_url.parse()?;
+    let format = u
+        .format
+        .unwrap_or_else(|| UpstreamFormat::detect(&u.base_url));
+    let proxy = u.proxy.clone().filter(|p| !p.trim().is_empty());
+    let client = UpstreamClient::new(proxy.as_deref())?;
 
     let scheme = base
         .scheme()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("upstream {}: base_url missing scheme", name_for_err))?;
-    let authority = base.authority().cloned().ok_or_else(|| {
-        anyhow::anyhow!("upstream {}: base_url missing authority", name_for_err)
-    })?;
+    let authority = base
+        .authority()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("upstream {}: base_url missing authority", name_for_err))?;
 
     let base_path = base.path().trim_end_matches('/').to_string();
-    let base_path = if base_path == "/" { String::new() } else { base_path };
+    let base_path = if base_path == "/" {
+        String::new()
+    } else {
+        base_path
+    };
 
     let upstream = Upstream {
         id: Arc::<str>::from(u.id),
@@ -1025,6 +1277,9 @@ fn parse_upstream(u: UpstreamConfig, weight: usize) -> anyhow::Result<Arc<Upstre
         base_path: Arc::<str>::from(base_path),
         weight,
         max_concurrent_per_key: u.max_concurrent_per_key.unwrap_or(0),
+        format,
+        proxy,
+        client,
         keys: ArcSwap::from_pointee(Vec::new()),
         active_keys: ArcSwap::from_pointee(Vec::new()),
         keys_update_lock: Mutex::new(()),
@@ -1044,10 +1299,8 @@ pub fn build_key_states(keys: Vec<String>) -> anyhow::Result<Arc<Vec<Arc<KeyStat
             continue;
         }
         let key_arc: Arc<str> = Arc::<str>::from(k.to_string());
-        let auth_header =
-            hyper::header::HeaderValue::from_str(&format!("Bearer {}", key_arc)).map_err(|_| {
-                anyhow::anyhow!("invalid key (cannot be used in HTTP header)")
-            })?;
+        let auth_header = hyper::header::HeaderValue::from_str(&format!("Bearer {}", key_arc))
+            .map_err(|_| anyhow::anyhow!("invalid key (cannot be used in HTTP header)"))?;
         out.push(Arc::new(KeyState {
             key: key_arc,
             auth_header,
@@ -1055,22 +1308,39 @@ pub fn build_key_states(keys: Vec<String>) -> anyhow::Result<Arc<Vec<Arc<KeyStat
             status: AtomicU8::new(KEY_STATUS_ACTIVE),
             active_requests: AtomicU32::new(0),
             cooldown_until_ms: AtomicU64::new(0),
+            latencies_ms: Mutex::new(VecDeque::with_capacity(256)),
         }));
     }
     Ok(Arc::new(out))
 }
 
-fn parse_models_response(body: &[u8]) -> anyhow::Result<AHashSet<String>> {
+fn parse_models_response(format: UpstreamFormat, body: &[u8]) -> anyhow::Result<AHashSet<String>> {
     let v: serde_json::Value = serde_json::from_slice(body)?;
-    let data = v
-        .get("data")
-        .and_then(|d| d.as_array())
-        .ok_or_else(|| anyhow::anyhow!("missing data array in models response"))?;
-
-    let mut out: AHashSet<String> = AHashSet::with_capacity(data.len().max(1));
-    for item in data {
-        if let Some(id) = item.get("id").and_then(|s| s.as_str()) {
-            out.insert(id.to_string());
+    let mut out: AHashSet<String> = AHashSet::new();
+    match format {
+        UpstreamFormat::Openai | UpstreamFormat::Anthropic => {
+            let data = v
+                .get("data")
+                .and_then(|d| d.as_array())
+                .ok_or_else(|| anyhow::anyhow!("missing data array in models response"))?;
+            out.reserve(data.len());
+            for item in data {
+                if let Some(id) = item.get("id").and_then(|s| s.as_str()) {
+                    out.insert(id.to_string());
+                }
+            }
+        }
+        UpstreamFormat::Gemini => {
+            let data = v
+                .get("models")
+                .and_then(|d| d.as_array())
+                .ok_or_else(|| anyhow::anyhow!("missing models array in gemini response"))?;
+            out.reserve(data.len());
+            for item in data {
+                if let Some(name) = item.get("name").and_then(|s| s.as_str()) {
+                    out.insert(name.trim_start_matches("models/").to_string());
+                }
+            }
         }
     }
     Ok(out)
@@ -1188,17 +1458,20 @@ impl RouterState {
         Ok(())
     }
 
-    pub fn update_upstream(&self, id: &str, base_url: String, weight: Option<usize>) -> anyhow::Result<()> {
+    pub fn update_upstream(&self, id: &str, mut cfg: UpstreamConfig) -> anyhow::Result<()> {
         let _guard = self
             .admin_write_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("admin write lock poisoned"))?;
         let mut list = self.current_upstream_configs();
         let mut found = false;
+        cfg.id = id.to_string();
+        if cfg.format.is_none() {
+            cfg.format = Some(UpstreamFormat::detect(&cfg.base_url));
+        }
         for u in list.iter_mut() {
             if u.id == id {
-                u.base_url = base_url.clone();
-                u.weight = weight;
+                *u = cfg.clone();
                 found = true;
                 break;
             }
@@ -1227,6 +1500,30 @@ impl RouterState {
             self.store.replace_keys(id, &empty)?;
         }
         Ok(())
+    }
+
+    pub async fn test_key_by_value(
+        &self,
+        upstream_id: &str,
+        key_value: &str,
+    ) -> anyhow::Result<bool> {
+        let Some((_idx, upstream)) = self.upstream_by_id(upstream_id) else {
+            anyhow::bail!("unknown upstream id");
+        };
+        let key_value = key_value.trim();
+        if key_value.is_empty() {
+            anyhow::bail!("key must not be empty");
+        }
+        let key = build_key_states(vec![key_value.to_string()])?
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("invalid key"))?;
+        validate_key(
+            &upstream,
+            &key,
+            Duration::from_secs(self.key_config().revalidation_timeout_secs.max(5)),
+        )
+        .await
     }
 
     fn build_model_routes(&self) -> ModelRoutesFile {
@@ -1294,6 +1591,8 @@ impl RouterState {
                 } else {
                     None
                 },
+                format: Some(u.format),
+                proxy: u.proxy.clone(),
             })
             .collect()
     }
@@ -1341,14 +1640,25 @@ impl RouterState {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no active keys for upstream"))?;
 
-        let uri = upstream.build_uri(&PathAndQuery::from_static("/v1/models"))?;
+        let pq: http::uri::PathAndQuery = match upstream.format {
+            UpstreamFormat::Openai | UpstreamFormat::Anthropic => {
+                http::uri::PathAndQuery::from_static("/v1/models")
+            }
+            UpstreamFormat::Gemini => {
+                let path = format!("/v1beta/models?key={}", url_encode(key.key.as_ref()));
+                path.parse()?
+            }
+        };
+        let uri = upstream.build_uri(&pq)?;
         let mut req = Request::builder()
             .method(Method::GET)
             .uri(uri)
             .body(Body::empty())?;
-        req.headers_mut().insert(HDR_AUTHORIZATION, key.auth_header.clone());
+        insert_key_headers(req.headers_mut(), upstream.format, &key)?;
 
-        let resp = match tokio::time::timeout(self.request_timeout, self.client.request(req)).await {
+        let resp = match tokio::time::timeout(self.request_timeout(), upstream.client.request(req))
+            .await
+        {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => anyhow::bail!("upstream request timeout"),
@@ -1359,7 +1669,7 @@ impl RouterState {
         }
 
         let body = hyper::body::to_bytes(resp.into_body()).await?;
-        parse_models_response(&body)
+        parse_models_response(upstream.format, &body)
     }
 }
 
@@ -1424,6 +1734,141 @@ fn apply_routes_to_upstreams(
     for (idx, set) in per_upstream.into_iter().enumerate() {
         upstreams[idx].models.store(Arc::new(set));
     }
+}
+
+impl RouterState {
+    pub fn apply_config_reload(&self, cfg: Config) -> anyhow::Result<()> {
+        if cfg.listen_addr != self.listen_addr {
+            tracing::warn!(
+                old = %self.listen_addr,
+                new = %cfg.listen_addr,
+                "config: listen_addr changed, restart required"
+            );
+        }
+        if cfg.worker_threads != self.worker_threads {
+            tracing::warn!(
+                old = ?self.worker_threads,
+                new = ?cfg.worker_threads,
+                "config: worker_threads changed, restart required"
+            );
+        }
+        if cfg.data_dir != self.data_dir {
+            tracing::warn!(
+                old = %self.data_dir.display(),
+                new = %cfg.data_dir.display(),
+                "config: data_dir changed, restart required"
+            );
+        }
+
+        let runtime = Arc::new(RuntimeConfig::from_config(&cfg));
+        let old = self.runtime.load_full();
+        if runtime.server.queue_max_depth > old.server.queue_max_depth {
+            self.queue_slots
+                .add_permits(runtime.server.queue_max_depth - old.server.queue_max_depth);
+        } else if runtime.server.queue_max_depth < old.server.queue_max_depth {
+            tracing::warn!(
+                old = old.server.queue_max_depth,
+                new = runtime.server.queue_max_depth,
+                "config: queue_max_depth decrease applies after restart"
+            );
+        }
+        log_runtime_config_changes(&old, &runtime);
+        self.runtime.store(runtime);
+
+        let _guard = self
+            .admin_write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("admin write lock poisoned"))?;
+        self.replace_upstreams(cfg.upstreams)?;
+        self.queue_notify.notify_waiters();
+        Ok(())
+    }
+}
+
+fn log_runtime_config_changes(old: &RuntimeConfig, new: &RuntimeConfig) {
+    if old.request_timeout != new.request_timeout {
+        tracing::info!(
+            old_ms = old.request_timeout.as_millis() as u64,
+            new_ms = new.request_timeout.as_millis() as u64,
+            "config reloaded: request_timeout_ms"
+        );
+    }
+    if old.max_retries != new.max_retries {
+        tracing::info!(
+            old = old.max_retries,
+            new = new.max_retries,
+            "config reloaded: max_retries"
+        );
+    }
+    if old.server.cors_origins != new.server.cors_origins {
+        tracing::info!("config reloaded: cors_origins");
+    }
+    if old.server.queue_enabled != new.server.queue_enabled
+        || old.server.queue_max_depth != new.server.queue_max_depth
+        || old.server.queue_timeout_ms != new.server.queue_timeout_ms
+    {
+        tracing::info!("config reloaded: queue settings");
+    }
+}
+
+fn config_preview(cfg: &Config) -> serde_json::Value {
+    let mut v = serde_json::to_value(cfg).unwrap_or_else(|_| serde_json::json!({}));
+    redact_config_value(&mut v);
+    v
+}
+
+fn redact_config_value(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, value) in map.iter_mut() {
+                if k.contains("token") || k == "keys" {
+                    *value = serde_json::json!("<redacted>");
+                } else {
+                    redact_config_value(value);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_config_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn insert_key_headers(
+    headers: &mut hyper::HeaderMap,
+    format: UpstreamFormat,
+    key: &KeyState,
+) -> anyhow::Result<()> {
+    match format {
+        UpstreamFormat::Openai => {
+            headers.insert(HDR_AUTHORIZATION, key.auth_header.clone());
+        }
+        UpstreamFormat::Anthropic => {
+            let value = hyper::header::HeaderValue::from_str(key.key.as_ref())?;
+            headers.insert("x-api-key", value);
+            headers.insert(
+                "anthropic-version",
+                hyper::header::HeaderValue::from_static("2023-06-01"),
+            );
+        }
+        UpstreamFormat::Gemini => {}
+    }
+    Ok(())
+}
+
+fn percentile(sorted: &[u64], pct: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = ((sorted.len().saturating_sub(1)) * pct) / 100;
+    sorted[idx]
+}
+
+fn url_encode(s: &str) -> String {
+    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
 pub fn validate_keys(keys: &[String]) -> anyhow::Result<()> {

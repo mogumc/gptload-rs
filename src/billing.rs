@@ -82,9 +82,7 @@ impl BillingStore {
         }
         map.insert(key.clone(), Arc::new(AtomicI64::new(balance)));
         drop(map);
-        let _ = self
-            .persist_tx
-            .send(PersistUpdate::Set { key, balance });
+        let _ = self.persist_tx.send(PersistUpdate::Set { key, balance });
         Ok(true)
     }
 

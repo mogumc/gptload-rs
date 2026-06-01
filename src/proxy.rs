@@ -1,21 +1,35 @@
-
 use crate::admin;
 use crate::billing::ReserveResult;
-use crate::state::{sanitize_hop_headers, RequestLogEntry, RouterState, Selected, HDR_AUTHORIZATION};
+use crate::config::UpstreamFormat;
+use crate::format::{self, AuthStyle};
+use crate::state::{
+    sanitize_hop_headers, RequestLogEntry, RouterState, Selected, HDR_AUTHORIZATION,
+};
 use crate::util::now_ms;
 use flate2::{Decompress, FlushDecompress, Status};
-use hyper::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
+use hyper::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ORIGIN};
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server};
-use std::io;
 use std::convert::Infallible;
+use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 
-pub async fn serve_http(addr: SocketAddr, state: Arc<RouterState>) -> anyhow::Result<()> {
+static REQUEST_LOG_ID: AtomicU64 = AtomicU64::new(1);
+
+pub async fn serve_http<F>(
+    addr: SocketAddr,
+    state: Arc<RouterState>,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let make_svc = make_service_fn(move |conn: &AddrStream| {
         let state = state.clone();
         let remote_addr = conn.remote_addr();
@@ -29,13 +43,28 @@ pub async fn serve_http(addr: SocketAddr, state: Arc<RouterState>) -> anyhow::Re
 
     let server = Server::bind(&addr)
         .tcp_nodelay(true)
-        .serve(make_svc);
+        .serve(make_svc)
+        .with_graceful_shutdown(shutdown);
 
     server.await?;
     Ok(())
 }
 
 async fn handle(
+    req: Request<Body>,
+    state: Arc<RouterState>,
+    client_addr: SocketAddr,
+) -> Response<Body> {
+    let origin = req.headers().get(ORIGIN).cloned();
+    if req.method() == hyper::Method::OPTIONS && origin.is_some() {
+        return cors_preflight(&state, origin.as_ref());
+    }
+
+    let resp = handle_inner(req, state.clone(), client_addr).await;
+    add_cors_headers(resp, &state, origin.as_ref())
+}
+
+async fn handle_inner(
     req: Request<Body>,
     state: Arc<RouterState>,
     client_addr: SocketAddr,
@@ -76,6 +105,14 @@ async fn handle(
         return admin::handle_admin(req, state).await;
     }
 
+    if state.is_shutting_down() {
+        return RouterState::json_error(
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "server is shutting down",
+            "shutting_down",
+        );
+    }
+
     let start = Instant::now();
     let client_ip = client_addr.ip().to_string();
     let method = req.method().clone();
@@ -84,6 +121,9 @@ async fn handle(
         client_ip.clone(),
         method.to_string(),
         path.clone(),
+        None,
+        None,
+        0,
         None,
         None,
         0,
@@ -137,33 +177,47 @@ async fn handle(
     }
 
     // Stats: request start.
-    state.stats.requests_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    state.stats.requests_inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .stats
+        .requests_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .stats
+        .requests_inflight
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let t0 = Instant::now();
 
-    let resp = if req.method() == hyper::Method::GET
-        && (path == "/v1/models" || path == "/v1/models/")
-    {
-        let (resp, resp_bytes) = models_list(&state);
-        record_request(&state, &base_log_ctx, resp.status().as_u16(), resp_bytes, None);
-        resp
-    } else {
-        forward(
-            req,
-            state.clone(),
-            start,
-            client_ip,
-            method,
-            path,
-            billing_key,
-        )
-        .await
-    };
+    let resp =
+        if req.method() == hyper::Method::GET && (path == "/v1/models" || path == "/v1/models/") {
+            let (resp, resp_bytes) = models_list(&state);
+            record_request(
+                &state,
+                &base_log_ctx,
+                resp.status().as_u16(),
+                resp_bytes,
+                None,
+            );
+            resp
+        } else {
+            forward(
+                req,
+                state.clone(),
+                start,
+                client_ip,
+                method,
+                path,
+                billing_key,
+            )
+            .await
+        };
 
     // Stats: latency + inflight.
     let dur = t0.elapsed();
     state.record_latency(dur.as_nanos() as u64);
-    state.stats.requests_inflight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .stats
+        .requests_inflight
+        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
     resp
 }
@@ -191,8 +245,27 @@ async fn execute_attempt(
     stream_request: bool,
 ) -> AttemptResult {
     let now = now_ms();
+    let attempt_start = Instant::now();
 
-    let uri = match upstream.build_uri(original_pq) {
+    let model = log_ctx.model.as_deref().unwrap_or_default();
+    let adapted = match format::adapt_request(
+        upstream.format,
+        original_pq,
+        out_method,
+        body_bytes,
+        model,
+        sel.key.key.as_ref(),
+    ) {
+        Ok(adapted) => adapted,
+        Err(resp) => {
+            if *billing_reserved {
+                let _ = state.billing.release_reservation(billing_key);
+            }
+            return AttemptResult::Success(logged_response(state, log_ctx, resp));
+        }
+    };
+
+    let uri = match upstream.build_uri(&adapted.path_and_query) {
         Ok(u) => u,
         Err(_) => {
             if *billing_reserved {
@@ -207,13 +280,14 @@ async fn execute_attempt(
     };
 
     let out_req = match build_upstream_request(
-        out_method.clone(),
+        adapted.method,
         uri,
         version,
         headers,
-        body_bytes.clone(),
+        adapted.body,
         sel,
         injected,
+        adapted.auth_style,
     ) {
         Ok(req) => req,
         Err(resp) => {
@@ -250,21 +324,27 @@ async fn execute_attempt(
         }
     }
 
-    let res = tokio::time::timeout(state.request_timeout, state.client.request(out_req)).await;
+    let res = tokio::time::timeout(state.request_timeout(), upstream.client.request(out_req)).await;
 
     match res {
         Ok(Ok(up_resp)) => {
+            let upstream_ms = attempt_start.elapsed().as_millis() as u64;
+            sel.key.record_latency_ms(upstream_ms);
             let status = up_resp.status();
-            state.on_upstream_status(sel, status);
+            let retry_after_ms = if status == http::StatusCode::TOO_MANY_REQUESTS {
+                parse_retry_after_ms(up_resp.headers().get(http::header::RETRY_AFTER))
+            } else {
+                None
+            };
+            state.on_upstream_status(sel, status, retry_after_ms);
 
             let should_retry = should_retry_status(state, status);
 
             if should_retry {
                 let now = now_ms();
-                if let Some(new_sel) = state.select_for_model(
-                    &log_ctx.model.clone().unwrap_or_default(),
-                    now,
-                ) {
+                if let Some(new_sel) =
+                    state.select_for_model(&log_ctx.model.clone().unwrap_or_default(), now)
+                {
                     drop(up_resp);
                     tracing::debug!(
                         status = %status,
@@ -276,6 +356,14 @@ async fn execute_attempt(
                 }
             }
 
+            let up_resp = format::adapt_response(
+                upstream.format,
+                up_resp,
+                stream_request,
+                log_ctx.model.clone(),
+            )
+            .await;
+
             AttemptResult::Success(proxy_upstream_response(
                 up_resp,
                 state.clone(),
@@ -285,12 +373,13 @@ async fn execute_attempt(
             ))
         }
         Ok(Err(_e)) => {
+            sel.key
+                .record_latency_ms(attempt_start.elapsed().as_millis() as u64);
             state.on_network_error(sel, now);
 
-            if let Some(new_sel) = state.select_for_model(
-                &log_ctx.model.clone().unwrap_or_default(),
-                now,
-            ) {
+            if let Some(new_sel) =
+                state.select_for_model(&log_ctx.model.clone().unwrap_or_default(), now)
+            {
                 tracing::debug!(
                     old_upstream = %sel.upstream.id,
                     new_upstream = %new_sel.upstream.id,
@@ -313,12 +402,13 @@ async fn execute_attempt(
             ))
         }
         Err(_) => {
+            sel.key
+                .record_latency_ms(attempt_start.elapsed().as_millis() as u64);
             state.on_timeout(sel, now);
 
-            if let Some(new_sel) = state.select_for_model(
-                &log_ctx.model.clone().unwrap_or_default(),
-                now,
-            ) {
+            if let Some(new_sel) =
+                state.select_for_model(&log_ctx.model.clone().unwrap_or_default(), now)
+            {
                 tracing::debug!(
                     old_upstream = %sel.upstream.id,
                     new_upstream = %new_sel.upstream.id,
@@ -365,10 +455,17 @@ async fn forward(
     let path_model = original_pq
         .path()
         .strip_prefix("/v1/models/")
-        .and_then(|s| if s.is_empty() { None } else { Some(s.to_string()) });
+        .and_then(|s| {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        });
     let out_method = parts.method.clone();
     let version = parts.version;
     let headers = parts.headers.clone();
+    let request_headers = sanitize_log_headers(&headers);
 
     // Read body into bytes for potential retries (necessary for 429 retry)
     use hyper::body::HttpBody;
@@ -397,6 +494,9 @@ async fn forward(
     }
     let body_bytes = bytes::Bytes::from(body_bytes);
     let req_bytes = body_bytes.len();
+    let request_body = String::from_utf8(body_bytes.to_vec())
+        .ok()
+        .filter(|s| s.len() <= 16 * 1024);
 
     let mut req_json = parse_request_json(&headers, &body_bytes);
     let mut model = req_json
@@ -423,6 +523,9 @@ async fn forward(
         model.clone(),
         None,
         req_bytes,
+        request_headers,
+        request_body,
+        0,
     );
 
     let Some(model) = model else {
@@ -435,6 +538,7 @@ async fn forward(
         );
     };
 
+    let mut queue_wait_ms = 0u64;
     let now = now_ms();
     let mut sel = if !state.model_exists(&model) {
         return logged_json_error(
@@ -447,18 +551,22 @@ async fn forward(
     } else if let Some(sel) = state.select_for_model(&model, now) {
         sel
     } else {
-        return logged_json_error(
-            &state,
-            &log_ctx,
-            http::StatusCode::SERVICE_UNAVAILABLE,
-            "no available upstream keys for model",
-            "model_unavailable",
-        );
+        match wait_for_selection(&state, &model).await {
+            Ok((sel, waited)) => {
+                queue_wait_ms = waited;
+                sel
+            }
+            Err(resp) => return logged_response(&state, &log_ctx, resp),
+        }
     };
+    log_ctx.queue_ms = queue_wait_ms;
 
     let mut body_bytes = body_bytes;
     let mut injected = false;
-    if stream_request && is_chat_completions && state.should_inject_usage(sel.upstream.id.as_ref())
+    if stream_request
+        && is_chat_completions
+        && sel.upstream.format == UpstreamFormat::Openai
+        && state.should_inject_usage(sel.upstream.id.as_ref())
     {
         if let Some(ref mut json) = req_json {
             if ensure_stream_usage(json) {
@@ -471,7 +579,7 @@ async fn forward(
     }
 
     // Retry policy from config.
-    let max_retries = state.max_retries;
+    let max_retries = state.max_retries();
     let mut retry_count = 0;
     let mut billing_reserved = false;
 
@@ -480,7 +588,9 @@ async fn forward(
         let upstream = &sel.upstream;
 
         // Track per-key concurrency for this attempt.
-        sel.key.active_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        sel.key
+            .active_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let result = execute_attempt(
             &state,
@@ -500,7 +610,10 @@ async fn forward(
         .await;
 
         // Decrement per-key concurrency after each attempt.
-        sel.key.active_requests.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        sel.key
+            .active_requests
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        state.notify_capacity();
 
         match result {
             AttemptResult::Success(resp) => return resp,
@@ -520,6 +633,116 @@ async fn forward(
     }
 }
 
+async fn wait_for_selection(
+    state: &Arc<RouterState>,
+    model: &str,
+) -> Result<(Selected, u64), Response<Body>> {
+    let server = state.server_config();
+    if !server.queue_enabled {
+        return Err(RouterState::json_error(
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "no available upstream keys for model",
+            "model_unavailable",
+        ));
+    }
+
+    let Some(_guard) = state.queue_enter() else {
+        return Err(queue_rejected_response(server.queue_timeout_ms));
+    };
+
+    let start = Instant::now();
+    let timeout = tokio::time::sleep(std::time::Duration::from_millis(server.queue_timeout_ms));
+    tokio::pin!(timeout);
+
+    loop {
+        if state.is_shutting_down() {
+            return Err(RouterState::json_error(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                "server is shutting down",
+                "shutting_down",
+            ));
+        }
+        if let Some(sel) = state.select_for_model(model, now_ms()) {
+            return Ok((sel, start.elapsed().as_millis() as u64));
+        }
+        tokio::select! {
+            _ = &mut timeout => {
+                state.stats.queue_timeout_total.fetch_add(1, Ordering::Relaxed);
+                return Err(queue_rejected_response(server.queue_timeout_ms));
+            }
+            _ = state.queue_notify.notified() => {}
+        }
+    }
+}
+
+fn queue_rejected_response(queue_timeout_ms: u64) -> Response<Body> {
+    let retry_after_secs = ((queue_timeout_ms.max(1000) + 999) / 1000).max(1);
+    let mut resp = RouterState::json_error(
+        http::StatusCode::TOO_MANY_REQUESTS,
+        "request queue full or timed out",
+        "queue_unavailable",
+    );
+    if let Ok(value) = http::HeaderValue::from_str(&retry_after_secs.to_string()) {
+        resp.headers_mut().insert(http::header::RETRY_AFTER, value);
+    }
+    resp
+}
+
+fn cors_preflight(state: &RouterState, origin: Option<&http::HeaderValue>) -> Response<Body> {
+    let resp = Response::builder()
+        .status(http::StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty()));
+    add_cors_headers(resp, state, origin)
+}
+
+fn add_cors_headers(
+    mut resp: Response<Body>,
+    state: &RouterState,
+    origin: Option<&http::HeaderValue>,
+) -> Response<Body> {
+    if let Some(value) = allowed_cors_origin(state, origin) {
+        let headers = resp.headers_mut();
+        headers.insert("access-control-allow-origin", value);
+        headers.insert(
+            "access-control-allow-methods",
+            http::HeaderValue::from_static("GET,POST,PUT,DELETE,OPTIONS"),
+        );
+        headers.insert(
+            "access-control-allow-headers",
+            http::HeaderValue::from_static(
+                "authorization,content-type,x-api-key,x-proxy-token,x-admin-token,x-export-token",
+            ),
+        );
+        headers.insert(
+            "access-control-expose-headers",
+            http::HeaderValue::from_static("retry-after,content-type"),
+        );
+        headers.insert(
+            "access-control-max-age",
+            http::HeaderValue::from_static("600"),
+        );
+    }
+    resp
+}
+
+fn allowed_cors_origin(
+    state: &RouterState,
+    origin: Option<&http::HeaderValue>,
+) -> Option<http::HeaderValue> {
+    let origin = origin?;
+    let cfg = state.server_config();
+    if cfg.cors_origins.iter().any(|o| o == "*") {
+        return Some(http::HeaderValue::from_static("*"));
+    }
+    let origin_str = origin.to_str().ok()?;
+    if cfg.cors_origins.iter().any(|allowed| allowed == origin_str) {
+        Some(origin.clone())
+    } else {
+        None
+    }
+}
+
 #[derive(Clone)]
 struct RequestLogContext {
     start: Instant,
@@ -529,6 +752,9 @@ struct RequestLogContext {
     model: Option<String>,
     upstream_id: Option<String>,
     req_bytes: usize,
+    request_headers: Option<std::collections::BTreeMap<String, String>>,
+    request_body: Option<String>,
+    queue_ms: u64,
 }
 
 impl RequestLogContext {
@@ -540,6 +766,9 @@ impl RequestLogContext {
         model: Option<String>,
         upstream_id: Option<String>,
         req_bytes: usize,
+        request_headers: Option<std::collections::BTreeMap<String, String>>,
+        request_body: Option<String>,
+        queue_ms: u64,
     ) -> Self {
         Self {
             start,
@@ -549,6 +778,9 @@ impl RequestLogContext {
             model,
             upstream_id,
             req_bytes,
+            request_headers,
+            request_body,
+            queue_ms,
         }
     }
 }
@@ -567,7 +799,9 @@ fn record_request(
     resp_bytes: usize,
     usage: Option<UsageTokens>,
 ) {
+    let total_ms = ctx.start.elapsed().as_millis() as u64;
     let entry = RequestLogEntry {
+        id: REQUEST_LOG_ID.fetch_add(1, Ordering::Relaxed),
         ts_ms: now_ms(),
         client_ip: ctx.client_ip.clone(),
         method: ctx.method.clone(),
@@ -575,12 +809,20 @@ fn record_request(
         model: ctx.model.clone(),
         upstream_id: ctx.upstream_id.clone(),
         status,
-        latency_ms: ctx.start.elapsed().as_millis() as u64,
+        latency_ms: total_ms,
         req_bytes: ctx.req_bytes,
         resp_bytes,
         prompt_tokens: usage.map(|u| u.prompt),
         completion_tokens: usage.map(|u| u.completion),
         total_tokens: usage.map(|u| u.total),
+        request_headers: ctx.request_headers.clone(),
+        request_body: ctx.request_body.clone(),
+        timing: crate::state::RequestTiming {
+            queue_ms: ctx.queue_ms,
+            upstream_ms: total_ms.saturating_sub(ctx.queue_ms),
+            total_ms,
+            attempts: 0,
+        },
     };
     state.record_request(entry);
 }
@@ -613,6 +855,7 @@ fn build_upstream_request(
     body_bytes: bytes::Bytes,
     sel: &crate::state::Selected,
     injected: bool,
+    auth_style: AuthStyle,
 ) -> Result<Request<Body>, Response<Body>> {
     let mut builder = hyper::Request::builder()
         .method(method)
@@ -633,10 +876,31 @@ fn build_upstream_request(
 
     sanitize_hop_headers(out_req.headers_mut());
     out_req.headers_mut().remove(HDR_AUTHORIZATION);
-    out_req
-        .headers_mut()
-        .insert(HDR_AUTHORIZATION, sel.key.auth_header.clone());
-    if injected {
+    out_req.headers_mut().remove("x-api-key");
+    out_req.headers_mut().remove("anthropic-version");
+    match auth_style {
+        AuthStyle::OpenAiBearer => {
+            out_req
+                .headers_mut()
+                .insert(HDR_AUTHORIZATION, sel.key.auth_header.clone());
+        }
+        AuthStyle::AnthropicKey => {
+            let key = http::HeaderValue::from_str(sel.key.key.as_ref()).map_err(|_| {
+                RouterState::json_error(
+                    http::StatusCode::BAD_GATEWAY,
+                    "invalid upstream key header",
+                    "request_build_error",
+                )
+            })?;
+            out_req.headers_mut().insert("x-api-key", key);
+            out_req.headers_mut().insert(
+                "anthropic-version",
+                http::HeaderValue::from_static("2023-06-01"),
+            );
+        }
+        AuthStyle::None => {}
+    }
+    if injected || !body_bytes.is_empty() {
         out_req.headers_mut().remove(CONTENT_LENGTH);
         if let Ok(v) = http::HeaderValue::from_str(&body_bytes.len().to_string()) {
             out_req.headers_mut().insert(CONTENT_LENGTH, v);
@@ -676,8 +940,8 @@ fn proxy_upstream_response(
 
     let is_event_stream = content_type.starts_with("text/event-stream");
     let want_sse_usage = stream_request && is_event_stream;
-    let want_json_usage = !stream_request
-        || (content_type.starts_with("application/json") && !want_sse_usage);
+    let want_json_usage =
+        !stream_request || (content_type.starts_with("application/json") && !want_sse_usage);
     let want_usage = want_sse_usage || want_json_usage;
 
     let mut decoder = if want_usage && content_encoding.contains("gzip") {
@@ -730,7 +994,8 @@ fn proxy_upstream_response(
                         continue;
                     }
 
-                    if decompressed_bytes.saturating_add(parse_bytes.len()) > MAX_DECOMPRESSED_BYTES {
+                    if decompressed_bytes.saturating_add(parse_bytes.len()) > MAX_DECOMPRESSED_BYTES
+                    {
                         parse_enabled = false;
                         continue;
                     }
@@ -771,6 +1036,38 @@ fn proxy_upstream_response(
     });
 
     Response::from_parts(parts, Body::wrap_stream(ReceiverStream::new(rx)))
+}
+
+fn parse_retry_after_ms(value: Option<&http::HeaderValue>) -> Option<u64> {
+    let raw = value?.to_str().ok()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(secs.saturating_mul(1000));
+    }
+    let dt = httpdate::parse_http_date(raw).ok()?;
+    let now = std::time::SystemTime::now();
+    let dur = dt.duration_since(now).unwrap_or_default();
+    Some(dur.as_millis() as u64)
+}
+
+fn sanitize_log_headers(
+    headers: &hyper::HeaderMap,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    if headers.is_empty() {
+        return None;
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for (name, value) in headers.iter() {
+        let key = name.as_str().to_ascii_lowercase();
+        if key == "authorization" || key == "x-api-key" || key.contains("token") {
+            out.insert(key, "<redacted>".to_string());
+        } else if let Ok(v) = value.to_str() {
+            out.insert(key, v.chars().take(512).collect());
+        }
+    }
+    Some(out)
 }
 
 fn extract_api_key(headers: &hyper::HeaderMap) -> Option<String> {
@@ -821,11 +1118,13 @@ fn models_list(state: &RouterState) -> (Response<Body>, usize) {
         .status(http::StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(body_str.clone()))
-        .unwrap_or_else(|_| RouterState::json_error(
-            http::StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to build response",
-            "response_build_error",
-        ));
+        .unwrap_or_else(|_| {
+            RouterState::json_error(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to build response",
+                "response_build_error",
+            )
+        });
     (resp, body_str.len())
 }
 
@@ -851,10 +1150,7 @@ fn ensure_stream_usage(v: &mut serde_json::Value) -> bool {
         Some(obj) => obj,
         None => return false,
     };
-    let stream = obj
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     if !stream {
         return false;
     }
@@ -886,12 +1182,13 @@ fn extract_usage_from_value(v: &serde_json::Value) -> Option<UsageTokens> {
     let usage = v.get("usage")?;
     let prompt = usage.get("prompt_tokens").and_then(|v| v.as_u64());
     let completion = usage.get("completion_tokens").and_then(|v| v.as_u64());
-    let total = usage.get("total_tokens").and_then(|v| v.as_u64()).or_else(|| {
-        match (prompt, completion) {
+    let total = usage
+        .get("total_tokens")
+        .and_then(|v| v.as_u64())
+        .or_else(|| match (prompt, completion) {
             (Some(p), Some(c)) => Some(p + c),
             _ => None,
-        }
-    });
+        });
 
     if prompt.is_none() && completion.is_none() && total.is_none() {
         return None;
@@ -969,5 +1266,23 @@ impl GzipDecoder {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::HeaderValue;
+
+    #[test]
+    fn retry_after_seconds_parses_to_millis() {
+        let value = HeaderValue::from_static("5");
+        assert_eq!(parse_retry_after_ms(Some(&value)), Some(5000));
+    }
+
+    #[test]
+    fn retry_after_past_date_is_zero() {
+        let value = HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT");
+        assert_eq!(parse_retry_after_ms(Some(&value)), Some(0));
     }
 }

@@ -94,8 +94,9 @@ impl KeyStore {
         let mut out = Vec::with_capacity(t.len());
         for item in t.iter() {
             let (k, _v) = item?;
-            let s = std::str::from_utf8(&k)
-                .map_err(|_| anyhow::anyhow!("invalid utf-8 key in db for upstream {}", upstream_id))?;
+            let s = std::str::from_utf8(&k).map_err(|_| {
+                anyhow::anyhow!("invalid utf-8 key in db for upstream {}", upstream_id)
+            })?;
             out.push(s.to_string());
         }
         Ok(out)

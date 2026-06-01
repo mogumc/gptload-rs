@@ -82,9 +82,18 @@ retry_status_codes = [429, 500, 502, 503, 504]
 admin_tokens = ["your-admin-token"]
 data_dir = "./data"
 
+[server]
+graceful_shutdown_timeout_secs = 30
+cors_origins = ["*"]
+queue_enabled = false
+queue_max_depth = 100
+queue_timeout_ms = 10000
+
 [key]
 blacklist_threshold = 3           # 401/403 失败多少次后标记 invalid
 max_concurrent_per_key = 5        # 每个 key 最大并发
+rate_limit_cooldown_ms = 3000     # 无 Retry-After 时的 429 冷却
+max_rate_limit_cooldown_ms = 30000 # Retry-After 冷却上限
 revalidation_interval_secs = 300  # 多久验证一次 invalid key
 revalidation_timeout_secs = 20    # 验证请求超时
 
@@ -92,6 +101,8 @@ revalidation_timeout_secs = 20    # 验证请求超时
 id = "openai"
 base_url = "https://api.openai.com"
 weight = 1
+format = "openai"                 # openai / anthropic / gemini，可自动检测
+# proxy = "socks5://127.0.0.1:1080"
 
 [[upstreams]]
 id = "xiaomimimo"

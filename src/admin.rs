@@ -1,4 +1,4 @@
-use crate::config::UpstreamConfig;
+use crate::config::{UpstreamConfig, UpstreamFormat};
 use crate::state::{build_key_states, validate_keys, MetricsWindow, RouterState};
 use crate::util::{now_ms, query_get};
 use bytes::Bytes;
@@ -16,11 +16,16 @@ const APP_JS: &str = include_str!("static/app.js");
 async fn parse_json_body<T: serde::de::DeserializeOwned>(
     req: Request<Body>,
 ) -> Result<T, Response<Body>> {
-    let body = read_body_limit(req, 10 * 1024 * 1024)
-        .await
-        .map_err(|e| RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request"))?;
-    serde_json::from_slice(&body)
-        .map_err(|e| RouterState::json_error(http::StatusCode::BAD_REQUEST, &format!("invalid json: {e}"), "bad_request"))
+    let body = read_body_limit(req, 10 * 1024 * 1024).await.map_err(|e| {
+        RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request")
+    })?;
+    serde_json::from_slice(&body).map_err(|e| {
+        RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            &format!("invalid json: {e}"),
+            "bad_request",
+        )
+    })
 }
 
 /// Look up upstream by id. Returns error response if not found.
@@ -29,7 +34,11 @@ fn get_upstream(
     id: &str,
 ) -> Result<(usize, Arc<crate::state::Upstream>), Response<Body>> {
     state.upstream_by_id(id).ok_or_else(|| {
-        RouterState::json_error(http::StatusCode::NOT_FOUND, "unknown upstream id", "not_found")
+        RouterState::json_error(
+            http::StatusCode::NOT_FOUND,
+            "unknown upstream id",
+            "not_found",
+        )
     })
 }
 
@@ -95,8 +104,10 @@ async fn handle_api(req: Request<Body>, state: Arc<RouterState>) -> Response<Bod
         (&Method::POST, "/admin/api/v1/upstreams") => api_add_upstream(req, state).await,
         (&Method::GET, "/admin/api/v1/stats") => api_stats_snapshot(state).await,
         (&Method::POST, "/admin/api/v1/reload") => api_reload_all(state).await,
+        (&Method::GET, "/admin/api/v1/config") => api_config_preview(state).await,
         (&Method::GET, "/admin/api/v1/models/routes") => api_get_model_routes(state).await,
         (&Method::PUT, "/admin/api/v1/models/routes") => api_put_model_routes(req, state).await,
+        (&Method::GET, "/admin/api/v1/requests/stream") => requests_stream(state).await,
         (&Method::GET, "/admin/api/v1/requests") => api_requests(state, req.uri()).await,
         (&Method::GET, "/admin/api/v1/metrics") => api_metrics(state, req.uri()).await,
         (&Method::POST, "/admin/api/v1/billing/keys") => api_billing_create_key(req, state).await,
@@ -327,7 +338,7 @@ async fn handle_upstream_subroutes(
             .unwrap();
     }
 
-    // Third segment selects a key sub-action: "" (CRUD), "release", or "ban".
+    // Third segment selects a key sub-action: "" (CRUD), "release", "test", or "ban".
     let action = parts.next().unwrap_or("");
     match action {
         "" => match *req.method() {
@@ -339,6 +350,10 @@ async fn handle_upstream_subroutes(
         },
         "release" => match *req.method() {
             Method::POST => api_release_keys(req, state, upstream_id).await,
+            _ => method_not_allowed(),
+        },
+        "test" => match *req.method() {
+            Method::POST => api_test_key(req, state, upstream_id).await,
             _ => method_not_allowed(),
         },
         "invalidate" | "ban" => match *req.method() {
@@ -382,7 +397,9 @@ async fn api_put_model_routes(req: Request<Body>, state: Arc<RouterState>) -> Re
     };
     match state.save_model_routes(routes_body.upstreams) {
         Ok(routes) => json_ok(&routes),
-        Err(e) => RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request"),
+        Err(e) => {
+            RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request")
+        }
     }
 }
 
@@ -393,7 +410,9 @@ async fn api_refresh_models(state: Arc<RouterState>, upstream_id: &str) -> Respo
             "count": models.len(),
             "models": models
         })),
-        Err(e) => RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request"),
+        Err(e) => {
+            RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request")
+        }
     }
 }
 
@@ -402,12 +421,18 @@ struct UpstreamBody {
     id: String,
     base_url: String,
     weight: Option<usize>,
+    max_concurrent_per_key: Option<u32>,
+    format: Option<UpstreamFormat>,
+    proxy: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct UpstreamUpdateBody {
     base_url: String,
     weight: Option<usize>,
+    max_concurrent_per_key: Option<u32>,
+    format: Option<UpstreamFormat>,
+    proxy: Option<String>,
 }
 
 async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
@@ -419,13 +444,19 @@ async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Respon
         return RouterState::json_error(http::StatusCode::BAD_REQUEST, "missing id", "bad_request");
     }
     if input.base_url.trim().is_empty() {
-        return RouterState::json_error(http::StatusCode::BAD_REQUEST, "missing base_url", "bad_request");
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            "missing base_url",
+            "bad_request",
+        );
     }
     let cfg = UpstreamConfig {
         id: input.id.trim().to_string(),
         base_url: input.base_url.trim().to_string(),
         weight: input.weight,
-        max_concurrent_per_key: None,
+        max_concurrent_per_key: input.max_concurrent_per_key,
+        format: input.format,
+        proxy: input.proxy.filter(|p| !p.trim().is_empty()),
     };
     let state2 = state.clone();
     let res = tokio::task::spawn_blocking(move || state2.add_upstream(cfg)).await;
@@ -434,32 +465,62 @@ async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Respon
             "ok": true,
             "upstreams": state.snapshot.load_full().upstreams.len(),
         })),
-        Ok(Err(e)) => RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request"),
-        Err(e) => RouterState::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "internal_error"),
+        Ok(Err(e)) => {
+            RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request")
+        }
+        Err(e) => RouterState::json_error(
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+            "internal_error",
+        ),
     }
 }
 
-async fn api_update_upstream(req: Request<Body>, state: Arc<RouterState>, upstream_id: &str) -> Response<Body> {
+async fn api_update_upstream(
+    req: Request<Body>,
+    state: Arc<RouterState>,
+    upstream_id: &str,
+) -> Response<Body> {
     let input: UpstreamUpdateBody = match parse_json_body(req).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
     if input.base_url.trim().is_empty() {
-        return RouterState::json_error(http::StatusCode::BAD_REQUEST, "missing base_url", "bad_request");
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            "missing base_url",
+            "bad_request",
+        );
     }
     let state2 = state.clone();
     let id = upstream_id.to_string();
-    let base_url = input.base_url.trim().to_string();
-    let weight = input.weight;
-    let res = tokio::task::spawn_blocking(move || state2.update_upstream(&id, base_url, weight)).await;
+    let cfg = UpstreamConfig {
+        id: id.clone(),
+        base_url: input.base_url.trim().to_string(),
+        weight: input.weight,
+        max_concurrent_per_key: input.max_concurrent_per_key,
+        format: input.format,
+        proxy: input.proxy.filter(|p| !p.trim().is_empty()),
+    };
+    let res = tokio::task::spawn_blocking(move || state2.update_upstream(&id, cfg)).await;
     match res {
         Ok(Ok(_)) => json_ok(&serde_json::json!({"ok": true})),
-        Ok(Err(e)) => RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request"),
-        Err(e) => RouterState::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "internal_error"),
+        Ok(Err(e)) => {
+            RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request")
+        }
+        Err(e) => RouterState::json_error(
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+            "internal_error",
+        ),
     }
 }
 
-async fn api_delete_upstream(req: Request<Body>, state: Arc<RouterState>, upstream_id: &str) -> Response<Body> {
+async fn api_delete_upstream(
+    req: Request<Body>,
+    state: Arc<RouterState>,
+    upstream_id: &str,
+) -> Response<Body> {
     let delete_keys = query_get(req.uri(), "delete_keys")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -468,8 +529,14 @@ async fn api_delete_upstream(req: Request<Body>, state: Arc<RouterState>, upstre
     let res = tokio::task::spawn_blocking(move || state2.delete_upstream(&id, delete_keys)).await;
     match res {
         Ok(Ok(_)) => json_ok(&serde_json::json!({"ok": true, "delete_keys": delete_keys})),
-        Ok(Err(e)) => RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request"),
-        Err(e) => RouterState::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "internal_error"),
+        Ok(Err(e)) => {
+            RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request")
+        }
+        Err(e) => RouterState::json_error(
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+            "internal_error",
+        ),
     }
 }
 
@@ -477,6 +544,8 @@ async fn api_delete_upstream(req: Request<Body>, state: Arc<RouterState>, upstre
 struct UpstreamInfo {
     id: String,
     base_url: String,
+    format: String,
+    proxy: Option<String>,
     weight: usize,
     max_concurrent_per_key: u32,
     keys_total: usize,
@@ -505,26 +574,53 @@ fn build_upstream_info(u: &crate::state::Upstream, global_max: u32) -> UpstreamI
     UpstreamInfo {
         id: u.id.to_string(),
         base_url: u.base_url.to_string(),
+        format: u.format.as_str().to_string(),
+        proxy: u.proxy.clone(),
         weight: u.weight,
         max_concurrent_per_key: effective_max,
         keys_total: total,
         keys_active: total.saturating_sub(invalid),
         keys_invalid: invalid,
-        selected_total: u.stats.selected_total.load(std::sync::atomic::Ordering::Relaxed),
-        responses_2xx: u.stats.responses_2xx.load(std::sync::atomic::Ordering::Relaxed),
-        responses_3xx: u.stats.responses_3xx.load(std::sync::atomic::Ordering::Relaxed),
-        responses_4xx: u.stats.responses_4xx.load(std::sync::atomic::Ordering::Relaxed),
-        responses_5xx: u.stats.responses_5xx.load(std::sync::atomic::Ordering::Relaxed),
-        errors_timeout: u.stats.errors_timeout.load(std::sync::atomic::Ordering::Relaxed),
-        errors_network: u.stats.errors_network.load(std::sync::atomic::Ordering::Relaxed),
+        selected_total: u
+            .stats
+            .selected_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        responses_2xx: u
+            .stats
+            .responses_2xx
+            .load(std::sync::atomic::Ordering::Relaxed),
+        responses_3xx: u
+            .stats
+            .responses_3xx
+            .load(std::sync::atomic::Ordering::Relaxed),
+        responses_4xx: u
+            .stats
+            .responses_4xx
+            .load(std::sync::atomic::Ordering::Relaxed),
+        responses_5xx: u
+            .stats
+            .responses_5xx
+            .load(std::sync::atomic::Ordering::Relaxed),
+        errors_timeout: u
+            .stats
+            .errors_timeout
+            .load(std::sync::atomic::Ordering::Relaxed),
+        errors_network: u
+            .stats
+            .errors_network
+            .load(std::sync::atomic::Ordering::Relaxed),
     }
 }
 
 async fn api_list_upstreams(state: Arc<RouterState>) -> Response<Body> {
     let snap = state.snapshot.load_full();
-    let global_max = state.key_config.max_concurrent_per_key;
+    let global_max = state.key_config().max_concurrent_per_key;
 
-    let ups: Vec<UpstreamInfo> = snap.upstreams.iter().map(|u| build_upstream_info(u, global_max)).collect();
+    let ups: Vec<UpstreamInfo> = snap
+        .upstreams
+        .iter()
+        .map(|u| build_upstream_info(u, global_max))
+        .collect();
     json_ok(&ups)
 }
 
@@ -547,6 +643,9 @@ struct StatsSnapshot {
 
     errors_timeout: u64,
     errors_network: u64,
+    queue_depth: u64,
+    queue_timeout_total: u64,
+    queue_enabled: bool,
 
     latency_avg_ms: f64,
     latency_max_ms: f64,
@@ -559,9 +658,18 @@ fn build_snapshot(state: &RouterState) -> StatsSnapshot {
     let ts = now_ms();
     let uptime_s = (ts.saturating_sub(state.stats.started_at_ms)) / 1000;
 
-    let latency_count = state.stats.latency_count.load(std::sync::atomic::Ordering::Relaxed);
-    let latency_total = state.stats.latency_ns_total.load(std::sync::atomic::Ordering::Relaxed);
-    let latency_max = state.stats.latency_ns_max.load(std::sync::atomic::Ordering::Relaxed);
+    let latency_count = state
+        .stats
+        .latency_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let latency_total = state
+        .stats
+        .latency_ns_total
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let latency_max = state
+        .stats
+        .latency_ns_max
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     let latency_avg_ms = if latency_count == 0 {
         0.0
@@ -571,24 +679,65 @@ fn build_snapshot(state: &RouterState) -> StatsSnapshot {
     let latency_max_ms = (latency_max as f64) / 1_000_000.0;
 
     let snap = state.snapshot.load_full();
-    let global_max = state.key_config.max_concurrent_per_key;
+    let global_max = state.key_config().max_concurrent_per_key;
     let _now = ts;
-    let ups: Vec<UpstreamInfo> = snap.upstreams.iter().map(|u| build_upstream_info(u, global_max)).collect();
+    let ups: Vec<UpstreamInfo> = snap
+        .upstreams
+        .iter()
+        .map(|u| build_upstream_info(u, global_max))
+        .collect();
+    let server = state.server_config();
 
     StatsSnapshot {
         ts_ms: ts,
         uptime_s,
-        max_retries: state.max_retries,
+        max_retries: state.max_retries(),
         retry_status_codes: state.retry_status_codes_sorted(),
-        requests_total: state.stats.requests_total.load(std::sync::atomic::Ordering::Relaxed),
-        requests_inflight: state.stats.requests_inflight.load(std::sync::atomic::Ordering::Relaxed),
-        upstream_selected_total: state.stats.upstream_selected_total.load(std::sync::atomic::Ordering::Relaxed),
-        responses_2xx: state.stats.responses_2xx.load(std::sync::atomic::Ordering::Relaxed),
-        responses_3xx: state.stats.responses_3xx.load(std::sync::atomic::Ordering::Relaxed),
-        responses_4xx: state.stats.responses_4xx.load(std::sync::atomic::Ordering::Relaxed),
-        responses_5xx: state.stats.responses_5xx.load(std::sync::atomic::Ordering::Relaxed),
-        errors_timeout: state.stats.errors_timeout.load(std::sync::atomic::Ordering::Relaxed),
-        errors_network: state.stats.errors_network.load(std::sync::atomic::Ordering::Relaxed),
+        requests_total: state
+            .stats
+            .requests_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        requests_inflight: state
+            .stats
+            .requests_inflight
+            .load(std::sync::atomic::Ordering::Relaxed),
+        upstream_selected_total: state
+            .stats
+            .upstream_selected_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        responses_2xx: state
+            .stats
+            .responses_2xx
+            .load(std::sync::atomic::Ordering::Relaxed),
+        responses_3xx: state
+            .stats
+            .responses_3xx
+            .load(std::sync::atomic::Ordering::Relaxed),
+        responses_4xx: state
+            .stats
+            .responses_4xx
+            .load(std::sync::atomic::Ordering::Relaxed),
+        responses_5xx: state
+            .stats
+            .responses_5xx
+            .load(std::sync::atomic::Ordering::Relaxed),
+        errors_timeout: state
+            .stats
+            .errors_timeout
+            .load(std::sync::atomic::Ordering::Relaxed),
+        errors_network: state
+            .stats
+            .errors_network
+            .load(std::sync::atomic::Ordering::Relaxed),
+        queue_depth: state
+            .stats
+            .queue_depth
+            .load(std::sync::atomic::Ordering::Relaxed),
+        queue_timeout_total: state
+            .stats
+            .queue_timeout_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        queue_enabled: server.queue_enabled,
         latency_avg_ms,
         latency_max_ms,
         latency_count,
@@ -625,6 +774,10 @@ async fn api_metrics(state: Arc<RouterState>, uri: &http::Uri) -> Response<Body>
     }))
 }
 
+async fn api_config_preview(state: Arc<RouterState>) -> Response<Body> {
+    json_ok(&state.config_preview())
+}
+
 /// Prometheus metrics endpoint.
 /// Returns metrics in Prometheus text exposition format (OpenMetrics compatible).
 pub async fn prometheus_metrics(state: Arc<RouterState>) -> Response<Body> {
@@ -641,63 +794,204 @@ pub async fn prometheus_metrics(state: Arc<RouterState>) -> Response<Body> {
     let _ = writeln!(buf, "gptload_uptime_seconds {}", uptime_s);
 
     // Requests total
-    let _ = writeln!(buf, "# HELP gptload_requests_total Total number of requests");
+    let _ = writeln!(
+        buf,
+        "# HELP gptload_requests_total Total number of requests"
+    );
     let _ = writeln!(buf, "# TYPE gptload_requests_total counter");
-    let _ = writeln!(buf, "gptload_requests_total {}", state.stats.requests_total.load(std::sync::atomic::Ordering::Relaxed));
+    let _ = writeln!(
+        buf,
+        "gptload_requests_total {}",
+        state
+            .stats
+            .requests_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     // Requests inflight
-    let _ = writeln!(buf, "# HELP gptload_requests_inflight Currently inflight requests");
+    let _ = writeln!(
+        buf,
+        "# HELP gptload_requests_inflight Currently inflight requests"
+    );
     let _ = writeln!(buf, "# TYPE gptload_requests_inflight gauge");
-    let _ = writeln!(buf, "gptload_requests_inflight {}", state.stats.requests_inflight.load(std::sync::atomic::Ordering::Relaxed));
+    let _ = writeln!(
+        buf,
+        "gptload_requests_inflight {}",
+        state
+            .stats
+            .requests_inflight
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+
+    let _ = writeln!(buf, "# HELP gptload_queue_depth Currently queued requests");
+    let _ = writeln!(buf, "# TYPE gptload_queue_depth gauge");
+    let _ = writeln!(
+        buf,
+        "gptload_queue_depth {}",
+        state
+            .stats
+            .queue_depth
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        buf,
+        "# HELP gptload_queue_timeout_total Queue timeout/full rejections"
+    );
+    let _ = writeln!(buf, "# TYPE gptload_queue_timeout_total counter");
+    let _ = writeln!(
+        buf,
+        "gptload_queue_timeout_total {}",
+        state
+            .stats
+            .queue_timeout_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     // Response status codes (global)
-    let _ = writeln!(buf, "# HELP gptload_responses_total Total responses by status class");
+    let _ = writeln!(
+        buf,
+        "# HELP gptload_responses_total Total responses by status class"
+    );
     let _ = writeln!(buf, "# TYPE gptload_responses_total counter");
-    let _ = writeln!(buf, "gptload_responses_total{{status_class=\"2xx\"}} {}", state.stats.responses_2xx.load(std::sync::atomic::Ordering::Relaxed));
-    let _ = writeln!(buf, "gptload_responses_total{{status_class=\"3xx\"}} {}", state.stats.responses_3xx.load(std::sync::atomic::Ordering::Relaxed));
-    let _ = writeln!(buf, "gptload_responses_total{{status_class=\"4xx\"}} {}", state.stats.responses_4xx.load(std::sync::atomic::Ordering::Relaxed));
-    let _ = writeln!(buf, "gptload_responses_total{{status_class=\"5xx\"}} {}", state.stats.responses_5xx.load(std::sync::atomic::Ordering::Relaxed));
+    let _ = writeln!(
+        buf,
+        "gptload_responses_total{{status_class=\"2xx\"}} {}",
+        state
+            .stats
+            .responses_2xx
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        buf,
+        "gptload_responses_total{{status_class=\"3xx\"}} {}",
+        state
+            .stats
+            .responses_3xx
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        buf,
+        "gptload_responses_total{{status_class=\"4xx\"}} {}",
+        state
+            .stats
+            .responses_4xx
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        buf,
+        "gptload_responses_total{{status_class=\"5xx\"}} {}",
+        state
+            .stats
+            .responses_5xx
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     // Errors
     let _ = writeln!(buf, "# HELP gptload_errors_total Total errors by type");
     let _ = writeln!(buf, "# TYPE gptload_errors_total counter");
-    let _ = writeln!(buf, "gptload_errors_total{{type=\"timeout\"}} {}", state.stats.errors_timeout.load(std::sync::atomic::Ordering::Relaxed));
-    let _ = writeln!(buf, "gptload_errors_total{{type=\"network\"}} {}", state.stats.errors_network.load(std::sync::atomic::Ordering::Relaxed));
+    let _ = writeln!(
+        buf,
+        "gptload_errors_total{{type=\"timeout\"}} {}",
+        state
+            .stats
+            .errors_timeout
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        buf,
+        "gptload_errors_total{{type=\"network\"}} {}",
+        state
+            .stats
+            .errors_network
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     // Latency
-    let latency_count = state.stats.latency_count.load(std::sync::atomic::Ordering::Relaxed);
-    let latency_total_ns = state.stats.latency_ns_total.load(std::sync::atomic::Ordering::Relaxed);
-    let latency_max_ns = state.stats.latency_ns_max.load(std::sync::atomic::Ordering::Relaxed);
+    let latency_count = state
+        .stats
+        .latency_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let latency_total_ns = state
+        .stats
+        .latency_ns_total
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let latency_max_ns = state
+        .stats
+        .latency_ns_max
+        .load(std::sync::atomic::Ordering::Relaxed);
 
-    let _ = writeln!(buf, "# HELP gptload_request_duration_seconds Request latency");
+    let _ = writeln!(
+        buf,
+        "# HELP gptload_request_duration_seconds Request latency"
+    );
     let _ = writeln!(buf, "# TYPE gptload_request_duration_seconds summary");
     if latency_count > 0 {
         let avg_s = (latency_total_ns as f64) / (latency_count as f64) / 1_000_000_000.0;
-        let _ = writeln!(buf, "gptload_request_duration_seconds{{quantile=\"avg\"}} {:.6}", avg_s);
+        let _ = writeln!(
+            buf,
+            "gptload_request_duration_seconds{{quantile=\"avg\"}} {:.6}",
+            avg_s
+        );
     }
-    let _ = writeln!(buf, "gptload_request_duration_seconds{{quantile=\"max\"}} {:.6}", (latency_max_ns as f64) / 1_000_000_000.0);
+    let _ = writeln!(
+        buf,
+        "gptload_request_duration_seconds{{quantile=\"max\"}} {:.6}",
+        (latency_max_ns as f64) / 1_000_000_000.0
+    );
     let _ = writeln!(buf, "gptload_request_duration_count {}", latency_count);
-    let _ = writeln!(buf, "gptload_request_duration_sum_seconds {:.6}", (latency_total_ns as f64) / 1_000_000_000.0);
+    let _ = writeln!(
+        buf,
+        "gptload_request_duration_sum_seconds {:.6}",
+        (latency_total_ns as f64) / 1_000_000_000.0
+    );
 
     // Upstream selection
-    let _ = writeln!(buf, "# HELP gptload_upstream_selected_total Total upstream selections");
+    let _ = writeln!(
+        buf,
+        "# HELP gptload_upstream_selected_total Total upstream selections"
+    );
     let _ = writeln!(buf, "# TYPE gptload_upstream_selected_total counter");
-    let _ = writeln!(buf, "gptload_upstream_selected_total {}", state.stats.upstream_selected_total.load(std::sync::atomic::Ordering::Relaxed));
+    let _ = writeln!(
+        buf,
+        "gptload_upstream_selected_total {}",
+        state
+            .stats
+            .upstream_selected_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     // Per-upstream metrics
-    let _ = writeln!(buf, "# HELP gptload_upstream_responses_total Per-upstream responses by status class");
+    let _ = writeln!(
+        buf,
+        "# HELP gptload_upstream_responses_total Per-upstream responses by status class"
+    );
     let _ = writeln!(buf, "# TYPE gptload_upstream_responses_total counter");
-    let _ = writeln!(buf, "# HELP gptload_upstream_errors_total Per-upstream errors by type");
+    let _ = writeln!(
+        buf,
+        "# HELP gptload_upstream_errors_total Per-upstream errors by type"
+    );
     let _ = writeln!(buf, "# TYPE gptload_upstream_errors_total counter");
-    let _ = writeln!(buf, "# HELP gptload_upstream_selected_total Per-upstream selection count");
+    let _ = writeln!(
+        buf,
+        "# HELP gptload_upstream_selected_total Per-upstream selection count"
+    );
     let _ = writeln!(buf, "# TYPE gptload_upstream_selected_total counter");
     let _ = writeln!(buf, "# HELP gptload_upstream_keys Total keys per upstream");
     let _ = writeln!(buf, "# TYPE gptload_upstream_keys gauge");
-    let _ = writeln!(buf, "# HELP gptload_upstream_active_keys Active keys per upstream");
+    let _ = writeln!(
+        buf,
+        "# HELP gptload_upstream_active_keys Active keys per upstream"
+    );
     let _ = writeln!(buf, "# TYPE gptload_upstream_active_keys gauge");
-    let _ = writeln!(buf, "# HELP gptload_upstream_invalid_keys Invalid keys per upstream");
+    let _ = writeln!(
+        buf,
+        "# HELP gptload_upstream_invalid_keys Invalid keys per upstream"
+    );
     let _ = writeln!(buf, "# TYPE gptload_upstream_invalid_keys gauge");
-    let _ = writeln!(buf, "# HELP gptload_upstream_cooldown_keys Keys in 429 cooldown per upstream");
+    let _ = writeln!(
+        buf,
+        "# HELP gptload_upstream_cooldown_keys Keys in 429 cooldown per upstream"
+    );
     let _ = writeln!(buf, "# TYPE gptload_upstream_cooldown_keys gauge");
 
     for u in snap.upstreams.iter() {
@@ -710,7 +1004,9 @@ pub async fn prometheus_metrics(state: Arc<RouterState>) -> Response<Body> {
         for k in keys_arc.iter() {
             if k.is_active() {
                 active += 1;
-                let until = k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed);
+                let until = k
+                    .cooldown_until_ms
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 if until > 0 && now < until {
                     cooldown += 1;
                 }
@@ -719,27 +1015,92 @@ pub async fn prometheus_metrics(state: Arc<RouterState>) -> Response<Body> {
             }
         }
 
-        let _ = writeln!(buf, "gptload_upstream_keys{{upstream=\"{}\"}} {}", id, total);
-        let _ = writeln!(buf, "gptload_upstream_active_keys{{upstream=\"{}\"}} {}", id, active);
-        let _ = writeln!(buf, "gptload_upstream_invalid_keys{{upstream=\"{}\"}} {}", id, invalid);
-        let _ = writeln!(buf, "gptload_upstream_cooldown_keys{{upstream=\"{}\"}} {}", id, cooldown);
+        let _ = writeln!(
+            buf,
+            "gptload_upstream_keys{{upstream=\"{}\"}} {}",
+            id, total
+        );
+        let _ = writeln!(
+            buf,
+            "gptload_upstream_active_keys{{upstream=\"{}\"}} {}",
+            id, active
+        );
+        let _ = writeln!(
+            buf,
+            "gptload_upstream_invalid_keys{{upstream=\"{}\"}} {}",
+            id, invalid
+        );
+        let _ = writeln!(
+            buf,
+            "gptload_upstream_cooldown_keys{{upstream=\"{}\"}} {}",
+            id, cooldown
+        );
 
-        let sel = u.stats.selected_total.load(std::sync::atomic::Ordering::Relaxed);
-        let _ = writeln!(buf, "gptload_upstream_selected_total{{upstream=\"{}\"}} {}", id, sel);
+        let sel = u
+            .stats
+            .selected_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let _ = writeln!(
+            buf,
+            "gptload_upstream_selected_total{{upstream=\"{}\"}} {}",
+            id, sel
+        );
 
-        let r2 = u.stats.responses_2xx.load(std::sync::atomic::Ordering::Relaxed);
-        let r3 = u.stats.responses_3xx.load(std::sync::atomic::Ordering::Relaxed);
-        let r4 = u.stats.responses_4xx.load(std::sync::atomic::Ordering::Relaxed);
-        let r5 = u.stats.responses_5xx.load(std::sync::atomic::Ordering::Relaxed);
-        let _ = writeln!(buf, "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"2xx\"}} {}", id, r2);
-        let _ = writeln!(buf, "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"3xx\"}} {}", id, r3);
-        let _ = writeln!(buf, "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"4xx\"}} {}", id, r4);
-        let _ = writeln!(buf, "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"5xx\"}} {}", id, r5);
+        let r2 = u
+            .stats
+            .responses_2xx
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let r3 = u
+            .stats
+            .responses_3xx
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let r4 = u
+            .stats
+            .responses_4xx
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let r5 = u
+            .stats
+            .responses_5xx
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let _ = writeln!(
+            buf,
+            "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"2xx\"}} {}",
+            id, r2
+        );
+        let _ = writeln!(
+            buf,
+            "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"3xx\"}} {}",
+            id, r3
+        );
+        let _ = writeln!(
+            buf,
+            "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"4xx\"}} {}",
+            id, r4
+        );
+        let _ = writeln!(
+            buf,
+            "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"5xx\"}} {}",
+            id, r5
+        );
 
-        let et = u.stats.errors_timeout.load(std::sync::atomic::Ordering::Relaxed);
-        let en = u.stats.errors_network.load(std::sync::atomic::Ordering::Relaxed);
-        let _ = writeln!(buf, "gptload_upstream_errors_total{{upstream=\"{}\",type=\"timeout\"}} {}", id, et);
-        let _ = writeln!(buf, "gptload_upstream_errors_total{{upstream=\"{}\",type=\"network\"}} {}", id, en);
+        let et = u
+            .stats
+            .errors_timeout
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let en = u
+            .stats
+            .errors_network
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let _ = writeln!(
+            buf,
+            "gptload_upstream_errors_total{{upstream=\"{}\",type=\"timeout\"}} {}",
+            id, et
+        );
+        let _ = writeln!(
+            buf,
+            "gptload_upstream_errors_total{{upstream=\"{}\",type=\"network\"}} {}",
+            id, en
+        );
     }
 
     // Key status distribution (global)
@@ -753,22 +1114,37 @@ pub async fn prometheus_metrics(state: Arc<RouterState>) -> Response<Body> {
             if k.is_active() {
                 active_keys += 1;
                 // Check if key is in 429 cooldown.
-                let until = k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed);
+                let until = k
+                    .cooldown_until_ms
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 if until > 0 && now < until {
                     cooldown_keys += 1;
                 }
             }
         }
     }
-    let _ = writeln!(buf, "# HELP gptload_keys_total Total keys across all upstreams");
+    let _ = writeln!(
+        buf,
+        "# HELP gptload_keys_total Total keys across all upstreams"
+    );
     let _ = writeln!(buf, "# TYPE gptload_keys_total gauge");
     let _ = writeln!(buf, "gptload_keys_total {}", total_keys);
-    let _ = writeln!(buf, "# HELP gptload_keys_active Active keys across all upstreams");
+    let _ = writeln!(
+        buf,
+        "# HELP gptload_keys_active Active keys across all upstreams"
+    );
     let _ = writeln!(buf, "# TYPE gptload_keys_active gauge");
     let _ = writeln!(buf, "gptload_keys_active {}", active_keys);
-    let _ = writeln!(buf, "# HELP gptload_keys_invalid Invalid keys across all upstreams");
+    let _ = writeln!(
+        buf,
+        "# HELP gptload_keys_invalid Invalid keys across all upstreams"
+    );
     let _ = writeln!(buf, "# TYPE gptload_keys_invalid gauge");
-    let _ = writeln!(buf, "gptload_keys_invalid {}", total_keys.saturating_sub(active_keys));
+    let _ = writeln!(
+        buf,
+        "gptload_keys_invalid {}",
+        total_keys.saturating_sub(active_keys)
+    );
     let _ = writeln!(buf, "# HELP gptload_keys_cooldown Keys in 429 cooldown");
     let _ = writeln!(buf, "# TYPE gptload_keys_cooldown gauge");
     let _ = writeln!(buf, "gptload_keys_cooldown {}", cooldown_keys);
@@ -785,14 +1161,18 @@ async fn stats_stream(state: Arc<RouterState>) -> Response<Body> {
     let state2 = state.clone();
 
     tokio::spawn(async move {
-        let mut last_total = state2.stats.requests_total.load(std::sync::atomic::Ordering::Relaxed);
+        let mut last_total = state2
+            .stats
+            .requests_total
+            .load(std::sync::atomic::Ordering::Relaxed);
         loop {
             let snap = build_snapshot(&state2);
             let total = snap.requests_total;
             let rps = total.saturating_sub(last_total);
             last_total = total;
 
-            let mut v = serde_json::to_value(&snap).unwrap_or(serde_json::json!({"error":"snapshot_failed"}));
+            let mut v = serde_json::to_value(&snap)
+                .unwrap_or(serde_json::json!({"error":"snapshot_failed"}));
             if let serde_json::Value::Object(ref mut m) = v {
                 m.insert("rps".into(), serde_json::json!(rps));
             }
@@ -806,6 +1186,36 @@ async fn stats_stream(state: Arc<RouterState>) -> Response<Body> {
                 break;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(Body::wrap_stream(ReceiverStream::new(rx)))
+        .unwrap()
+}
+
+async fn requests_stream(state: Arc<RouterState>) -> Response<Body> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(128);
+    let mut sub = state.subscribe_requests();
+
+    tokio::spawn(async move {
+        loop {
+            match sub.recv().await {
+                Ok(entry) => {
+                    let payload = serde_json::to_string(&entry)
+                        .unwrap_or_else(|_| String::from(r#"{"error":"json"}"#));
+                    let msg = format!("data: {}\n\n", payload);
+                    if tx.send(Ok(Bytes::from(msg))).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
         }
     });
 
@@ -841,14 +1251,19 @@ async fn api_reload_all(state: Arc<RouterState>) -> Response<Body> {
             let ks = build_key_states(keys)?;
             let n = ks.len();
             u2.keys.store(ks);
+            u2.rebuild_active_keys();
             Ok(n)
         })
         .await;
 
         match res {
             Ok(Ok(n)) => results.push(serde_json::json!({"id": id, "keys_total": n, "ok": true})),
-            Ok(Err(e)) => results.push(serde_json::json!({"id": id, "ok": false, "error": e.to_string()})),
-            Err(e) => results.push(serde_json::json!({"id": id, "ok": false, "error": e.to_string()})),
+            Ok(Err(e)) => {
+                results.push(serde_json::json!({"id": id, "ok": false, "error": e.to_string()}))
+            }
+            Err(e) => {
+                results.push(serde_json::json!({"id": id, "ok": false, "error": e.to_string()}))
+            }
         }
     }
 
@@ -866,9 +1281,17 @@ struct JsonKeysBody {
     dedupe: Option<bool>,
 }
 
-async fn api_add_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: &str) -> Response<Body> {
+async fn api_add_keys(
+    req: Request<Body>,
+    state: Arc<RouterState>,
+    upstream_id: &str,
+) -> Response<Body> {
     let Some((_idx, upstream)) = state.upstream_by_id(upstream_id) else {
-        return RouterState::json_error(http::StatusCode::NOT_FOUND, "unknown upstream id", "not_found");
+        return RouterState::json_error(
+            http::StatusCode::NOT_FOUND,
+            "unknown upstream id",
+            "not_found",
+        );
     };
 
     let (keys, dedupe) = match parse_keys_body(req).await {
@@ -878,10 +1301,18 @@ async fn api_add_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: 
 
     let keys = if dedupe { dedupe_keys(keys) } else { keys };
     if keys.is_empty() {
-        return RouterState::json_error(http::StatusCode::BAD_REQUEST, "no keys provided", "bad_request");
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            "no keys provided",
+            "bad_request",
+        );
     }
     if let Err(e) = validate_keys(&keys) {
-        return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request");
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            &e.to_string(),
+            "bad_request",
+        );
     }
 
     let store = state.store.clone();
@@ -904,7 +1335,8 @@ async fn api_add_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: 
         // Build new KeyState arcs only for inserted keys and append to in-memory list.
         let inserted_states = build_key_states(add_res.inserted_keys)?;
         let old = upstream2.keys.load_full();
-        let mut merged: Vec<Arc<crate::state::KeyState>> = Vec::with_capacity(old.len() + inserted_states.len());
+        let mut merged: Vec<Arc<crate::state::KeyState>> =
+            Vec::with_capacity(old.len() + inserted_states.len());
         merged.extend(old.iter().cloned());
         merged.extend(inserted_states.iter().cloned());
         upstream2.keys.store(Arc::new(merged));
@@ -929,14 +1361,30 @@ async fn api_add_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: 
             });
             json_ok(&v)
         }
-        Ok(Err(e)) => RouterState::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "internal_error"),
-        Err(e) => RouterState::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "internal_error"),
+        Ok(Err(e)) => RouterState::json_error(
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+            "internal_error",
+        ),
+        Err(e) => RouterState::json_error(
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+            "internal_error",
+        ),
     }
 }
 
-async fn api_replace_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: &str) -> Response<Body> {
+async fn api_replace_keys(
+    req: Request<Body>,
+    state: Arc<RouterState>,
+    upstream_id: &str,
+) -> Response<Body> {
     let Some((_idx, upstream)) = state.upstream_by_id(upstream_id) else {
-        return RouterState::json_error(http::StatusCode::NOT_FOUND, "unknown upstream id", "not_found");
+        return RouterState::json_error(
+            http::StatusCode::NOT_FOUND,
+            "unknown upstream id",
+            "not_found",
+        );
     };
 
     let (keys, dedupe) = match parse_keys_body(req).await {
@@ -946,10 +1394,18 @@ async fn api_replace_keys(req: Request<Body>, state: Arc<RouterState>, upstream_
 
     let keys = if dedupe { dedupe_keys(keys) } else { keys };
     if keys.is_empty() {
-        return RouterState::json_error(http::StatusCode::BAD_REQUEST, "no keys provided", "bad_request");
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            "no keys provided",
+            "bad_request",
+        );
     }
     if let Err(e) = validate_keys(&keys) {
-        return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request");
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            &e.to_string(),
+            "bad_request",
+        );
     }
 
     let store = state.store.clone();
@@ -987,14 +1443,30 @@ async fn api_replace_keys(req: Request<Body>, state: Arc<RouterState>, upstream_
             });
             json_ok(&v)
         }
-        Ok(Err(e)) => RouterState::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "internal_error"),
-        Err(e) => RouterState::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "internal_error"),
+        Ok(Err(e)) => RouterState::json_error(
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+            "internal_error",
+        ),
+        Err(e) => RouterState::json_error(
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+            "internal_error",
+        ),
     }
 }
 
-async fn api_delete_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: &str) -> Response<Body> {
+async fn api_delete_keys(
+    req: Request<Body>,
+    state: Arc<RouterState>,
+    upstream_id: &str,
+) -> Response<Body> {
     let Some((_idx, upstream)) = state.upstream_by_id(upstream_id) else {
-        return RouterState::json_error(http::StatusCode::NOT_FOUND, "unknown upstream id", "not_found");
+        return RouterState::json_error(
+            http::StatusCode::NOT_FOUND,
+            "unknown upstream id",
+            "not_found",
+        );
     };
 
     let (keys, dedupe) = match parse_keys_body(req).await {
@@ -1002,7 +1474,11 @@ async fn api_delete_keys(req: Request<Body>, state: Arc<RouterState>, upstream_i
         Err(e) => return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request"),
     };
     if keys.is_empty() {
-        return RouterState::json_error(http::StatusCode::BAD_REQUEST, "no keys provided", "bad_request");
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            "no keys provided",
+            "bad_request",
+        );
     }
 
     let store = state.store.clone();
@@ -1024,7 +1500,8 @@ async fn api_delete_keys(req: Request<Body>, state: Arc<RouterState>, upstream_i
         // Update in-memory: filter out removed keys.
         let remove_set: ahash::AHashSet<&str> = keys.iter().map(|s| s.as_str()).collect();
         let old = upstream2.keys.load_full();
-        let mut kept: Vec<Arc<crate::state::KeyState>> = Vec::with_capacity(old.len().saturating_sub(removed));
+        let mut kept: Vec<Arc<crate::state::KeyState>> =
+            Vec::with_capacity(old.len().saturating_sub(removed));
         for k in old.iter() {
             if !remove_set.contains(k.key.as_ref()) {
                 kept.push(k.clone());
@@ -1044,8 +1521,16 @@ async fn api_delete_keys(req: Request<Body>, state: Arc<RouterState>, upstream_i
 
     match res {
         Ok(Ok(v)) => json_ok(&v),
-        Ok(Err(e)) => RouterState::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "internal_error"),
-        Err(e) => RouterState::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "internal_error"),
+        Ok(Err(e)) => RouterState::json_error(
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+            "internal_error",
+        ),
+        Err(e) => RouterState::json_error(
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+            "internal_error",
+        ),
     }
 }
 
@@ -1085,7 +1570,11 @@ fn scoped_key_set(body: &KeyStatusBody) -> Result<KeyStatusScope, String> {
     }
 }
 
-async fn api_release_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: &str) -> Response<Body> {
+async fn api_release_keys(
+    req: Request<Body>,
+    state: Arc<RouterState>,
+    upstream_id: &str,
+) -> Response<Body> {
     let (_idx, upstream) = match get_upstream(&state, upstream_id) {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -1107,7 +1596,11 @@ async fn api_release_keys(req: Request<Body>, state: Arc<RouterState>, upstream_
     }))
 }
 
-async fn api_invalidate_keys(req: Request<Body>, state: Arc<RouterState>, upstream_id: &str) -> Response<Body> {
+async fn api_invalidate_keys(
+    req: Request<Body>,
+    state: Arc<RouterState>,
+    upstream_id: &str,
+) -> Response<Body> {
     let (_idx, upstream) = match get_upstream(&state, upstream_id) {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -1119,9 +1612,14 @@ async fn api_invalidate_keys(req: Request<Body>, state: Arc<RouterState>, upstre
     let invalidated = match scoped_key_set(&body) {
         Ok(KeyStatusScope::Keys(set)) => upstream.invalidate_keys(&set),
         Ok(KeyStatusScope::All) => {
-            let all: ahash::AHashSet<String> = upstream.keys.load_full().iter().map(|k| k.key.to_string()).collect();
+            let all: ahash::AHashSet<String> = upstream
+                .keys
+                .load_full()
+                .iter()
+                .map(|k| k.key.to_string())
+                .collect();
             upstream.invalidate_keys(&all)
-        },
+        }
         Err(e) => return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request"),
     };
     json_ok(&serde_json::json!({
@@ -1132,6 +1630,36 @@ async fn api_invalidate_keys(req: Request<Body>, state: Arc<RouterState>, upstre
     }))
 }
 
+#[derive(Deserialize)]
+struct KeyTestBody {
+    key: String,
+}
+
+async fn api_test_key(
+    req: Request<Body>,
+    state: Arc<RouterState>,
+    upstream_id: &str,
+) -> Response<Body> {
+    let body: KeyTestBody = match parse_json_body(req).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let started = std::time::Instant::now();
+    match state.test_key_by_value(upstream_id, &body.key).await {
+        Ok(valid) => json_ok(&serde_json::json!({
+            "ok": true,
+            "valid": valid,
+            "latency_ms": started.elapsed().as_millis() as u64,
+            "upstream": upstream_id,
+        })),
+        Err(e) => RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            &e.to_string(),
+            "key_test_failed",
+        ),
+    }
+}
+
 #[derive(Serialize)]
 struct KeyInfo {
     key: String,
@@ -1140,11 +1668,22 @@ struct KeyInfo {
     active_requests: u32,
     /// Unix ms timestamp when 429 cooldown expires. 0 = not in cooldown.
     cooldown_until_ms: u64,
+    latency_p50_ms: Option<u64>,
+    latency_p90_ms: Option<u64>,
+    latency_p99_ms: Option<u64>,
 }
 
-async fn api_list_keys(state: Arc<RouterState>, upstream_id: &str, uri: &http::Uri) -> Response<Body> {
+async fn api_list_keys(
+    state: Arc<RouterState>,
+    upstream_id: &str,
+    uri: &http::Uri,
+) -> Response<Body> {
     let Some((_idx, upstream)) = state.upstream_by_id(upstream_id) else {
-        return RouterState::json_error(http::StatusCode::NOT_FOUND, "unknown upstream id", "not_found");
+        return RouterState::json_error(
+            http::StatusCode::NOT_FOUND,
+            "unknown upstream id",
+            "not_found",
+        );
     };
 
     let limit: usize = query_get(uri, "limit")
@@ -1166,13 +1705,19 @@ async fn api_list_keys(state: Arc<RouterState>, upstream_id: &str, uri: &http::U
         let status = if k.is_active() { "active" } else { "invalid" };
         let failure_count = k.failure_count.load(std::sync::atomic::Ordering::Relaxed);
         let active_requests = k.active_requests.load(std::sync::atomic::Ordering::Relaxed);
-        let cooldown_until_ms = k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let cooldown_until_ms = k
+            .cooldown_until_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let (latency_p50_ms, latency_p90_ms, latency_p99_ms) = k.latency_percentiles();
         out.push(KeyInfo {
             key: k.key.to_string(),
             status,
             failure_count,
             active_requests,
             cooldown_until_ms,
+            latency_p50_ms,
+            latency_p90_ms,
+            latency_p99_ms,
         });
     }
 
@@ -1193,7 +1738,7 @@ async fn api_export_keys(
     state: Arc<RouterState>,
     upstream_id: &str,
 ) -> Response<Body> {
-    let Some(ref expected) = state.export_token else {
+    let Some(expected) = state.export_token() else {
         return RouterState::json_error(
             http::StatusCode::NOT_FOUND,
             "export not configured",
@@ -1256,10 +1801,13 @@ async fn parse_keys_body(req: Request<Body>) -> Result<(Vec<String>, bool), Stri
         .unwrap_or("")
         .to_string();
 
-    let body_bytes = read_body_limit(req, 50 * 1024 * 1024).await.map_err(|e| e.to_string())?; // 50MB
+    let body_bytes = read_body_limit(req, 50 * 1024 * 1024)
+        .await
+        .map_err(|e| e.to_string())?; // 50MB
 
     if content_type.starts_with("application/json") {
-        let v: JsonKeysBody = serde_json::from_slice(&body_bytes).map_err(|e| format!("invalid json: {e}"))?;
+        let v: JsonKeysBody =
+            serde_json::from_slice(&body_bytes).map_err(|e| format!("invalid json: {e}"))?;
         Ok((v.keys, v.dedupe.unwrap_or(true)))
     } else {
         // Treat as plain text.

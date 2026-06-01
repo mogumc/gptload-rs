@@ -35,6 +35,18 @@ data_dir = "./data"
 # Enable stream usage injection for these upstream ids (adds stream_options.include_usage).
 # usage_inject_upstreams = ["openai"]
 
+[server]
+# Wait for inflight requests after SIGINT/SIGTERM.
+graceful_shutdown_timeout_secs = 30
+
+# Browser CORS allow-list. ["*"] allows every Origin.
+cors_origins = ["*"]
+
+# Queue requests instead of returning 503 when keys are busy or cooling down.
+queue_enabled = false
+queue_max_depth = 100
+queue_timeout_ms = 10000
+
 [key]
 # Number of auth failures (401/403) before a key is auto-invalidated.
 # 0 = disabled (keys are never auto-blacklisted).
@@ -43,6 +55,12 @@ blacklist_threshold = 3
 # Max concurrent requests per key. Keys at this limit are skipped during selection.
 # Prevents upstream 429 from concurrent overload. 0 = no limit.
 max_concurrent_per_key = 5
+
+# Default cooldown after 429 when Retry-After is absent.
+rate_limit_cooldown_ms = 3000
+
+# Upper bound for Retry-After cooldown.
+max_rate_limit_cooldown_ms = 30000
 
 # How often (seconds) to re-validate invalid keys for automatic recovery.
 revalidation_interval_secs = 300
@@ -54,6 +72,8 @@ revalidation_timeout_secs = 20
 id = "openai"
 base_url = "https://api.openai.com"
 weight = 1
+format = "openai"
+# proxy = "socks5://127.0.0.1:1080"
 # Per-upstream override for max concurrent requests per key.
 # Overrides the global [key].max_concurrent_per_key default.
 # max_concurrent_per_key = 5
