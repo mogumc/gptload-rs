@@ -341,7 +341,7 @@ async fn handle_upstream_subroutes(
             Method::POST => api_release_keys(req, state, upstream_id).await,
             _ => method_not_allowed(),
         },
-        "invalidate" => match *req.method() {
+        "invalidate" | "ban" => match *req.method() {
             Method::POST => api_invalidate_keys(req, state, upstream_id).await,
             _ => method_not_allowed(),
         },
