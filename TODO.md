@@ -239,3 +239,156 @@ tokio-socks = "0.5"      # SOCKS5 support (via hyper-socks 或自行实现 conne
 ```
 
 **涉及文件**：`src/config.rs`（proxy 字段）、`src/state.rs`（构建不同 connector）、`Cargo.toml`（新依赖）
+
+---
+
+## 大目标 (Big Targets)
+
+### 9. AI Gateway — 从 Proxy 演进为 Gateway
+
+**愿景**：不只是转发请求，而是成为 AI 基础设施的核心层。
+
+**9.1 Token 预算管理**
+- 每个 proxy_token / 团队有 token 配额（每日/每月）
+- 基于 usage injection 的 token 计数做精确计量
+- 超配额 → 拒绝请求（402 Payment Required）
+- 配额管理 API：设置、查询、重置
+- 支持 burst（允许短期超配额，但长期受限）
+
+**9.2 智能路由 — 成本优化**
+- 不同 provider 定价不同（OpenAI vs Anthropic vs Gemini）
+- 根据请求特征选择最优 provider：
+  - 延迟敏感 → 选最近的 upstream
+  - 成本敏感 → 选最便宜的 upstream
+  - 质量敏感 → 选模型最好的 upstream
+- 配置每个 upstream 的 cost_per_1k_tokens
+- 路由策略：`cheapest`、`fastest`、`quality`、`balanced`
+
+**9.3 响应缓存**
+- 对完全相同的请求（相同 model + messages + params）缓存响应
+- 缓存键：请求 body 的 hash
+- TTL 可配置，默认 5 分钟
+- 适用场景：重复查询、测试、批量处理
+- 存储：内存 LRU 或 Redis
+
+**9.4 Prompt 前缀去重**
+- 很多请求共享相同的 system prompt
+- 检测公共前缀，只传一次
+- 与 upstream 的 prompt caching 特性配合（如 OpenAI 的 automatic prompt caching）
+- 节省 token 费用
+
+**9.5 安全层**
+- Prompt 注入检测：用规则或模型检测恶意 prompt
+- PII 检测/脱敏：自动识别并遮蔽请求中的个人信息
+- 内容审核：检测违规内容（暴力、色情等）
+- 可选：用上游模型做 content moderation
+
+**涉及**：整个项目架构级重构。新增 `src/gateway/` 模块组。
+
+---
+
+### 10. 可观测性平台 (Observability)
+
+**10.1 OpenTelemetry 分布式追踪**
+- 每个请求生成 trace_id
+- Span：proxy 接收 → upstream 请求 → 响应处理
+- 导出到 Jaeger / Zipkin / Grafana Tempo
+- 可视化请求在多个 upstream 之间的重试路径
+
+**10.2 结构化日志**
+- 每条请求日志包含：trace_id、model、upstream、key（脱敏）、token usage、延迟 breakdown
+- JSON 格式输出，可接入 ELK / Loki
+- 日志级别动态调整（无需重启）
+
+**10.3 成本分析仪表盘**
+- 按 team（proxy_token）统计 token 花费
+- 按 model 统计 usage 和 cost
+- 按 upstream 统计成功率、延迟、成本
+- 趋势图、对比图、预算预警
+
+**10.4 告警**
+- 基于 Prometheus 指标的告警规则
+- 示例：key 活跃率 < 30%、upstream 5xx 率 > 10%、队列深度 > 50
+- Webhook / Email / Slack 通知
+
+**涉及**：`src/telemetry/` 模块、Prometheus 指标扩展、Admin UI 仪表盘。
+
+---
+
+### 11. Developer SDK & 生态
+
+**11.1 CLI 管理工具**
+- `gptload key add --upstream openai --keys "sk-xxx,sk-yyy"`
+- `gptload key list --upstream openai --status invalid`
+- `gptload config validate --file config.toml`
+- `gptload bench --model gpt-4 --concurrent 50 --requests 1000`
+- 独立 binary，通过 Admin API 交互
+
+**11.2 Terraform Provider**
+- `resource "gptload_upstream" "openai" { ... }`
+- `resource "gptload_key" "k1" { upstream = gptload_upstream.openai.id ... }`
+- `resource "gptload_token" "team_a" { balance = 1000000 ... }`
+- 适合 IaC 管理大量 upstream 和 key
+
+**11.3 Kubernetes Operator**
+- CRD：`GptloadConfig`、`UpstreamPool`、`KeyPool`
+- Operator 自动管理 gptload-rs 实例
+- 自动滚动更新、HPA 扩缩容
+- Key 轮转自动化（CronJob 定期更新 Secret）
+
+**11.4 Client SDK**
+- Python：`gptload.Client(upstream="openai").chat(model="gpt-4", ...)`
+- Node.js / Go 同理
+- 内置重试、负载均衡、failover
+- 与直接用 OpenAI SDK 兼容，只需改 base_url
+
+**涉及**：新仓库、新项目。
+
+---
+
+### 12. 高性能数据面 (High-Performance Data Plane)
+
+**12.1 io_uring I/O**
+- 用 `io-uring` crate 替代 tokio 的 epoll
+- 减少系统调用开销，提升吞吐
+- 适合极高并发场景（10k+ RPS）
+
+**12.2 零拷贝转发**
+- 当前 proxy 将 body 读入 Bytes 再转发
+- 对于非重试请求，直接 pipe 上游 body 到下游
+- 减少内存拷贝和分配
+
+**12.3 连接池优化**
+- 每个 upstream 独立的连接池
+- 连接池大小可配置
+- 连接复用策略：keep-alive、max idle per host
+
+**12.4 SIMD 加速**
+- JSON 解析/序列化用 SIMD 优化
+- Header 解析用 SIMD 加速
+- 可引入 `simd-json` crate
+
+**涉及**：`src/proxy.rs`、`src/state.rs`、`Cargo.toml`。底层重构。
+
+---
+
+### 13. 多区域联邦 (Multi-Region Federation)
+
+**愿景**：多个 gptload-rs 实例跨区域部署，共享状态，智能路由。
+
+**13.1 状态同步**
+- 方案一：Redis Cluster 共享 key 状态（failure_count、cooldown、active_requests）
+- 方案二：CRDT 数据结构 + Gossip 协议（无中心依赖）
+- 方案三：etcd/Consul 作为一致性存储
+
+**13.2 全局路由**
+- 客户端请求到达最近的 gptload-rs 实例
+- 实例根据全局状态选择最优 upstream
+- 考虑跨区域延迟、upstream 健康状态、key 可用性
+
+**13.3 故障转移**
+- 某个区域的 gptload-rs 实例挂掉
+- DNS / 负载均衡器自动切换到其他区域
+- 其他区域的实例已同步 key 状态，无缝接管
+
+**涉及**：新增 `src/federation/` 模块、外部依赖（Redis/etcd）。架构级变更。
