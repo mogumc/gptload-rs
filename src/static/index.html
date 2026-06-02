@@ -4,30 +4,45 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>gptload-rs Admin</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; }
+    :root { color-scheme: light; --bg:#f7f8fa; --panel:#fff; --text:#111827; --muted:#667085; --border:#d9dde5; --soft:#eef1f6; --accent:#1e6bd6; --ok:#087443; --bad:#b42318; --pre:#0b1020; --pre-text:#d7e3ff; }
+    @media (prefers-color-scheme: dark) {
+      :root { color-scheme: dark; --bg:#111318; --panel:#191c22; --text:#f3f4f6; --muted:#a0a7b4; --border:#303642; --soft:#222732; --accent:#6ea8ff; --ok:#38c172; --bad:#ff6b6b; --pre:#080b12; --pre-text:#d8e2ff; }
+    }
+    body.dark { color-scheme: dark; --bg:#111318; --panel:#191c22; --text:#f3f4f6; --muted:#a0a7b4; --border:#303642; --soft:#222732; --accent:#6ea8ff; --ok:#38c172; --bad:#ff6b6b; --pre:#080b12; --pre-text:#d8e2ff; }
+    body.light { color-scheme: light; --bg:#f7f8fa; --panel:#fff; --text:#111827; --muted:#667085; --border:#d9dde5; --soft:#eef1f6; --accent:#1e6bd6; --ok:#087443; --bad:#b42318; --pre:#0b1020; --pre-text:#d7e3ff; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; background: var(--bg); color: var(--text); }
     h1 { margin: 0 0 10px 0; }
     .row { display: flex; gap: 16px; flex-wrap: wrap; }
-    .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px; }
+    .card { border: 1px solid var(--border); border-radius: 8px; padding: 12px; background: var(--panel); }
     .card h2 { margin: 0 0 8px 0; font-size: 16px; }
     table { border-collapse: collapse; width: 100%; }
-    th, td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left; font-size: 13px; }
-    th { background: #fafafa; position: sticky; top: 0; }
+    th, td { border-bottom: 1px solid var(--soft); padding: 6px 8px; text-align: left; font-size: 13px; }
+    th { background: var(--soft); position: sticky; top: 0; }
     input, select, textarea, button { font-size: 14px; }
+    input, select, textarea { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; }
     textarea { width: 100%; min-height: 180px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-    .muted { color: #666; font-size: 12px; }
-    .ok { color: #0a7; }
-    .bad { color: #c00; }
+    .muted { color: var(--muted); font-size: 12px; }
+    .ok { color: var(--ok); }
+    .bad { color: var(--bad); }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
     .small { font-size: 12px; }
-    pre { background: #0b1020; color: #d7e3ff; padding: 10px; border-radius: 8px; overflow: auto; }
-    .btn { padding: 6px 10px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer; }
-    .btn:hover { background: #f6f6f6; }
+    pre { background: var(--pre); color: var(--pre-text); padding: 10px; border-radius: 8px; overflow: auto; }
+    .btn { padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); color: var(--text); cursor: pointer; }
+    .btn:hover { background: var(--soft); }
+    tr.clickable { cursor: pointer; }
+    tr.clickable:hover { background: var(--soft); }
   </style>
 </head>
 <body>
-  <h1>gptload-rs Admin</h1>
-  <div class="muted">路径：<span class="mono">/admin</span> ｜ API：<span class="mono">/admin/api/v1</span></div>
+  <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+    <div>
+      <h1>gptload-rs Admin</h1>
+      <div class="muted">路径：<span class="mono">/admin</span> ｜ API：<span class="mono">/admin/api/v1</span></div>
+    </div>
+    <button class="btn" id="themeToggle">主题</button>
+  </div>
 
   <div class="row" style="margin-top: 14px;">
     <div class="card" style="flex: 1; min-width: 320px;">
@@ -68,6 +83,7 @@
       <h2>最近请求</h2>
       <div style="display:flex; gap:8px; align-items:center;">
         <button class="btn" id="refreshRequests">刷新</button>
+        <button class="btn" id="toggleRequestsStream">实时流</button>
         <span id="requestsInfo" class="muted small"></span>
       </div>
       <div style="overflow:auto; max-height: 360px; margin-top: 8px;">
@@ -87,6 +103,7 @@
           <tbody></tbody>
         </table>
       </div>
+      <pre id="requestDetail" class="small" style="margin-top:8px; max-height:220px;"></pre>
     </div>
   </div>
 
@@ -131,9 +148,10 @@
             <tr>
               <th>ID</th>
               <th>Base URL</th>
+              <th>Format</th>
+              <th>Proxy</th>
               <th>Weight</th>
-              <th>Keys (ok/ban)</th>
-              <th>Cooldown</th>
+              <th>Keys (active/invalid)</th>
               <th>Selected</th>
               <th>2xx</th>
               <th>4xx</th>
@@ -193,6 +211,19 @@
         <label class="small muted">Weight</label><br/>
         <input id="upstreamWeight" type="number" min="1" step="1" placeholder="1" style="width:100%; padding:6px 8px;" />
       </div>
+      <div style="margin-top: 8px;">
+        <label class="small muted">Format</label><br/>
+        <select id="upstreamFormat" style="width:100%; padding:6px 8px;">
+          <option value="">auto</option>
+          <option value="openai">openai</option>
+          <option value="anthropic">anthropic</option>
+          <option value="gemini">gemini</option>
+        </select>
+      </div>
+      <div style="margin-top: 8px;">
+        <label class="small muted">Proxy</label><br/>
+        <input id="upstreamProxy" type="text" placeholder="socks5://127.0.0.1:1080" style="width:100%; padding:6px 8px;" />
+      </div>
       <div style="display:flex; gap:8px; margin-top: 8px; flex-wrap: wrap;">
         <button class="btn" id="addUpstream">新增</button>
         <button class="btn" id="updateUpstream">更新</button>
@@ -208,21 +239,25 @@
   <div class="row" style="margin-top: 14px;">
     <div class="card" style="flex: 2; min-width: 640px;">
       <h2>Keys 状态</h2>
-      <div class="muted">查看每个 key 的封禁状态，可单独释放/封禁，或一键释放全部 / 一键封禁全部。封禁状态仅存内存，重启后清除。</div>
+      <div class="muted">查看每个 key 的状态，可单独恢复/失效，或一键恢复全部 / 一键失效全部。Invalid key 会被定时验证自动恢复。</div>
       <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top: 8px;">
         <select id="keyStatusUpstreamSelect" style="padding:6px 8px; min-width:160px;"></select>
-        <button class="btn" id="loadKeyStatus">查看 / 刷新</button>
-        <button class="btn" id="releaseAllKeys">一键释放全部</button>
-        <button class="btn" id="banAllKeys">一键封禁全部</button>
-        <label class="small muted">封禁时长</label>
-        <select id="banDuration" style="padding:6px 8px;">
-          <option value="300000">5 分钟</option>
-          <option value="1800000">30 分钟</option>
-          <option value="3600000" selected>1 小时</option>
-          <option value="21600000">6 小时</option>
-          <option value="86400000">24 小时</option>
-          <option value="">永久（手动释放）</option>
+        <input id="keySearch" type="search" placeholder="搜索 key" style="padding:6px 8px; min-width:180px;" />
+        <select id="keyFilter" style="padding:6px 8px;">
+          <option value="all">全部状态</option>
+          <option value="active">active</option>
+          <option value="invalid">invalid</option>
+          <option value="cooldown">cooldown</option>
         </select>
+        <select id="keySort" style="padding:6px 8px;">
+          <option value="index">默认排序</option>
+          <option value="failure_desc">失败次数</option>
+          <option value="latency_desc">P90 延迟</option>
+        </select>
+        <button class="btn" id="loadKeyStatus">查看 / 刷新</button>
+        <button class="btn" id="releaseAllKeys">一键恢复全部</button>
+        <button class="btn" id="banAllKeys">一键失效全部</button>
+        <button class="btn" id="exportKeys" style="margin-left:12px;">导出 Keys</button>
         <span id="keyStatusInfo" class="muted small"></span>
       </div>
       <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top: 8px;">
@@ -244,9 +279,9 @@
               <th>#</th>
               <th>Key</th>
               <th>状态</th>
-              <th>剩余冷却</th>
               <th>失败次数</th>
-              <th>最后封禁信息</th>
+              <th>并发</th>
+              <th>延迟 p50/p90/p99</th>
               <th>操作</th>
             </tr>
           </thead>
@@ -254,6 +289,18 @@
         </table>
       </div>
       <pre id="keyStatusResult" class="small" style="margin-top:8px;"></pre>
+      <canvas id="keyLatencyChart" style="width:100%; height:180px; margin-top:8px;"></canvas>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top: 14px;">
+    <div class="card" style="flex: 2; min-width: 520px;">
+      <h2>配置预览</h2>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button class="btn" id="loadConfig">刷新配置</button>
+        <span id="configInfo" class="muted small"></span>
+      </div>
+      <pre id="configPreview" class="small" style="margin-top:8px; max-height:420px;"></pre>
     </div>
   </div>
 

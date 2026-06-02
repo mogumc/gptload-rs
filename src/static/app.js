@@ -1,4 +1,5 @@
 (function () {
+  const themeToggle = document.getElementById('themeToggle');
   const tokenInput = document.getElementById('token');
   const saveTokenBtn = document.getElementById('saveToken');
   const clearTokenBtn = document.getElementById('clearToken');
@@ -12,8 +13,10 @@
   const requestsChart = document.getElementById('requestsChart');
 
   const refreshRequestsBtn = document.getElementById('refreshRequests');
+  const toggleRequestsStreamBtn = document.getElementById('toggleRequestsStream');
   const requestsInfo = document.getElementById('requestsInfo');
   const requestsTableBody = document.querySelector('#requestsTable tbody');
+  const requestDetail = document.getElementById('requestDetail');
 
   const refreshUpstreamsBtn = document.getElementById('refreshUpstreams');
   const upstreamsInfo = document.getElementById('upstreamsInfo');
@@ -24,6 +27,8 @@
   const upstreamIdInput = document.getElementById('upstreamId');
   const upstreamBaseUrlInput = document.getElementById('upstreamBaseUrl');
   const upstreamWeightInput = document.getElementById('upstreamWeight');
+  const upstreamFormatInput = document.getElementById('upstreamFormat');
+  const upstreamProxyInput = document.getElementById('upstreamProxy');
   const addUpstreamBtn = document.getElementById('addUpstream');
   const updateUpstreamBtn = document.getElementById('updateUpstream');
   const deleteUpstreamBtn = document.getElementById('deleteUpstream');
@@ -58,10 +63,13 @@
   const modelsList = document.getElementById('modelsList');
 
   const keyStatusUpstreamSelect = document.getElementById('keyStatusUpstreamSelect');
+  const keySearchInput = document.getElementById('keySearch');
+  const keyFilterSelect = document.getElementById('keyFilter');
+  const keySortSelect = document.getElementById('keySort');
   const loadKeyStatusBtn = document.getElementById('loadKeyStatus');
   const releaseAllKeysBtn = document.getElementById('releaseAllKeys');
   const banAllKeysBtn = document.getElementById('banAllKeys');
-  const banDurationSelect = document.getElementById('banDuration');
+  const exportKeysBtn = document.getElementById('exportKeys');
   const keyStatusInfo = document.getElementById('keyStatusInfo');
   const keyStatusPrevBtn = document.getElementById('keyStatusPrev');
   const keyStatusNextBtn = document.getElementById('keyStatusNext');
@@ -69,6 +77,11 @@
   const keyStatusPageInfo = document.getElementById('keyStatusPageInfo');
   const keyStatusTableBody = document.querySelector('#keyStatusTable tbody');
   const keyStatusResult = document.getElementById('keyStatusResult');
+  const keyLatencyChartCanvas = document.getElementById('keyLatencyChart');
+
+  const loadConfigBtn = document.getElementById('loadConfig');
+  const configInfo = document.getElementById('configInfo');
+  const configPreview = document.getElementById('configPreview');
 
   let lastModels = [];
   let lastUpstreams = [];
@@ -76,6 +89,9 @@
   let chartTimer = null;
   let keyStatusOffset = 0;
   let keyStatusTotal = 0;
+  let lastKeyStatusList = [];
+  let keyLatencyChart = null;
+  let requestStreamAbort = null;
 
   function getToken() {
     return localStorage.getItem('gptload_admin_token') || '';
@@ -87,6 +103,32 @@
     localStorage.removeItem('gptload_admin_token');
   }
 
+  function applyTheme(theme) {
+    document.body.classList.remove('dark', 'light');
+    if (theme === 'dark' || theme === 'light') {
+      document.body.classList.add(theme);
+    }
+    if (themeToggle) {
+      themeToggle.textContent = theme === 'dark' ? '浅色' : '深色';
+    }
+  }
+
+  function initTheme() {
+    const saved = localStorage.getItem('gptload_theme') || '';
+    applyTheme(saved);
+  }
+
+  if (themeToggle) {
+    themeToggle.onclick = () => {
+      const next = document.body.classList.contains('dark') ? 'light' : 'dark';
+      localStorage.setItem('gptload_theme', next);
+      applyTheme(next);
+      refreshRequestsChart();
+      renderKeyLatencyChart(lastKeyStatusList);
+    };
+  }
+
+  initTheme();
   tokenInput.value = getToken();
 
   saveTokenBtn.onclick = () => {
@@ -95,6 +137,7 @@
     startStatsStream();
     refreshUpstreams();
     loadRoutes();
+    loadConfig();
     startRequestsAutoRefresh();
   };
   clearTokenBtn.onclick = () => {
@@ -104,6 +147,7 @@
     stopStatsStream();
     refreshUpstreams();
     stopRequestsAutoRefresh();
+    stopRequestsStream();
   };
 
   async function apiFetch(path, opts) {
@@ -126,18 +170,16 @@
     upstreamsTableBody.innerHTML = '';
     for (const u of lastUpstreams) {
       const tr = document.createElement('tr');
-      const healthy = u.keys_healthy != null ? u.keys_healthy : u.keys_total;
-      const banned = u.keys_banned || 0;
-      const keysClass = banned > 0 ? 'bad' : 'ok';
-      const cdMs = u.upstream_cooldown_until_ms || 0;
-      const cdText = cdMs > Date.now() ? formatDuration(cdMs - Date.now()) : '-';
-      const cdClass = cdMs > Date.now() ? 'bad' : 'muted';
+      const active = u.keys_active != null ? u.keys_active : u.keys_total;
+      const invalid = u.keys_invalid || 0;
+      const keysClass = invalid > 0 ? 'bad' : 'ok';
       tr.innerHTML = `
         <td class="mono">${escapeHtml(u.id)}</td>
         <td class="mono small">${escapeHtml(u.base_url)}</td>
-        <td>${u.weight}</td>
-        <td class="${keysClass}">${healthy}/${banned}</td>
-        <td class="${cdClass} mono small">${cdText}</td>
+        <td class="mono small">${escapeHtml(u.format || 'openai')}</td>
+        <td class="mono small">${escapeHtml(u.proxy || '-')}</td>
+        <td><input type="range" min="1" max="100" value="${u.weight}" data-upstream="${escapeHtml(u.id)}" class="weightSlider" style="width:120px;" /> <span class="mono small">${u.weight}</span></td>
+        <td class="${keysClass}">${active}/${invalid}</td>
         <td class="mono small">${u.selected_total || 0}</td>
         <td class="mono small">${u.responses_2xx || 0}</td>
         <td class="mono small">${u.responses_4xx || 0}</td>
@@ -146,6 +188,9 @@
         <td class="mono small">${u.errors_timeout || 0}</td>
       `;
       upstreamsTableBody.appendChild(tr);
+    }
+    for (const slider of upstreamsTableBody.querySelectorAll('.weightSlider')) {
+      slider.onchange = () => updateWeight(slider.dataset.upstream, parseInt(slider.value, 10));
     }
 
     // Select
@@ -279,31 +324,105 @@
     const list = (json && json.requests) || [];
     requestsTableBody.innerHTML = '';
     for (const r of list) {
-      const tr = document.createElement('tr');
-      const status = r.status || 0;
-      const statusClass = status >= 200 && status < 300 ? 'ok' : (status === 404 ? 'muted' : 'bad');
-      const tokens = r.total_tokens != null
-        ? `${r.prompt_tokens || 0}/${r.completion_tokens || 0}/${r.total_tokens}`
-        : '-';
-      const bytes = `${r.req_bytes || 0}/${r.resp_bytes || 0}`;
-      tr.innerHTML = `
-        <td class="small">${new Date(r.ts_ms).toLocaleTimeString()}</td>
-        <td class="mono small">${escapeHtml(r.client_ip || '')}</td>
-        <td class="mono small">${escapeHtml(r.model || '-')}</td>
-        <td class="${statusClass}">${status}</td>
-        <td class="mono small">${r.latency_ms || 0}</td>
-        <td class="mono small">${tokens}</td>
-        <td class="mono small">${bytes}</td>
-        <td class="mono small">${escapeHtml(r.upstream_id || '-')}</td>
-      `;
-      requestsTableBody.appendChild(tr);
+      appendRequestRow(r, false);
     }
     requestsInfo.textContent = `count=${list.length} ｜ ${new Date().toLocaleTimeString()}`;
+  }
+
+  function appendRequestRow(r, prepend) {
+    const tr = document.createElement('tr');
+    tr.className = 'clickable';
+    const status = r.status || 0;
+    const statusClass = status >= 200 && status < 300 ? 'ok' : (status === 404 ? 'muted' : 'bad');
+    const tokens = r.total_tokens != null
+      ? `${r.prompt_tokens || 0}/${r.completion_tokens || 0}/${r.total_tokens}`
+      : '-';
+    const bytes = `${r.req_bytes || 0}/${r.resp_bytes || 0}`;
+    tr.innerHTML = `
+      <td class="small">${new Date(r.ts_ms).toLocaleTimeString()}</td>
+      <td class="mono small">${escapeHtml(r.client_ip || '')}</td>
+      <td class="mono small">${escapeHtml(r.model || '-')}</td>
+      <td class="${statusClass}">${status}</td>
+      <td class="mono small">${r.latency_ms || 0}</td>
+      <td class="mono small">${tokens}</td>
+      <td class="mono small">${bytes}</td>
+      <td class="mono small">${escapeHtml(r.upstream_id || '-')}</td>
+    `;
+    tr.onclick = () => {
+      if (requestDetail) requestDetail.textContent = JSON.stringify(r, null, 2);
+    };
+    if (prepend && requestsTableBody.firstChild) {
+      requestsTableBody.insertBefore(tr, requestsTableBody.firstChild);
+    } else {
+      requestsTableBody.appendChild(tr);
+    }
+    while (requestsTableBody.children.length > 200) {
+      requestsTableBody.removeChild(requestsTableBody.lastChild);
+    }
   }
 
   if (refreshRequestsChartBtn) refreshRequestsChartBtn.onclick = refreshRequestsChart;
   if (requestsWindowSelect) requestsWindowSelect.onchange = refreshRequestsChart;
   if (refreshRequestsBtn) refreshRequestsBtn.onclick = refreshRequests;
+  if (toggleRequestsStreamBtn) toggleRequestsStreamBtn.onclick = () => {
+    if (requestStreamAbort) stopRequestsStream();
+    else startRequestsStream();
+  };
+
+  async function startRequestsStream() {
+    stopRequestsStream();
+    const t = getToken();
+    if (!t) return alert('请先保存 admin token');
+    const controller = new AbortController();
+    requestStreamAbort = controller;
+    if (toggleRequestsStreamBtn) toggleRequestsStreamBtn.textContent = '停止实时';
+    try {
+      const res = await fetch('/admin/api/v1/requests/stream', {
+        headers: { 'X-Admin-Token': t },
+        signal: controller.signal
+      });
+      if (!res.ok || !res.body) throw new Error(String(res.status));
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        buf = processRequestSse(buf);
+      }
+    } catch (e) {
+      if (!controller.signal.aborted) requestsInfo.textContent = `实时流断开: ${e.message || e}`;
+    } finally {
+      if (requestStreamAbort === controller) stopRequestsStream();
+    }
+  }
+
+  function stopRequestsStream() {
+    if (requestStreamAbort) {
+      requestStreamAbort.abort();
+      requestStreamAbort = null;
+    }
+    if (toggleRequestsStreamBtn) toggleRequestsStreamBtn.textContent = '实时流';
+  }
+
+  function processRequestSse(buf) {
+    buf = buf.replace(/\r\n/g, '\n');
+    let idx = buf.indexOf('\n\n');
+    while (idx !== -1) {
+      const raw = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      const data = raw.split(/\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n');
+      if (data) {
+        try {
+          appendRequestRow(JSON.parse(data), true);
+          requestsInfo.textContent = `实时 ｜ ${new Date().toLocaleTimeString()}`;
+        } catch (_) {}
+      }
+      idx = buf.indexOf('\n\n');
+    }
+    return buf.length > 1024 * 1024 ? buf.slice(-512 * 1024) : buf;
+  }
 
   function getMode() {
     const els = document.querySelectorAll('input[name="mode"]');
@@ -419,6 +538,27 @@
     upstreamIdInput.value = u.id || '';
     upstreamBaseUrlInput.value = u.base_url || '';
     upstreamWeightInput.value = u.weight != null ? String(u.weight) : '';
+    if (upstreamFormatInput) upstreamFormatInput.value = u.format || '';
+    if (upstreamProxyInput) upstreamProxyInput.value = u.proxy || '';
+  }
+
+  async function updateWeight(id, weight) {
+    const u = lastUpstreams.find(x => x.id === id);
+    if (!u || !Number.isInteger(weight) || weight <= 0) return;
+    const payload = { base_url: u.base_url, weight };
+    if (u.max_concurrent_per_key) payload.max_concurrent_per_key = u.max_concurrent_per_key;
+    if (u.format) payload.format = u.format;
+    if (u.proxy) payload.proxy = u.proxy;
+    const { res, text } = await apiFetch(`/admin/api/v1/upstreams/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      upstreamResult.textContent = `权重更新失败 ${res.status}\n${text || ''}`;
+      return;
+    }
+    await refreshUpstreams();
   }
 
   upstreamManageSelect.onchange = () => {
@@ -429,12 +569,16 @@
     const id = (upstreamIdInput.value || '').trim();
     const baseUrl = (upstreamBaseUrlInput.value || '').trim();
     const weightRaw = (upstreamWeightInput.value || '').trim();
+    const format = (upstreamFormatInput && upstreamFormatInput.value || '').trim();
+    const proxy = (upstreamProxyInput && upstreamProxyInput.value || '').trim();
     const weight = weightRaw ? parseInt(weightRaw, 10) : null;
     if (!id) return alert('请输入 upstream id');
     if (!baseUrl) return alert('请输入 base_url');
     upstreamResult.textContent = '提交中...';
     const payload = { id, base_url: baseUrl };
     if (Number.isInteger(weight) && weight > 0) payload.weight = weight;
+    if (format) payload.format = format;
+    if (proxy) payload.proxy = proxy;
     const { res, text } = await apiFetch('/admin/api/v1/upstreams', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -453,12 +597,16 @@
     const id = (upstreamIdInput.value || '').trim();
     const baseUrl = (upstreamBaseUrlInput.value || '').trim();
     const weightRaw = (upstreamWeightInput.value || '').trim();
+    const format = (upstreamFormatInput && upstreamFormatInput.value || '').trim();
+    const proxy = (upstreamProxyInput && upstreamProxyInput.value || '').trim();
     const weight = weightRaw ? parseInt(weightRaw, 10) : null;
     if (!id) return alert('请输入 upstream id');
     if (!baseUrl) return alert('请输入 base_url');
     upstreamResult.textContent = '提交中...';
     const payload = { base_url: baseUrl };
     if (Number.isInteger(weight) && weight > 0) payload.weight = weight;
+    if (format) payload.format = format;
+    if (proxy) payload.proxy = proxy;
     const { res, text } = await apiFetch(`/admin/api/v1/upstreams/${encodeURIComponent(id)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -490,6 +638,8 @@
     upstreamIdInput.value = '';
     upstreamBaseUrlInput.value = '';
     upstreamWeightInput.value = '';
+    if (upstreamFormatInput) upstreamFormatInput.value = '';
+    if (upstreamProxyInput) upstreamProxyInput.value = '';
     await refreshUpstreams();
     await loadRoutes();
   };
@@ -569,6 +719,20 @@
       routesInfo.textContent = `更新时间 ${new Date(json.updated_at_ms).toLocaleString()}`;
     }
   }
+
+  async function loadConfig() {
+    if (!configPreview) return;
+    configPreview.textContent = '加载中...';
+    const { res, json, text } = await apiFetch('/admin/api/v1/config');
+    if (!res.ok) {
+      configPreview.textContent = `失败 ${res.status}\n${text || ''}`;
+      return;
+    }
+    configPreview.textContent = JSON.stringify(json || {}, null, 2);
+    if (configInfo) configInfo.textContent = new Date().toLocaleTimeString();
+  }
+
+  if (loadConfigBtn) loadConfigBtn.onclick = loadConfig;
 
   function renderModelsList(models) {
     modelsList.innerHTML = '';
@@ -654,63 +818,62 @@
     return k.slice(0, 6) + '…' + k.slice(-4);
   }
 
-  function keyBanInfoHtml(info) {
-    if (!info) return '<span class="muted">-</span>';
-    const status = info.status || 0;
-    const reason = info.reason || 'ban';
-    const when = info.ts_ms ? new Date(info.ts_ms).toLocaleString() : '-';
-    const summary = status ? `HTTP ${status} ${reason}` : reason;
-    const detail = {
-      time: when,
-      status,
-      reason,
-      retry_after_ms: info.retry_after_ms || null,
-      cooldown_until: info.cooldown_until_ms ? new Date(info.cooldown_until_ms).toLocaleString() : null,
-      headers: info.headers || [],
-      body: info.body || '',
-      body_truncated: !!info.body_truncated
-    };
-    return `
-      <details>
-        <summary class="mono small">${escapeHtml(summary)}</summary>
-        <pre class="small" style="max-width: 680px; max-height: 220px;">${escapeHtml(JSON.stringify(detail, null, 2))}</pre>
-      </details>
-    `;
-  }
-
   function renderKeyStatus(list, offset) {
+    lastKeyStatusList = Array.isArray(list) ? list.slice() : [];
+    const q = (keySearchInput && keySearchInput.value || '').trim().toLowerCase();
+    const filter = (keyFilterSelect && keyFilterSelect.value) || 'all';
+    const sort = (keySortSelect && keySortSelect.value) || 'index';
+    list = lastKeyStatusList.filter(k => {
+      if (q && !(k.key || '').toLowerCase().includes(q)) return false;
+      if (filter === 'active' && k.status !== 'active') return false;
+      if (filter === 'invalid' && k.status !== 'invalid') return false;
+      if (filter === 'cooldown' && !(k.cooldown_until_ms && k.cooldown_until_ms > Date.now())) return false;
+      return true;
+    });
+    if (sort === 'failure_desc') {
+      list.sort((a, b) => (b.failure_count || 0) - (a.failure_count || 0));
+    } else if (sort === 'latency_desc') {
+      list.sort((a, b) => (b.latency_p90_ms || 0) - (a.latency_p90_ms || 0));
+    }
     keyStatusTableBody.innerHTML = '';
     list.forEach((k, i) => {
       const tr = document.createElement('tr');
-      const banned = k.status === 'banned' || (k.cooldown_remaining_ms || 0) > 0;
-      const statusClass = banned ? 'bad' : 'ok';
-      const remaining = (k.cooldown_remaining_ms || 0) > 0 ? formatDuration(k.cooldown_remaining_ms) : '-';
-      const banInfo = banned ? keyBanInfoHtml(k.last_ban) : '<span class="muted">-</span>';
+      const isInvalid = k.status === 'invalid';
+      const statusClass = isInvalid ? 'bad' : 'ok';
+      const lat = k.latency_p50_ms != null ? `${k.latency_p50_ms}/${k.latency_p90_ms || 0}/${k.latency_p99_ms || 0}` : '-';
       tr.innerHTML = `
         <td class="mono small">${offset + i + 1}</td>
         <td class="mono small" title="${escapeHtml(k.key)}">${escapeHtml(maskKey(k.key))}</td>
-        <td class="${statusClass}">${banned ? 'banned' : 'ok'}</td>
-        <td class="mono small">${remaining}</td>
-        <td class="mono small">${k.fail_streak || 0}</td>
-        <td class="small">${banInfo}</td>
+        <td class="${statusClass}">${isInvalid ? 'invalid' : 'active'}</td>
+        <td class="mono small">${k.failure_count || 0}</td>
+        <td class="mono small">${k.active_requests || 0}</td>
+        <td class="mono small">${lat}</td>
       `;
       const actionTd = document.createElement('td');
       const relBtn = document.createElement('button');
       relBtn.className = 'btn';
-      relBtn.textContent = '释放';
+      relBtn.textContent = '恢复';
       relBtn.dataset.key = k.key;
       relBtn.onclick = () => keyAction('release', [relBtn.dataset.key]);
       const banBtn = document.createElement('button');
       banBtn.className = 'btn';
-      banBtn.textContent = '封禁';
+      banBtn.textContent = '失效';
       banBtn.style.marginLeft = '6px';
       banBtn.dataset.key = k.key;
-      banBtn.onclick = () => keyAction('ban', [banBtn.dataset.key]);
+      banBtn.onclick = () => keyAction('invalidate', [banBtn.dataset.key]);
+      const testBtn = document.createElement('button');
+      testBtn.className = 'btn';
+      testBtn.textContent = '测试';
+      testBtn.style.marginLeft = '6px';
+      testBtn.dataset.key = k.key;
+      testBtn.onclick = () => testKey(testBtn.dataset.key);
       actionTd.appendChild(relBtn);
       actionTd.appendChild(banBtn);
+      actionTd.appendChild(testBtn);
       tr.appendChild(actionTd);
       keyStatusTableBody.appendChild(tr);
     });
+    renderKeyLatencyChart(list);
   }
 
   async function loadKeyStatus() {
@@ -746,12 +909,6 @@
     keyStatusPageInfo.textContent = keyStatusTotal > 0 ? `${keyStatusOffset + 1}–${end} / ${keyStatusTotal}` : '0 / 0';
   }
 
-  function banDurationBody(body) {
-    const d = banDurationSelect.value;
-    if (d) body.duration_ms = parseInt(d, 10);
-    return body;
-  }
-
   async function postKeyAction(action, body) {
     const upstream = keyStatusUpstreamSelect.value;
     if (!upstream) return alert('请选择 upstream');
@@ -773,24 +930,82 @@
   }
 
   async function keyAction(action, keys) {
-    const body = action === 'ban' ? banDurationBody({ keys }) : { keys };
+    const body = { keys };
     await postKeyAction(action, body);
+  }
+
+  async function testKey(key) {
+    const upstream = keyStatusUpstreamSelect.value;
+    if (!upstream) return alert('请选择 upstream');
+    keyStatusResult.textContent = '测试中...';
+    const { res, json, text } = await apiFetch(
+      `/admin/api/v1/upstreams/${encodeURIComponent(upstream)}/keys/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key })
+      });
+    if (!res.ok) {
+      keyStatusResult.textContent = `失败 ${res.status}\n${text || ''}`;
+      return;
+    }
+    keyStatusResult.textContent = JSON.stringify(json || {}, null, 2);
+  }
+
+  function renderKeyLatencyChart(list) {
+    if (!keyLatencyChartCanvas || typeof Chart === 'undefined') return;
+    const rows = (list || []).filter(k => k.latency_p90_ms != null).slice(0, 25);
+    const labels = rows.map(k => maskKey(k.key));
+    const data = rows.map(k => k.latency_p90_ms || 0);
+    if (keyLatencyChart) keyLatencyChart.destroy();
+    keyLatencyChart = new Chart(keyLatencyChartCanvas, {
+      type: 'bar',
+      data: { labels, datasets: [{ label: 'p90 ms', data, backgroundColor: '#1e6bd6' }] },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: { y: { beginAtZero: true } }
+      }
+    });
   }
 
   async function bulkKeyAction(action) {
     const upstream = keyStatusUpstreamSelect.value;
     if (!upstream) return alert('请选择 upstream');
-    const verb = action === 'ban' ? '封禁' : '释放';
+    const verb = action === 'invalidate' ? '失效' : '恢复';
     if (!confirm(`确认${verb} upstream "${upstream}" 的全部 keys?`)) return;
-    const body = action === 'ban' ? banDurationBody({ all: true }) : { all: true };
+    const body = { all: true };
     await postKeyAction(action, body);
   }
 
   if (loadKeyStatusBtn) loadKeyStatusBtn.onclick = () => { keyStatusOffset = 0; loadKeyStatus(); };
+  if (keySearchInput) keySearchInput.oninput = () => renderKeyStatus(lastKeyStatusList, keyStatusOffset);
+  if (keyFilterSelect) keyFilterSelect.onchange = () => renderKeyStatus(lastKeyStatusList, keyStatusOffset);
+  if (keySortSelect) keySortSelect.onchange = () => renderKeyStatus(lastKeyStatusList, keyStatusOffset);
   if (keyStatusUpstreamSelect) keyStatusUpstreamSelect.onchange = () => { keyStatusOffset = 0; loadKeyStatus(); };
   if (keyStatusPageSize) keyStatusPageSize.onchange = () => { keyStatusOffset = 0; loadKeyStatus(); };
   if (releaseAllKeysBtn) releaseAllKeysBtn.onclick = () => bulkKeyAction('release');
-  if (banAllKeysBtn) banAllKeysBtn.onclick = () => bulkKeyAction('ban');
+  if (banAllKeysBtn) banAllKeysBtn.onclick = () => bulkKeyAction('invalidate');
+  if (exportKeysBtn) exportKeysBtn.onclick = () => {
+    const upstream = keyStatusUpstreamSelect.value;
+    if (!upstream) return alert('请选择 upstream');
+    const exportToken = prompt('请输入导出密码（Export Token）:');
+    if (!exportToken) return;
+    const url = `/admin/api/v1/upstreams/${encodeURIComponent(upstream)}/keys/export`;
+    fetch(url, { headers: { 'X-Admin-Token': getToken(), 'X-Export-Token': exportToken } })
+      .then(resp => {
+        if (!resp.ok) return resp.json().then(d => { throw new Error(d.error?.message || resp.statusText); });
+        return resp.blob();
+      })
+      .then(blob => {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `${upstream}_keys_${Math.floor(Date.now()/1000)}.txt`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+      })
+      .catch(e => alert('导出失败: ' + e.message));
+  };
   if (keyStatusPrevBtn) keyStatusPrevBtn.onclick = () => {
     const limit = keyStatusPageSizeValue();
     keyStatusOffset = Math.max(0, keyStatusOffset - limit);
@@ -962,6 +1177,7 @@
     startStatsStream();
     refreshUpstreams();
     loadRoutes();
+    loadConfig();
     startRequestsAutoRefresh();
   } else {
     authStatus.textContent = '请输入并保存 admin token。';

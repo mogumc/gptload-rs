@@ -25,31 +25,62 @@ retry_status_codes = [429, 500, 502, 503, 504, 401, 403]
 # NOTE: If you expose this server publicly, set strong tokens.
 admin_tokens = ["admin-token-1"]
 
+# Separate token for sensitive operations (key export).
+# Clients must pass X-Export-Token header for export endpoints.
+export_token = "your-export-secret"
+
 # Where to store the embedded key database (sled). Will be created if missing.
 data_dir = "./data"
 
 # Enable stream usage injection for these upstream ids (adds stream_options.include_usage).
 # usage_inject_upstreams = ["openai"]
 
-[ban]
-# Base cooldowns (milliseconds). Exponential backoff is applied by fail streak.
-# - rate_limit_ms / auth_error_ms are applied at **key** level.
-# - server_error_ms / network_error_ms are applied at **upstream** level (circuit breaker).
-rate_limit_ms    = 30000     # HTTP 429
-server_error_ms  = 5000      # HTTP 5xx
-network_error_ms = 5000      # connect/reset/timeout
-auth_error_ms    = 86400000  # HTTP 401/403 (usually bad/expired key)
+[server]
+# Wait for inflight requests after SIGINT/SIGTERM.
+graceful_shutdown_timeout_secs = 30
 
-# Maximum exponent for backoff doubling. 0 = no backoff, 6 = up to 64x.
-max_backoff_pow = 7
+# Browser CORS allow-list. ["*"] allows every Origin.
+cors_origins = ["*"]
+
+# Queue requests instead of returning 503 when keys are busy or cooling down.
+queue_enabled = false
+queue_max_depth = 100
+queue_timeout_ms = 10000
+
+[key]
+# Number of auth failures (401/403) before a key is auto-invalidated.
+# 0 = disabled (keys are never auto-blacklisted).
+blacklist_threshold = 3
+
+# Max concurrent requests per key. Keys at this limit are skipped during selection.
+# Prevents upstream 429 from concurrent overload. 0 = no limit.
+max_concurrent_per_key = 5
+
+# Default cooldown after 429 when Retry-After is absent.
+rate_limit_cooldown_ms = 3000
+
+# Upper bound for Retry-After cooldown.
+max_rate_limit_cooldown_ms = 30000
+
+# How often (seconds) to re-validate invalid keys for automatic recovery.
+revalidation_interval_secs = 300
+
+# Timeout (seconds) for each re-validation request.
+revalidation_timeout_secs = 20
 
 [[upstreams]]
 id = "openai"
 base_url = "https://api.openai.com"
 weight = 1
+format = "openai"
+# proxy = "socks5://127.0.0.1:1080"
+# Per-upstream override for max concurrent requests per key.
+# Overrides the global [key].max_concurrent_per_key default.
+# max_concurrent_per_key = 5
 
 # Example: second upstream (OpenAI-compatible) weighted 2x
 [[upstreams]]
 id = "alt"
 base_url = "https://your-openai-compatible-upstream.example.com"
 weight = 2
+# max_concurrent_per_key = 10

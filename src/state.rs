@@ -1,10 +1,11 @@
 use crate::billing::BillingStore;
-use crate::config::{BanConfig, Config, UpstreamConfig};
+use crate::config::{Config, KeyConfig, ServerConfig, UpstreamConfig, UpstreamFormat};
 use crate::storage::KeyStore;
+use crate::upstream_client::UpstreamClient;
 use crate::util::now_ms;
 use ahash::{AHashMap, AHashSet};
 use arc_swap::ArcSwap;
-use http::uri::{Authority, PathAndQuery, Scheme};
+use http::uri::{Authority, Scheme};
 use hyper::client::HttpConnector;
 use hyper::header::{
     HeaderName, CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER,
@@ -15,22 +16,25 @@ use hyper_rustls::HttpsConnectorBuilder;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc, Notify, Semaphore, SemaphorePermit};
 
 pub const HDR_AUTHORIZATION: HeaderName = hyper::header::AUTHORIZATION;
 
 pub struct RouterState {
+    pub runtime: ArcSwap<RuntimeConfig>,
+
     pub request_timeout: Duration,
     pub max_retries: usize,
     pub retry_status_codes: Arc<AHashSet<u16>>,
-    pub ban: BanConfig,
+    pub key_config: KeyConfig,
 
     pub proxy_tokens: Option<Arc<AHashSet<String>>>,
     pub admin_tokens: Arc<AHashSet<String>>,
+    pub export_token: Option<String>,
     pub usage_inject_upstreams: Option<Arc<AHashSet<String>>>,
 
     pub store: Arc<KeyStore>,
@@ -46,6 +50,38 @@ pub struct RouterState {
     pub stats: Arc<Stats>,
     pub requests: Arc<RequestsLog>,
     pub admin_write_lock: Arc<Mutex<()>>,
+    pub shutting_down: AtomicBool,
+    pub queue_notify: Notify,
+    pub queue_slots: Semaphore,
+    pub config_path: Option<PathBuf>,
+    pub listen_addr: String,
+    pub worker_threads: Option<usize>,
+    pub data_dir: PathBuf,
+}
+
+#[derive(Clone)]
+pub struct RuntimeConfig {
+    pub request_timeout: Duration,
+    pub max_retries: usize,
+    pub retry_status_codes: Arc<AHashSet<u16>>,
+    pub key_config: KeyConfig,
+    pub proxy_tokens: Option<Arc<AHashSet<String>>>,
+    pub admin_tokens: Arc<AHashSet<String>>,
+    pub export_token: Option<String>,
+    pub usage_inject_upstreams: Option<Arc<AHashSet<String>>>,
+    pub server: ServerConfig,
+    pub preview: serde_json::Value,
+}
+
+pub struct QueueGuard<'a> {
+    state: &'a RouterState,
+    _permit: SemaphorePermit<'a>,
+}
+
+impl Drop for QueueGuard<'_> {
+    fn drop(&mut self) {
+        self.state.stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 pub struct RouterSnapshot {
@@ -58,23 +94,34 @@ pub struct RouterSnapshot {
 impl Clone for RouterState {
     fn clone(&self) -> Self {
         RouterState {
+            runtime: ArcSwap::from(self.runtime.load_full()),
             request_timeout: self.request_timeout,
             max_retries: self.max_retries,
             retry_status_codes: self.retry_status_codes.clone(),
-            ban: self.ban.clone(),
+            key_config: self.key_config.clone(),
             proxy_tokens: self.proxy_tokens.clone(),
             admin_tokens: self.admin_tokens.clone(),
+            export_token: self.export_token.clone(),
             usage_inject_upstreams: self.usage_inject_upstreams.clone(),
             store: self.store.clone(),
             billing: self.billing.clone(),
             model_routes_path: self.model_routes_path.clone(),
             upstreams_path: self.upstreams_path.clone(),
             snapshot: ArcSwap::from(self.snapshot.load_full()),
-            sched_rr: Arc::new(AtomicUsize::new(self.sched_rr.load(std::sync::atomic::Ordering::Relaxed))),
+            sched_rr: Arc::new(AtomicUsize::new(
+                self.sched_rr.load(std::sync::atomic::Ordering::Relaxed),
+            )),
             client: self.client.clone(),
             stats: self.stats.clone(),
             requests: self.requests.clone(),
             admin_write_lock: self.admin_write_lock.clone(),
+            shutting_down: AtomicBool::new(self.shutting_down.load(Ordering::Relaxed)),
+            queue_notify: Notify::new(),
+            queue_slots: Semaphore::new(self.server_config().queue_max_depth),
+            config_path: self.config_path.clone(),
+            listen_addr: self.listen_addr.clone(),
+            worker_threads: self.worker_threads,
+            data_dir: self.data_dir.clone(),
         }
     }
 }
@@ -88,50 +135,33 @@ pub struct Upstream {
     pub base_path: Arc<str>,
 
     pub weight: usize,
+    pub max_concurrent_per_key: u32,
+    pub format: UpstreamFormat,
+    pub proxy: Option<String>,
+    pub client: UpstreamClient,
 
     pub keys: ArcSwap<Vec<Arc<KeyState>>>,
+    pub active_keys: ArcSwap<Vec<Arc<KeyState>>>,
     pub keys_update_lock: Mutex<()>,
     pub key_rr: AtomicUsize,
     pub models: ArcSwap<AHashSet<String>>,
 
-    // Upstream-level circuit breaker (network/5xx).
-    pub cooldown_until_ms: AtomicU64,
-    pub fail_streak: AtomicU32,
-
     pub stats: UpstreamStats,
 }
+
+/// Key status: active (in the rotation pool) or invalid (blacklisted).
+pub const KEY_STATUS_ACTIVE: u8 = 0;
+pub const KEY_STATUS_INVALID: u8 = 1;
 
 pub struct KeyState {
     pub key: Arc<str>,
     pub auth_header: hyper::header::HeaderValue,
+    pub failure_count: AtomicU32,
+    pub status: AtomicU8,
+    pub active_requests: AtomicU32,
+    /// Unix ms timestamp when the 429 cooldown expires. 0 = not in cooldown.
     pub cooldown_until_ms: AtomicU64,
-    pub fail_streak: AtomicU32,
-    pub last_ban: Mutex<Option<KeyBanInfo>>,
-}
-
-#[derive(Clone, serde::Serialize)]
-pub struct KeyBanHeader {
-    pub name: String,
-    pub value: String,
-}
-
-#[derive(Clone, serde::Serialize)]
-pub struct KeyBanInfo {
-    pub ts_ms: u64,
-    pub status: u16,
-    pub reason: String,
-    pub retry_after_ms: Option<u64>,
-    pub cooldown_until_ms: u64,
-    pub headers: Vec<KeyBanHeader>,
-    pub body: String,
-    pub body_truncated: bool,
-}
-
-#[derive(Clone)]
-pub struct KeyBanEvent {
-    pub key: Arc<KeyState>,
-    pub ts_ms: u64,
-    pub cooldown_until_ms: u64,
+    pub latencies_ms: Mutex<VecDeque<u64>>,
 }
 
 #[derive(Clone)]
@@ -156,6 +186,9 @@ pub struct Stats {
 
     pub errors_timeout: AtomicU64,
     pub errors_network: AtomicU64,
+
+    pub queue_depth: AtomicU64,
+    pub queue_timeout_total: AtomicU64,
 
     pub latency_ns_total: AtomicU64,
     pub latency_count: AtomicU64,
@@ -200,6 +233,8 @@ impl Stats {
             responses_5xx: AtomicU64::new(0),
             errors_timeout: AtomicU64::new(0),
             errors_network: AtomicU64::new(0),
+            queue_depth: AtomicU64::new(0),
+            queue_timeout_total: AtomicU64::new(0),
             latency_ns_total: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             latency_ns_max: AtomicU64::new(0),
@@ -209,6 +244,7 @@ impl Stats {
 
 #[derive(Clone, serde::Serialize)]
 pub struct RequestLogEntry {
+    pub id: u64,
     pub ts_ms: u64,
     pub client_ip: String,
     pub method: String,
@@ -222,6 +258,17 @@ pub struct RequestLogEntry {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    pub request_headers: Option<BTreeMap<String, String>>,
+    pub request_body: Option<String>,
+    pub timing: RequestTiming,
+}
+
+#[derive(Clone, Default, serde::Serialize)]
+pub struct RequestTiming {
+    pub queue_ms: u64,
+    pub upstream_ms: u64,
+    pub total_ms: u64,
+    pub attempts: u32,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -263,19 +310,23 @@ pub struct RequestsLog {
     metrics: Mutex<RequestMetrics>,
     cap: usize,
     tx: Option<mpsc::Sender<RequestLogEntry>>,
+    broadcast_tx: broadcast::Sender<RequestLogEntry>,
 }
 
 impl RequestsLog {
     pub fn new(cap: usize, tx: Option<mpsc::Sender<RequestLogEntry>>) -> Self {
+        let (broadcast_tx, _rx) = broadcast::channel(1024);
         Self {
             entries: Mutex::new(VecDeque::with_capacity(cap)),
             metrics: Mutex::new(RequestMetrics::new()),
             cap,
             tx,
+            broadcast_tx,
         }
     }
 
     pub fn record(&self, entry: RequestLogEntry) {
+        let _ = self.broadcast_tx.send(entry.clone());
         if let Some(tx) = &self.tx {
             let _ = tx.try_send(entry.clone());
         }
@@ -303,6 +354,10 @@ impl RequestsLog {
         let metrics = self.metrics.lock().unwrap();
         metrics.snapshot(window)
     }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<RequestLogEntry> {
+        self.broadcast_tx.subscribe()
+    }
 }
 
 pub struct RequestMetrics {
@@ -324,9 +379,33 @@ impl RequestMetrics {
         let (success, failure, ignored) = classify_status(entry.status);
         let ts_ms = entry.ts_ms;
 
-        update_bucket(&mut self.minute, ts_ms, 60_000, 60, success, failure, ignored);
-        update_bucket(&mut self.hour, ts_ms, 3_600_000, 48, success, failure, ignored);
-        update_bucket(&mut self.day, ts_ms, 86_400_000, 30, success, failure, ignored);
+        update_bucket(
+            &mut self.minute,
+            ts_ms,
+            60_000,
+            60,
+            success,
+            failure,
+            ignored,
+        );
+        update_bucket(
+            &mut self.hour,
+            ts_ms,
+            3_600_000,
+            48,
+            success,
+            failure,
+            ignored,
+        );
+        update_bucket(
+            &mut self.day,
+            ts_ms,
+            86_400_000,
+            30,
+            success,
+            failure,
+            ignored,
+        );
     }
 
     pub fn snapshot(&self, window: MetricsWindow) -> Vec<MetricsBucket> {
@@ -338,14 +417,16 @@ impl RequestMetrics {
     }
 }
 
-impl RouterState {
-    pub fn new(cfg: Config) -> anyhow::Result<Self> {
-        let request_timeout = Duration::from_millis(cfg.request_timeout_ms);
-        let max_retries = cfg.max_retries.unwrap_or(5);
-        let retry_status_codes = cfg.retry_status_codes.unwrap_or_else(|| vec![429]);
-        let retry_status_codes = Arc::new(retry_status_codes.into_iter().collect::<AHashSet<u16>>());
+impl RuntimeConfig {
+    pub fn from_config(cfg: &Config) -> Self {
+        let retry_status_codes = cfg
+            .retry_status_codes
+            .clone()
+            .unwrap_or_else(|| vec![429])
+            .into_iter()
+            .collect::<AHashSet<u16>>();
 
-        let proxy_tokens = cfg.proxy_tokens.and_then(|v| {
+        let proxy_tokens = cfg.proxy_tokens.clone().and_then(|v| {
             let mut set = AHashSet::with_capacity(v.len().max(1));
             for t in v {
                 let t = t.trim();
@@ -361,14 +442,13 @@ impl RouterState {
         });
 
         let mut admin_set = AHashSet::with_capacity(cfg.admin_tokens.len().max(1));
-        for t in cfg.admin_tokens {
+        for t in cfg.admin_tokens.iter() {
             if !t.is_empty() {
-                admin_set.insert(t);
+                admin_set.insert(t.clone());
             }
         }
-        let admin_tokens = Arc::new(admin_set);
 
-        let usage_inject_upstreams = cfg.usage_inject_upstreams.and_then(|v| {
+        let usage_inject_upstreams = cfg.usage_inject_upstreams.clone().and_then(|v| {
             let mut set = AHashSet::with_capacity(v.len().max(1));
             for id in v {
                 let id = id.trim();
@@ -383,8 +463,34 @@ impl RouterState {
             }
         });
 
+        Self {
+            request_timeout: Duration::from_millis(cfg.request_timeout_ms),
+            max_retries: cfg.max_retries.unwrap_or(5),
+            retry_status_codes: Arc::new(retry_status_codes),
+            key_config: cfg.key.clone(),
+            proxy_tokens,
+            admin_tokens: Arc::new(admin_set),
+            export_token: cfg.export_token.clone(),
+            usage_inject_upstreams,
+            server: cfg.server.clone(),
+            preview: config_preview(cfg),
+        }
+    }
+}
+
+impl RouterState {
+    pub fn new(cfg: Config, config_path: Option<PathBuf>) -> anyhow::Result<Self> {
+        let runtime = Arc::new(RuntimeConfig::from_config(&cfg));
+        let queue_max_depth = runtime.server.queue_max_depth;
+        let request_timeout = runtime.request_timeout;
+        let max_retries = runtime.max_retries;
+        let retry_status_codes = runtime.retry_status_codes.clone();
+        let proxy_tokens = runtime.proxy_tokens.clone();
+        let admin_tokens = runtime.admin_tokens.clone();
+        let usage_inject_upstreams = runtime.usage_inject_upstreams.clone();
+
         // Storage
-        let data_dir: PathBuf = cfg.data_dir;
+        let data_dir: PathBuf = cfg.data_dir.clone();
         let store = Arc::new(KeyStore::open(&data_dir)?);
         let billing = Arc::new(BillingStore::new(&store)?);
         let model_routes_path = data_dir.join("models_routes.json");
@@ -393,7 +499,7 @@ impl RouterState {
         let log_tx = start_request_log_writer(requests_log_path);
         let requests = Arc::new(RequestsLog::new(5000, log_tx));
 
-        let mut upstream_configs = cfg.upstreams;
+        let mut upstream_configs = cfg.upstreams.clone();
         if let Ok(list) = load_upstreams_override(&upstreams_path) {
             upstream_configs = list;
         } else if upstreams_path.exists() {
@@ -427,12 +533,14 @@ impl RouterState {
         }
 
         Ok(Self {
+            runtime: ArcSwap::from(runtime),
             request_timeout,
             max_retries,
             retry_status_codes,
-            ban: cfg.ban,
+            key_config: cfg.key.clone(),
             proxy_tokens,
             admin_tokens,
+            export_token: cfg.export_token.clone(),
             usage_inject_upstreams,
             store,
             billing,
@@ -444,12 +552,20 @@ impl RouterState {
             stats: Arc::new(Stats::new()),
             requests,
             admin_write_lock: Arc::new(Mutex::new(())),
+            shutting_down: AtomicBool::new(false),
+            queue_notify: Notify::new(),
+            queue_slots: Semaphore::new(queue_max_depth),
+            config_path,
+            listen_addr: cfg.listen_addr.clone(),
+            worker_threads: cfg.worker_threads,
+            data_dir,
         })
     }
 
     #[inline]
     pub fn authorize_proxy(&self, req: &Request<Body>) -> bool {
-        let Some(tokens) = &self.proxy_tokens else {
+        let rt = self.runtime.load();
+        let Some(tokens) = &rt.proxy_tokens else {
             return true;
         };
         let Some(h) = req.headers().get("x-proxy-token") else {
@@ -467,19 +583,16 @@ impl RouterState {
             return false;
         };
         match h.to_str() {
-            Ok(s) => self.admin_tokens.contains(s),
+            Ok(s) => self.runtime.load().admin_tokens.contains(s),
             Err(_) => false,
         }
     }
 
     #[inline]
-    pub fn authorize_admin_token_str(&self, token: &str) -> bool {
-        self.admin_tokens.contains(token)
-    }
-
-    #[inline]
     pub fn should_inject_usage(&self, upstream_id: &str) -> bool {
-        self.usage_inject_upstreams
+        self.runtime
+            .load()
+            .usage_inject_upstreams
             .as_ref()
             .map(|set| set.contains(upstream_id))
             .unwrap_or(false)
@@ -487,11 +600,15 @@ impl RouterState {
 
     #[inline]
     pub fn should_retry_status(&self, status: http::StatusCode) -> bool {
-        self.retry_status_codes.contains(&status.as_u16())
+        self.runtime
+            .load()
+            .retry_status_codes
+            .contains(&status.as_u16())
     }
 
     pub fn retry_status_codes_sorted(&self) -> Vec<u16> {
-        let mut v: Vec<u16> = self.retry_status_codes.iter().copied().collect();
+        let rt = self.runtime.load();
+        let mut v: Vec<u16> = rt.retry_status_codes.iter().copied().collect();
         v.sort_unstable();
         v
     }
@@ -505,8 +622,58 @@ impl RouterState {
         self.requests.recent(limit)
     }
 
+    pub fn subscribe_requests(&self) -> broadcast::Receiver<RequestLogEntry> {
+        self.requests.subscribe()
+    }
+
     pub fn metrics_snapshot(&self, window: MetricsWindow) -> Vec<MetricsBucket> {
         self.requests.metrics_snapshot(window)
+    }
+
+    pub fn server_config(&self) -> ServerConfig {
+        self.runtime.load().server.clone()
+    }
+
+    pub fn request_timeout(&self) -> Duration {
+        self.runtime.load().request_timeout
+    }
+
+    pub fn max_retries(&self) -> usize {
+        self.runtime.load().max_retries
+    }
+
+    pub fn key_config(&self) -> KeyConfig {
+        self.runtime.load().key_config.clone()
+    }
+
+    pub fn export_token(&self) -> Option<String> {
+        self.runtime.load().export_token.clone()
+    }
+
+    pub fn config_preview(&self) -> serde_json::Value {
+        self.runtime.load().preview.clone()
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Relaxed)
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Relaxed);
+        self.queue_notify.notify_waiters();
+    }
+
+    pub fn notify_capacity(&self) {
+        self.queue_notify.notify_one();
+    }
+
+    pub fn queue_enter(&self) -> Option<QueueGuard<'_>> {
+        let permit = self.queue_slots.try_acquire().ok()?;
+        self.stats.queue_depth.fetch_add(1, Ordering::Relaxed);
+        Some(QueueGuard {
+            state: self,
+            _permit: permit,
+        })
     }
 
     pub fn upstream_by_id(&self, id: &str) -> Option<(usize, Arc<Upstream>)> {
@@ -515,27 +682,40 @@ impl RouterState {
         Some((idx, snap.upstreams[idx].clone()))
     }
 
-    /// Select an upstream + key. Returns None if **all** keys are in cooldown or no keys loaded.
-    pub fn select(&self, now_ms: u64) -> Option<Selected> {
+    /// Select an upstream + key that supports the given model.
+    /// Returns None only if no upstream has active keys for the model.
+    pub fn select_for_model(&self, model: &str, _now_ms: u64) -> Option<Selected> {
+        if self.is_shutting_down() {
+            return None;
+        }
         let snap = self.snapshot.load_full();
         let sched_len = snap.schedule.len();
         if sched_len == 0 {
             return None;
         }
 
-        // Try up to schedule length to find an upstream with any available key.
+        let global_max = self.key_config().max_concurrent_per_key;
+
         for _ in 0..sched_len {
             let rr = self.sched_rr.as_ref().fetch_add(1, Ordering::Relaxed);
             let u_idx = snap.schedule[rr % sched_len];
-
             let u = &snap.upstreams[u_idx];
 
-            let u_until = u.cooldown_until_ms.load(Ordering::Relaxed);
-            if u_until > now_ms {
+            if !u.models.load().contains(model) {
                 continue;
             }
-            if let Some(k) = u.select_key(now_ms) {
-                self.stats.upstream_selected_total.fetch_add(1, Ordering::Relaxed);
+
+            // Per-upstream override, fallback to global default.
+            let max = if u.max_concurrent_per_key > 0 {
+                u.max_concurrent_per_key
+            } else {
+                global_max
+            };
+
+            if let Some(k) = u.select_key(max) {
+                self.stats
+                    .upstream_selected_total
+                    .fetch_add(1, Ordering::Relaxed);
                 u.stats.selected_total.fetch_add(1, Ordering::Relaxed);
                 return Some(Selected {
                     upstream: u.clone(),
@@ -547,79 +727,11 @@ impl RouterState {
         None
     }
 
-    /// Select an upstream + key that supports the given model.
-    /// Falls back to the least-cooldown'd upstream/key when all are in cooldown.
-    pub fn select_for_model(&self, model: &str, now_ms: u64) -> Option<Selected> {
-        let snap = self.snapshot.load_full();
-        let sched_len = snap.schedule.len();
-        if sched_len == 0 {
-            return None;
-        }
-
-        // Track the best fallback when all options are in cooldown.
-        let mut fallback: Option<(u64, Selected)> = None;
-
-        for _ in 0..sched_len {
-            let rr = self.sched_rr.as_ref().fetch_add(1, Ordering::Relaxed);
-            let u_idx = snap.schedule[rr % sched_len];
-            let u = &snap.upstreams[u_idx];
-
-            if !u.models.load().contains(model) {
-                continue;
-            }
-
-            let u_until = u.cooldown_until_ms.load(Ordering::Relaxed);
-            if u_until > now_ms {
-                // Upstream is in cooldown — track as fallback.
-                if let Some(k) = u.select_key(now_ms) {
-                    let worst = u_until.max(
-                        k.cooldown_until_ms.load(Ordering::Relaxed),
-                    );
-                    match fallback {
-                        Some((best, _)) if worst >= best => {}
-                        _ => fallback = Some((worst, Selected {
-                            upstream: u.clone(),
-                            key: k,
-                        })),
-                    }
-                }
-                continue;
-            }
-
-            // Upstream is healthy.
-            if let Some(k) = u.select_key(now_ms) {
-                let k_until = k.cooldown_until_ms.load(Ordering::Relaxed);
-                if k_until <= now_ms {
-                    // Key is healthy — use it immediately.
-                    self.stats.upstream_selected_total.fetch_add(1, Ordering::Relaxed);
-                    u.stats.selected_total.fetch_add(1, Ordering::Relaxed);
-                    return Some(Selected {
-                        upstream: u.clone(),
-                        key: k,
-                    });
-                }
-                // All keys are banned — track as fallback.
-                match fallback {
-                    Some((best, _)) if k_until >= best => {}
-                    _ => fallback = Some((k_until, Selected {
-                        upstream: u.clone(),
-                        key: k,
-                    })),
-                }
-            }
-        }
-
-        // All upstreams/keys are in cooldown — use the best fallback.
-        fallback.map(|(_, sel)| {
-            self.stats.upstream_selected_total.fetch_add(1, Ordering::Relaxed);
-            sel.upstream.stats.selected_total.fetch_add(1, Ordering::Relaxed);
-            sel
-        })
-    }
-
     pub fn model_exists(&self, model: &str) -> bool {
         let snap = self.snapshot.load_full();
-        snap.upstreams.iter().any(|u| u.models.load().contains(model))
+        snap.upstreams
+            .iter()
+            .any(|u| u.models.load().contains(model))
     }
 
     pub fn any_models_loaded(&self) -> bool {
@@ -693,99 +805,79 @@ impl RouterState {
         upstream.models.store(Arc::new(models));
         Ok(count)
     }
+    /// Handle an upstream response status. Only auth errors (401/403) count as
+    /// key failures. 429 (rate limit) sets a short cooldown on the key.
     #[inline]
     pub fn on_upstream_status(
         &self,
         sel: &Selected,
         status: http::StatusCode,
         retry_after_ms: Option<u64>,
-        now_ms: u64,
-        headers: Option<&hyper::HeaderMap>,
-    ) -> Option<KeyBanEvent> {
+    ) {
         let u = &sel.upstream;
 
-        // Upstream per-status stats
         inc_status(&u.stats, status);
-
-        // Global per-status stats
         self.inc_global_status(status);
 
-        // Clear upstream cooldown and streak — but for key-level errors (429/401/403)
-        // only clear if the cooldown has already expired. A 429 is a valid response
-        // (upstream is reachable), so an expired cooldown should be cleared. But an
-        // *active* cooldown should be preserved: a concurrent request may have just
-        // set a 5xx cooldown, and clearing it here would erase that.
-        let is_key_error = matches!(
-            status,
-            http::StatusCode::TOO_MANY_REQUESTS
-                | http::StatusCode::UNAUTHORIZED
-                | http::StatusCode::FORBIDDEN,
-        );
-        if !is_key_error || u.cooldown_until_ms.load(Ordering::Relaxed) <= now_ms {
-            u.fail_streak.store(0, Ordering::Relaxed);
-            u.cooldown_until_ms.store(0, Ordering::Relaxed);
-        }
-
-        if status == http::StatusCode::TOO_MANY_REQUESTS {
-            // Key-level rate limit. Honor the upstream's Retry-After when present
-            // (clamped to a sane ceiling); otherwise fall back to exponential backoff.
-            let until = match retry_after_ms {
-                Some(ms) if ms > 0 => {
-                    self.ban_key_for(&sel.key, ms.min(self.rate_limit_ceiling_ms()), now_ms)
-                }
-                _ => self.ban_key(&sel.key, self.ban.rate_limit_ms, now_ms),
-            };
-            return Some(record_key_ban_info(
-                &sel.key,
-                status,
-                "rate_limit",
-                retry_after_ms,
-                now_ms,
-                until,
-                headers,
-            ));
-        } else if status == http::StatusCode::UNAUTHORIZED || status == http::StatusCode::FORBIDDEN {
-            // Key invalid / forbidden.
-            let until = self.ban_key(&sel.key, self.ban.auth_error_ms, now_ms);
-            return Some(record_key_ban_info(
-                &sel.key,
-                status,
-                "auth_error",
-                retry_after_ms,
-                now_ms,
-                until,
-                headers,
-            ));
-        } else if status.is_server_error() {
-            // Upstream 5xx: prefer upstream cooldown, not key cooldown.
-            self.ban_upstream(u, self.ban.server_error_ms, now_ms);
-        } else {
-            // Success or other 4xx: reset key streak only if the key is no longer
-            // in cooldown. A concurrent request may have just banned this key;
-            // blindly clearing would erase that ban info.
-            let cd = sel.key.cooldown_until_ms.load(Ordering::Relaxed);
-            if cd <= now_ms {
-                sel.key.fail_streak.store(0, Ordering::Relaxed);
-                sel.key.clear_last_ban_info();
+        // Only count auth errors as key failures (matches gpt-load behaviour).
+        if status == http::StatusCode::UNAUTHORIZED || status == http::StatusCode::FORBIDDEN {
+            self.handle_auth_failure(sel);
+        } else if status == http::StatusCode::TOO_MANY_REQUESTS {
+            let key_cfg = self.key_config();
+            let configured = key_cfg.rate_limit_cooldown_ms;
+            let cooldown_ms = retry_after_ms
+                .or(if configured > 0 {
+                    Some(configured)
+                } else {
+                    None
+                })
+                .unwrap_or(3000)
+                .min(key_cfg.max_rate_limit_cooldown_ms.max(1));
+            if cooldown_ms > 0 {
+                let until = now_ms() + cooldown_ms;
+                sel.key.cooldown_until_ms.store(until, Ordering::Relaxed);
             }
         }
-        None
+    }
+
+    /// Increment failure count; if threshold reached, mark key invalid and
+    /// remove it from the upstream's active pool.
+    fn handle_auth_failure(&self, sel: &Selected) {
+        let threshold = self.key_config().blacklist_threshold;
+        if threshold == 0 {
+            return; // auto-blacklist disabled
+        }
+
+        let key = &sel.key;
+        let new_count = key.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if new_count >= threshold {
+            key.status.store(KEY_STATUS_INVALID, Ordering::Relaxed);
+            sel.upstream.rebuild_active_keys();
+            tracing::info!(
+                key = %key.key,
+                upstream = %sel.upstream.id,
+                failures = new_count,
+                "key blacklisted after auth failures"
+            );
+        }
     }
 
     #[inline]
-    pub fn on_timeout(&self, sel: &Selected, now_ms: u64) {
-        let u = &sel.upstream;
+    pub fn on_timeout(&self, sel: &Selected, _now_ms: u64) {
         self.stats.errors_timeout.fetch_add(1, Ordering::Relaxed);
-        u.stats.errors_timeout.fetch_add(1, Ordering::Relaxed);
-        self.ban_upstream(u, self.ban.network_error_ms, now_ms);
+        sel.upstream
+            .stats
+            .errors_timeout
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
-    pub fn on_network_error(&self, sel: &Selected, now_ms: u64) {
-        let u = &sel.upstream;
+    pub fn on_network_error(&self, sel: &Selected, _now_ms: u64) {
         self.stats.errors_network.fetch_add(1, Ordering::Relaxed);
-        u.stats.errors_network.fetch_add(1, Ordering::Relaxed);
-        self.ban_upstream(u, self.ban.network_error_ms, now_ms);
+        sel.upstream
+            .stats
+            .errors_network
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -801,51 +893,10 @@ impl RouterState {
         }
     }
 
-    fn ban_key(&self, key: &KeyState, base_ms: u64, now_ms: u64) -> u64 {
-        let streak = key.fail_streak.fetch_add(1, Ordering::Relaxed) + 1;
-        let max_pow = self.ban.max_backoff_pow.min(30);
-        let pow = (streak - 1).min(max_pow);
-        let mult = 1u64 << pow;
-
-        let ban_ms = base_ms.saturating_mul(mult);
-        let until = now_ms.saturating_add(ban_ms);
-
-        key.cooldown_until_ms.store(until, Ordering::Relaxed);
-        until
-    }
-
-    /// Ban a key for an explicit cooldown (used when honoring `Retry-After`).
-    /// Still bumps the fail streak so a later header-less 429 backs off further.
-    fn ban_key_for(&self, key: &KeyState, cooldown_ms: u64, now_ms: u64) -> u64 {
-        key.fail_streak.fetch_add(1, Ordering::Relaxed);
-        let until = now_ms.saturating_add(cooldown_ms);
-        key.cooldown_until_ms.store(until, Ordering::Relaxed);
-        until
-    }
-
-    /// Upper bound for a key cooldown: the most the exponential backoff could
-    /// ever produce (`rate_limit_ms << max_backoff_pow`). Caps a hostile or
-    /// oversized `Retry-After` so one response can't sideline a key for days.
-    #[inline]
-    fn rate_limit_ceiling_ms(&self) -> u64 {
-        let max_pow = self.ban.max_backoff_pow.min(30);
-        self.ban.rate_limit_ms.saturating_mul(1u64 << max_pow)
-    }
-
-    fn ban_upstream(&self, u: &Upstream, base_ms: u64, now_ms: u64) {
-        let streak = u.fail_streak.fetch_add(1, Ordering::Relaxed) + 1;
-        let max_pow = self.ban.max_backoff_pow.min(30);
-        let pow = (streak - 1).min(max_pow);
-        let mult = 1u64 << pow;
-
-        let ban_ms = base_ms.saturating_mul(mult);
-        let until = now_ms.saturating_add(ban_ms);
-
-        u.cooldown_until_ms.store(until, Ordering::Relaxed);
-    }
-
     pub fn record_latency(&self, latency_ns: u64) {
-        self.stats.latency_ns_total.fetch_add(latency_ns, Ordering::Relaxed);
+        self.stats
+            .latency_ns_total
+            .fetch_add(latency_ns, Ordering::Relaxed);
         self.stats.latency_count.fetch_add(1, Ordering::Relaxed);
 
         // Update max with CAS loop.
@@ -876,120 +927,251 @@ impl RouterState {
             .body(Body::from(body))
             .unwrap_or_else(|_| Response::new(Body::from("proxy_error")))
     }
+
+    /// Spawn a background task that periodically re-validates invalid keys.
+    /// Invalid keys are tested against their upstream; if the upstream responds
+    /// with anything other than 401/403, the key is restored to active.
+    pub fn start_revalidation(self: &Arc<RouterState>) {
+        let state = Arc::clone(self);
+
+        tokio::spawn(async move {
+            // Wait a bit before first run to let the system stabilise.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            loop {
+                let key_cfg = state.key_config();
+                let interval_secs = key_cfg.revalidation_interval_secs.max(60);
+                let timeout_secs = key_cfg.revalidation_timeout_secs.max(5);
+                tracing::debug!("revalidation: checking invalid keys...");
+                let start = now_ms();
+
+                let snap = state.snapshot.load_full();
+                let mut total_checked = 0u32;
+                let mut total_restored = 0u32;
+
+                for upstream in snap.upstreams.iter() {
+                    let invalid_keys: Vec<Arc<KeyState>> = upstream
+                        .keys
+                        .load_full()
+                        .iter()
+                        .filter(|k| !k.is_active())
+                        .cloned()
+                        .collect();
+
+                    if invalid_keys.is_empty() {
+                        continue;
+                    }
+
+                    for key in invalid_keys {
+                        total_checked += 1;
+                        match validate_key(upstream, &key, Duration::from_secs(timeout_secs)).await
+                        {
+                            Ok(true) => {
+                                key.failure_count.store(0, Ordering::Relaxed);
+                                key.status.store(KEY_STATUS_ACTIVE, Ordering::Relaxed);
+                                upstream.rebuild_active_keys();
+                                total_restored += 1;
+                                tracing::info!(
+                                    key = %key.key,
+                                    upstream = %upstream.id,
+                                    "revalidation: key restored"
+                                );
+                            }
+                            Ok(false) => {
+                                tracing::debug!(
+                                    key = %key.key,
+                                    upstream = %upstream.id,
+                                    "revalidation: key still invalid"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    key = %key.key,
+                                    upstream = %upstream.id,
+                                    error = %e,
+                                    "revalidation: request failed"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let elapsed_ms = now_ms().saturating_sub(start);
+                if total_checked > 0 {
+                    tracing::info!(
+                        checked = total_checked,
+                        restored = total_restored,
+                        elapsed_ms,
+                        "revalidation cycle complete"
+                    );
+                }
+
+                tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+            }
+        });
+    }
+}
+
+/// Test a single key by calling the upstream's /v1/models endpoint.
+/// Returns Ok(true) if the key is valid (not 401/403), Ok(false) if invalid.
+pub async fn validate_key(
+    upstream: &Upstream,
+    key: &KeyState,
+    timeout: Duration,
+) -> anyhow::Result<bool> {
+    use hyper::body::HttpBody;
+
+    let pq: http::uri::PathAndQuery = match upstream.format {
+        UpstreamFormat::Openai | UpstreamFormat::Anthropic => {
+            http::uri::PathAndQuery::from_static("/v1/models")
+        }
+        UpstreamFormat::Gemini => {
+            let path = format!("/v1beta/models?key={}", url_encode(key.key.as_ref()));
+            path.parse()?
+        }
+    };
+    let uri = upstream.build_uri(&pq)?;
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Body::empty())?;
+    insert_key_headers(req.headers_mut(), upstream.format, key)?;
+
+    let mut resp = match tokio::time::timeout(timeout, upstream.client.request(req)).await {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => anyhow::bail!("validation request timeout"),
+    };
+
+    let status = resp.status();
+    // Drain the body to allow connection reuse.
+    while let Some(Ok(_)) = resp.data().await {}
+
+    // 401/403 = key is still invalid. Anything else = key is probably fine.
+    Ok(status != http::StatusCode::UNAUTHORIZED && status != http::StatusCode::FORBIDDEN)
 }
 
 impl KeyState {
-    pub fn clear_last_ban_info(&self) {
-        if let Ok(mut info) = self.last_ban.lock() {
-            *info = None;
+    pub fn is_active(&self) -> bool {
+        self.status.load(Ordering::Relaxed) == KEY_STATUS_ACTIVE
+    }
+
+    pub fn record_latency_ms(&self, latency_ms: u64) {
+        let Ok(mut latencies) = self.latencies_ms.lock() else {
+            return;
+        };
+        latencies.push_back(latency_ms);
+        while latencies.len() > 256 {
+            latencies.pop_front();
         }
     }
 
-    pub fn last_ban_info(&self) -> Option<KeyBanInfo> {
-        self.last_ban.lock().ok().and_then(|info| info.clone())
-    }
-
-    fn set_last_ban_info(&self, info: KeyBanInfo) {
-        if let Ok(mut last) = self.last_ban.lock() {
-            *last = Some(info);
+    pub fn latency_percentiles(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        let Ok(latencies) = self.latencies_ms.lock() else {
+            return (None, None, None);
+        };
+        if latencies.is_empty() {
+            return (None, None, None);
         }
-    }
-
-    pub fn finish_last_ban_body(
-        &self,
-        ts_ms: u64,
-        cooldown_until_ms: u64,
-        body: String,
-        body_truncated: bool,
-    ) {
-        if let Ok(mut last) = self.last_ban.lock() {
-            let Some(info) = last.as_mut() else {
-                return;
-            };
-            if info.ts_ms == ts_ms && info.cooldown_until_ms == cooldown_until_ms {
-                info.body = body;
-                info.body_truncated = body_truncated;
-            }
-        }
+        let mut values: Vec<u64> = latencies.iter().copied().collect();
+        values.sort_unstable();
+        (
+            Some(percentile(&values, 50)),
+            Some(percentile(&values, 90)),
+            Some(percentile(&values, 99)),
+        )
     }
 }
 
 impl Upstream {
-    fn select_key(&self, now_ms: u64) -> Option<Arc<KeyState>> {
-        let keys_arc = self.keys.load_full();
-        let keys = keys_arc.as_ref();
+    /// Select an active key via atomic round-robin, skipping keys at their
+    /// concurrency limit and keys in 429 cooldown. Returns None if no active
+    /// keys available.
+    fn select_key(&self, max_concurrent: u32) -> Option<Arc<KeyState>> {
+        let keys = self.active_keys.load_full();
         let n = keys.len();
         if n == 0 {
             return None;
         }
-
+        let now = now_ms();
         let start = self.key_rr.fetch_add(1, Ordering::Relaxed);
-        let mut fallback: Option<(u64, usize)> = None;
         for i in 0..n {
             let idx = (start + i) % n;
             let k = &keys[idx];
+            // Skip keys in 429 cooldown.
             let until = k.cooldown_until_ms.load(Ordering::Relaxed);
-            if until <= now_ms {
-                return Some(k.clone());
+            if until > 0 && now < until {
+                continue;
             }
-            // Track the key with the shortest remaining cooldown.
-            match fallback {
-                Some((best, _)) if until >= best => {}
-                _ => fallback = Some((until, idx)),
-            }
-        }
-        // All keys are in cooldown — fall back to the one expiring soonest.
-        fallback.map(|(_, idx)| keys[idx].clone())
-    }
-
-    /// Clear cooldown + fail streak for keys whose value is in `set`. Returns the count matched.
-    pub fn release_keys(&self, set: &AHashSet<String>) -> usize {
-        let keys = self.keys.load_full();
-        let mut n = 0;
-        for k in keys.iter() {
-            if set.contains(k.key.as_ref()) {
+            // Clear expired cooldown (no-op if already 0).
+            if until > 0 && now >= until {
                 k.cooldown_until_ms.store(0, Ordering::Relaxed);
-                k.fail_streak.store(0, Ordering::Relaxed);
-                k.clear_last_ban_info();
-                n += 1;
             }
+            // Skip keys at concurrency limit.
+            if max_concurrent > 0 && k.active_requests.load(Ordering::Relaxed) >= max_concurrent {
+                continue;
+            }
+            return Some(k.clone());
         }
-        n
+        // All keys at limit or in cooldown — return None to signal backpressure.
+        None
     }
 
-    /// Clear cooldown + fail streak for all keys. Returns the count cleared.
-    pub fn release_all_keys(&self) -> usize {
-        let keys = self.keys.load_full();
-        for k in keys.iter() {
-            k.cooldown_until_ms.store(0, Ordering::Relaxed);
-            k.fail_streak.store(0, Ordering::Relaxed);
-            k.clear_last_ban_info();
-        }
-        keys.len()
+    /// Rebuild the active_keys list from the full keys list based on current status.
+    pub fn rebuild_active_keys(&self) {
+        let all = self.keys.load_full();
+        let active: Vec<Arc<KeyState>> = all.iter().filter(|k| k.is_active()).cloned().collect();
+        self.active_keys.store(Arc::new(active));
     }
 
-    /// Ban keys whose value is in `set` until `until_ms`. Returns the count matched.
-    pub fn ban_keys(&self, set: &AHashSet<String>, until_ms: u64) -> usize {
-        let keys = self.keys.load_full();
+    /// Restore specified keys to active. Returns count restored.
+    pub fn restore_keys(&self, set: &AHashSet<String>) -> usize {
+        let all = self.keys.load_full();
         let mut n = 0;
-        for k in keys.iter() {
+        for k in all.iter() {
             if set.contains(k.key.as_ref()) {
-                k.cooldown_until_ms.store(until_ms, Ordering::Relaxed);
-                k.clear_last_ban_info();
+                k.failure_count.store(0, Ordering::Relaxed);
+                k.status.store(KEY_STATUS_ACTIVE, Ordering::Relaxed);
                 n += 1;
             }
+        }
+        if n > 0 {
+            self.rebuild_active_keys();
         }
         n
     }
 
-    /// Ban all keys until `until_ms`. Returns the count banned.
-    pub fn ban_all_keys(&self, until_ms: u64) -> usize {
-        let keys = self.keys.load_full();
-        for k in keys.iter() {
-            k.cooldown_until_ms.store(until_ms, Ordering::Relaxed);
-            k.clear_last_ban_info();
+    /// Restore all invalid keys. Returns count restored.
+    pub fn restore_all_keys(&self) -> usize {
+        let all = self.keys.load_full();
+        let mut n = 0;
+        for k in all.iter() {
+            if !k.is_active() {
+                k.failure_count.store(0, Ordering::Relaxed);
+                k.status.store(KEY_STATUS_ACTIVE, Ordering::Relaxed);
+                n += 1;
+            }
         }
-        keys.len()
+        if n > 0 {
+            self.rebuild_active_keys();
+        }
+        n
+    }
+
+    /// Invalidate specified keys. Returns count invalidated.
+    pub fn invalidate_keys(&self, set: &AHashSet<String>) -> usize {
+        let all = self.keys.load_full();
+        let mut n = 0;
+        for k in all.iter() {
+            if set.contains(k.key.as_ref()) {
+                k.status.store(KEY_STATUS_INVALID, Ordering::Relaxed);
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.rebuild_active_keys();
+        }
+        n
     }
 
     /// Builds an absolute URI to upstream by combining base scheme+authority and request path/query.
@@ -1061,58 +1243,31 @@ fn inc_status(stats: &UpstreamStats, status: http::StatusCode) {
     }
 }
 
-fn record_key_ban_info(
-    key: &Arc<KeyState>,
-    status: http::StatusCode,
-    reason: &str,
-    retry_after_ms: Option<u64>,
-    ts_ms: u64,
-    cooldown_until_ms: u64,
-    headers: Option<&hyper::HeaderMap>,
-) -> KeyBanEvent {
-    let info = KeyBanInfo {
-        ts_ms,
-        status: status.as_u16(),
-        reason: reason.to_string(),
-        retry_after_ms,
-        cooldown_until_ms,
-        headers: headers.map(capture_headers).unwrap_or_default(),
-        body: String::new(),
-        body_truncated: false,
-    };
-    key.set_last_ban_info(info);
-    KeyBanEvent {
-        key: key.clone(),
-        ts_ms,
-        cooldown_until_ms,
-    }
-}
-
-fn capture_headers(headers: &hyper::HeaderMap) -> Vec<KeyBanHeader> {
-    headers
-        .iter()
-        .map(|(name, value)| KeyBanHeader {
-            name: name.as_str().to_string(),
-            value: String::from_utf8_lossy(value.as_bytes()).to_string(),
-        })
-        .collect()
-}
-
 fn parse_upstream(u: UpstreamConfig, weight: usize) -> anyhow::Result<Arc<Upstream>> {
     let name_for_err = u.id.clone();
 
     let base: Uri = u.base_url.parse()?;
+    let format = u
+        .format
+        .unwrap_or_else(|| UpstreamFormat::detect(&u.base_url));
+    let proxy = u.proxy.clone().filter(|p| !p.trim().is_empty());
+    let client = UpstreamClient::new(proxy.as_deref())?;
 
     let scheme = base
         .scheme()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("upstream {}: base_url missing scheme", name_for_err))?;
-    let authority = base.authority().cloned().ok_or_else(|| {
-        anyhow::anyhow!("upstream {}: base_url missing authority", name_for_err)
-    })?;
+    let authority = base
+        .authority()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("upstream {}: base_url missing authority", name_for_err))?;
 
     let base_path = base.path().trim_end_matches('/').to_string();
-    let base_path = if base_path == "/" { String::new() } else { base_path };
+    let base_path = if base_path == "/" {
+        String::new()
+    } else {
+        base_path
+    };
 
     let upstream = Upstream {
         id: Arc::<str>::from(u.id),
@@ -1121,12 +1276,15 @@ fn parse_upstream(u: UpstreamConfig, weight: usize) -> anyhow::Result<Arc<Upstre
         base_authority: authority,
         base_path: Arc::<str>::from(base_path),
         weight,
+        max_concurrent_per_key: u.max_concurrent_per_key.unwrap_or(0),
+        format,
+        proxy,
+        client,
         keys: ArcSwap::from_pointee(Vec::new()),
+        active_keys: ArcSwap::from_pointee(Vec::new()),
         keys_update_lock: Mutex::new(()),
         key_rr: AtomicUsize::new(0),
         models: ArcSwap::from_pointee(AHashSet::new()),
-        cooldown_until_ms: AtomicU64::new(0),
-        fail_streak: AtomicU32::new(0),
         stats: UpstreamStats::default(),
     };
 
@@ -1141,32 +1299,48 @@ pub fn build_key_states(keys: Vec<String>) -> anyhow::Result<Arc<Vec<Arc<KeyStat
             continue;
         }
         let key_arc: Arc<str> = Arc::<str>::from(k.to_string());
-        let auth_header =
-            hyper::header::HeaderValue::from_str(&format!("Bearer {}", key_arc)).map_err(|_| {
-                anyhow::anyhow!("invalid key (cannot be used in HTTP header)")
-            })?;
+        let auth_header = hyper::header::HeaderValue::from_str(&format!("Bearer {}", key_arc))
+            .map_err(|_| anyhow::anyhow!("invalid key (cannot be used in HTTP header)"))?;
         out.push(Arc::new(KeyState {
             key: key_arc,
             auth_header,
+            failure_count: AtomicU32::new(0),
+            status: AtomicU8::new(KEY_STATUS_ACTIVE),
+            active_requests: AtomicU32::new(0),
             cooldown_until_ms: AtomicU64::new(0),
-            fail_streak: AtomicU32::new(0),
-            last_ban: Mutex::new(None),
+            latencies_ms: Mutex::new(VecDeque::with_capacity(256)),
         }));
     }
     Ok(Arc::new(out))
 }
 
-fn parse_models_response(body: &[u8]) -> anyhow::Result<AHashSet<String>> {
+fn parse_models_response(format: UpstreamFormat, body: &[u8]) -> anyhow::Result<AHashSet<String>> {
     let v: serde_json::Value = serde_json::from_slice(body)?;
-    let data = v
-        .get("data")
-        .and_then(|d| d.as_array())
-        .ok_or_else(|| anyhow::anyhow!("missing data array in models response"))?;
-
-    let mut out: AHashSet<String> = AHashSet::with_capacity(data.len().max(1));
-    for item in data {
-        if let Some(id) = item.get("id").and_then(|s| s.as_str()) {
-            out.insert(id.to_string());
+    let mut out: AHashSet<String> = AHashSet::new();
+    match format {
+        UpstreamFormat::Openai | UpstreamFormat::Anthropic => {
+            let data = v
+                .get("data")
+                .and_then(|d| d.as_array())
+                .ok_or_else(|| anyhow::anyhow!("missing data array in models response"))?;
+            out.reserve(data.len());
+            for item in data {
+                if let Some(id) = item.get("id").and_then(|s| s.as_str()) {
+                    out.insert(id.to_string());
+                }
+            }
+        }
+        UpstreamFormat::Gemini => {
+            let data = v
+                .get("models")
+                .and_then(|d| d.as_array())
+                .ok_or_else(|| anyhow::anyhow!("missing models array in gemini response"))?;
+            out.reserve(data.len());
+            for item in data {
+                if let Some(name) = item.get("name").and_then(|s| s.as_str()) {
+                    out.insert(name.trim_start_matches("models/").to_string());
+                }
+            }
         }
     }
     Ok(out)
@@ -1284,17 +1458,20 @@ impl RouterState {
         Ok(())
     }
 
-    pub fn update_upstream(&self, id: &str, base_url: String, weight: Option<usize>) -> anyhow::Result<()> {
+    pub fn update_upstream(&self, id: &str, mut cfg: UpstreamConfig) -> anyhow::Result<()> {
         let _guard = self
             .admin_write_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("admin write lock poisoned"))?;
         let mut list = self.current_upstream_configs();
         let mut found = false;
+        cfg.id = id.to_string();
+        if cfg.format.is_none() {
+            cfg.format = Some(UpstreamFormat::detect(&cfg.base_url));
+        }
         for u in list.iter_mut() {
             if u.id == id {
-                u.base_url = base_url.clone();
-                u.weight = weight;
+                *u = cfg.clone();
                 found = true;
                 break;
             }
@@ -1323,6 +1500,30 @@ impl RouterState {
             self.store.replace_keys(id, &empty)?;
         }
         Ok(())
+    }
+
+    pub async fn test_key_by_value(
+        &self,
+        upstream_id: &str,
+        key_value: &str,
+    ) -> anyhow::Result<bool> {
+        let Some((_idx, upstream)) = self.upstream_by_id(upstream_id) else {
+            anyhow::bail!("unknown upstream id");
+        };
+        let key_value = key_value.trim();
+        if key_value.is_empty() {
+            anyhow::bail!("key must not be empty");
+        }
+        let key = build_key_states(vec![key_value.to_string()])?
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("invalid key"))?;
+        validate_key(
+            &upstream,
+            &key,
+            Duration::from_secs(self.key_config().revalidation_timeout_secs.max(5)),
+        )
+        .await
     }
 
     fn build_model_routes(&self) -> ModelRoutesFile {
@@ -1385,6 +1586,13 @@ impl RouterState {
                 id: u.id.to_string(),
                 base_url: u.base_url.to_string(),
                 weight: Some(u.weight),
+                max_concurrent_per_key: if u.max_concurrent_per_key > 0 {
+                    Some(u.max_concurrent_per_key)
+                } else {
+                    None
+                },
+                format: Some(u.format),
+                proxy: u.proxy.clone(),
             })
             .collect()
     }
@@ -1426,23 +1634,31 @@ impl RouterState {
         &self,
         upstream: Arc<Upstream>,
     ) -> anyhow::Result<AHashSet<String>> {
-        let keys = upstream.keys.load_full();
-        let now = now_ms();
+        let keys = upstream.active_keys.load_full();
         let key = keys
-            .iter()
-            .find(|k| k.cooldown_until_ms.load(Ordering::Relaxed) <= now)
+            .first()
             .cloned()
-            .or_else(|| keys.first().cloned())
-            .ok_or_else(|| anyhow::anyhow!("no keys loaded"))?;
+            .ok_or_else(|| anyhow::anyhow!("no active keys for upstream"))?;
 
-        let uri = upstream.build_uri(&PathAndQuery::from_static("/v1/models"))?;
+        let pq: http::uri::PathAndQuery = match upstream.format {
+            UpstreamFormat::Openai | UpstreamFormat::Anthropic => {
+                http::uri::PathAndQuery::from_static("/v1/models")
+            }
+            UpstreamFormat::Gemini => {
+                let path = format!("/v1beta/models?key={}", url_encode(key.key.as_ref()));
+                path.parse()?
+            }
+        };
+        let uri = upstream.build_uri(&pq)?;
         let mut req = Request::builder()
             .method(Method::GET)
             .uri(uri)
             .body(Body::empty())?;
-        req.headers_mut().insert(HDR_AUTHORIZATION, key.auth_header.clone());
+        insert_key_headers(req.headers_mut(), upstream.format, &key)?;
 
-        let resp = match tokio::time::timeout(self.request_timeout, self.client.request(req)).await {
+        let resp = match tokio::time::timeout(self.request_timeout(), upstream.client.request(req))
+            .await
+        {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => anyhow::bail!("upstream request timeout"),
@@ -1453,7 +1669,7 @@ impl RouterState {
         }
 
         let body = hyper::body::to_bytes(resp.into_body()).await?;
-        parse_models_response(&body)
+        parse_models_response(upstream.format, &body)
     }
 }
 
@@ -1481,7 +1697,10 @@ fn build_snapshot_from_configs(
 
         let keys = store.load_all_keys(&u.id)?;
         let key_states = build_key_states(keys)?;
+        // active_keys starts as a copy of all keys (all active by default).
+        let active = key_states.iter().cloned().collect::<Vec<_>>();
         u.keys.store(key_states);
+        u.active_keys.store(Arc::new(active));
 
         for _ in 0..weight {
             schedule.push(idx);
@@ -1515,6 +1734,141 @@ fn apply_routes_to_upstreams(
     for (idx, set) in per_upstream.into_iter().enumerate() {
         upstreams[idx].models.store(Arc::new(set));
     }
+}
+
+impl RouterState {
+    pub fn apply_config_reload(&self, cfg: Config) -> anyhow::Result<()> {
+        if cfg.listen_addr != self.listen_addr {
+            tracing::warn!(
+                old = %self.listen_addr,
+                new = %cfg.listen_addr,
+                "config: listen_addr changed, restart required"
+            );
+        }
+        if cfg.worker_threads != self.worker_threads {
+            tracing::warn!(
+                old = ?self.worker_threads,
+                new = ?cfg.worker_threads,
+                "config: worker_threads changed, restart required"
+            );
+        }
+        if cfg.data_dir != self.data_dir {
+            tracing::warn!(
+                old = %self.data_dir.display(),
+                new = %cfg.data_dir.display(),
+                "config: data_dir changed, restart required"
+            );
+        }
+
+        let runtime = Arc::new(RuntimeConfig::from_config(&cfg));
+        let old = self.runtime.load_full();
+        if runtime.server.queue_max_depth > old.server.queue_max_depth {
+            self.queue_slots
+                .add_permits(runtime.server.queue_max_depth - old.server.queue_max_depth);
+        } else if runtime.server.queue_max_depth < old.server.queue_max_depth {
+            tracing::warn!(
+                old = old.server.queue_max_depth,
+                new = runtime.server.queue_max_depth,
+                "config: queue_max_depth decrease applies after restart"
+            );
+        }
+        log_runtime_config_changes(&old, &runtime);
+        self.runtime.store(runtime);
+
+        let _guard = self
+            .admin_write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("admin write lock poisoned"))?;
+        self.replace_upstreams(cfg.upstreams)?;
+        self.queue_notify.notify_waiters();
+        Ok(())
+    }
+}
+
+fn log_runtime_config_changes(old: &RuntimeConfig, new: &RuntimeConfig) {
+    if old.request_timeout != new.request_timeout {
+        tracing::info!(
+            old_ms = old.request_timeout.as_millis() as u64,
+            new_ms = new.request_timeout.as_millis() as u64,
+            "config reloaded: request_timeout_ms"
+        );
+    }
+    if old.max_retries != new.max_retries {
+        tracing::info!(
+            old = old.max_retries,
+            new = new.max_retries,
+            "config reloaded: max_retries"
+        );
+    }
+    if old.server.cors_origins != new.server.cors_origins {
+        tracing::info!("config reloaded: cors_origins");
+    }
+    if old.server.queue_enabled != new.server.queue_enabled
+        || old.server.queue_max_depth != new.server.queue_max_depth
+        || old.server.queue_timeout_ms != new.server.queue_timeout_ms
+    {
+        tracing::info!("config reloaded: queue settings");
+    }
+}
+
+fn config_preview(cfg: &Config) -> serde_json::Value {
+    let mut v = serde_json::to_value(cfg).unwrap_or_else(|_| serde_json::json!({}));
+    redact_config_value(&mut v);
+    v
+}
+
+fn redact_config_value(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, value) in map.iter_mut() {
+                if k.contains("token") || k == "keys" {
+                    *value = serde_json::json!("<redacted>");
+                } else {
+                    redact_config_value(value);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_config_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn insert_key_headers(
+    headers: &mut hyper::HeaderMap,
+    format: UpstreamFormat,
+    key: &KeyState,
+) -> anyhow::Result<()> {
+    match format {
+        UpstreamFormat::Openai => {
+            headers.insert(HDR_AUTHORIZATION, key.auth_header.clone());
+        }
+        UpstreamFormat::Anthropic => {
+            let value = hyper::header::HeaderValue::from_str(key.key.as_ref())?;
+            headers.insert("x-api-key", value);
+            headers.insert(
+                "anthropic-version",
+                hyper::header::HeaderValue::from_static("2023-06-01"),
+            );
+        }
+        UpstreamFormat::Gemini => {}
+    }
+    Ok(())
+}
+
+fn percentile(sorted: &[u64], pct: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = ((sorted.len().saturating_sub(1)) * pct) / 100;
+    sorted[idx]
+}
+
+fn url_encode(s: &str) -> String {
+    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
 pub fn validate_keys(keys: &[String]) -> anyhow::Result<()> {
