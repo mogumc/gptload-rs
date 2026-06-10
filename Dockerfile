@@ -1,14 +1,15 @@
 FROM alpine:3.20
 
+ARG TARGETOS
+ARG TARGETARCH
+
 RUN apk add --no-cache ca-certificates tzdata libssl3
 
 WORKDIR /app
 
-# 从构建上下文复制预编译的二进制文件
-COPY gptload-rs .
-RUN chmod +x gptload-rs
+COPY gptload-rs-${TARGETOS}-${TARGETARCH} /app/gptload-rs
+RUN chmod +x /app/gptload-rs
 
-# 创建数据目录
 RUN mkdir -p /app/data
 
 EXPOSE 8080

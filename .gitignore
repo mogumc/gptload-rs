@@ -17,6 +17,11 @@ Cargo.lock
 data/
 config.toml
 
+# Pre-built binaries (docker-build)
+gptload-rs-linux-amd64
+gptload-rs-linux-arm64
+gptload-rs
+
 # Test outputs
 unexpected_responses/
 available_models_*.json
