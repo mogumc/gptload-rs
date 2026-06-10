@@ -38,7 +38,9 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(false)
         .with_level(true)
         .init();
@@ -62,10 +64,78 @@ fn main() -> anyhow::Result<()> {
         state.refresh_missing_models_routes().await;
         state.start_revalidation();
         spawn_config_reload(state.clone(), config_path);
-        tracing::info!(%addr, "listening (admin at /admin/)");
+
+        // Print startup info
+        print_startup_info(&state, addr);
+
         let shutdown = graceful_shutdown_signal(state.clone());
         proxy::serve_http(addr, state, shutdown).await
     })
+}
+
+fn print_startup_info(state: &Arc<state::RouterState>, addr: SocketAddr) {
+    let snapshot = state.snapshot.load();
+    let upstreams = &snapshot.upstreams;
+    let admin_tokens = &state.admin_tokens;
+
+    tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    tracing::info!("  gptload-rs v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    tracing::info!(%addr, "listening");
+    tracing::info!(url = %format!("http://{}/admin/", addr), "admin panel");
+
+    // Admin tokens
+    let token_count = admin_tokens.len();
+    if token_count > 0 {
+        let masked: Vec<String> = admin_tokens
+            .iter()
+            .take(3)
+            .map(|t| {
+                if t.len() > 8 {
+                    format!("{}...{}", &t[..4], &t[t.len() - 4..])
+                } else {
+                    t.clone()
+                }
+            })
+            .collect();
+        let extra = if token_count > 3 {
+            format!(" (+{} more)", token_count - 3)
+        } else {
+            String::new()
+        };
+        tracing::info!(tokens = %masked.join(", "), extra, "admin tokens");
+    }
+
+    // Upstreams
+    tracing::info!(count = upstreams.len(), "upstreams loaded");
+    for u in upstreams.iter() {
+        tracing::info!(
+            id = %u.id,
+            base_url = %u.base_url,
+            weight = u.weight,
+            format = ?u.format,
+            "  upstream"
+        );
+    }
+
+    // Key config
+    let key_cfg = &state.key_config;
+    tracing::info!(
+        max_concurrent = key_cfg.max_concurrent_per_key,
+        blacklist_threshold = key_cfg.blacklist_threshold,
+        "key config"
+    );
+
+    // Runtime config
+    let rt = state.runtime.load();
+    tracing::info!(
+        timeout_ms = rt.request_timeout.as_millis() as u64,
+        max_retries = rt.max_retries,
+        queue_enabled = rt.server.queue_enabled,
+        "runtime config"
+    );
+
+    tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }
 
 async fn graceful_shutdown_signal(state: Arc<state::RouterState>) {
