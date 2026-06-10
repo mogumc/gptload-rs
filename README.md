@@ -252,6 +252,10 @@ curl -X POST http://localhost:8080/admin/api/v1/billing/keys/my-api-key/adjust \
   -H "X-Admin-Token: xxx" \
   -H "Content-Type: application/json" \
   -d '{"delta":50000}'
+
+# 删除计费 key
+curl -X DELETE http://localhost:8080/admin/api/v1/billing/keys/my-api-key \
+  -H "X-Admin-Token: xxx"
 ```
 
 ### 模型路由
