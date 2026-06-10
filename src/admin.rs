@@ -10,38 +10,34 @@ use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 
 // Embedded static files from dist/
-use include_dir::{include_dir, Dir};
+use rust_embed::RustEmbed;
 
-static DIST_DIR: Dir = include_dir!("src/static/dist");
+#[derive(RustEmbed)]
+#[folder = "src/static/dist"]
+struct Asset;
 
-// File map for /web/ serving
-lazy_static::lazy_static! {
-    static ref WEB_FILES: BTreeMap<&'static str, (&'static [u8], &'static str)> = {
-        let mut m = BTreeMap::new();
-        for file in DIST_DIR.files() {
-            let path = file.path().to_str().unwrap_or("");
-            // Strip the "static/dist/" prefix to get the relative path.
-            let relative = path.strip_prefix("src/static/dist/").unwrap_or(path);
-            let content_type = match relative.rsplit('.').next() {
-                Some("html") => "text/html; charset=utf-8",
-                Some("js") => "application/javascript; charset=utf-8",
-                Some("css") => "text/css; charset=utf-8",
-                Some("woff") => "font/woff",
-                Some("woff2") => "font/woff2",
-                Some("ttf") => "font/ttf",
-                Some("otf") => "font/otf",
-                Some("json") => "application/json",
-                Some("png") => "image/png",
-                Some("jpg") | Some("jpeg") => "image/jpeg",
-                Some("gif") => "image/gif",
-                Some("svg") => "image/svg+xml",
-                Some("ico") => "image/x-icon",
-                _ => "application/octet-stream",
-            };
-            m.insert(relative, (file.contents(), content_type));
-        }
-        m
-    };
+/// Get content-type and cache-control for a file path.
+fn mime_and_cache(path: &str) -> (&'static str, &'static str) {
+    match path.rsplit('.').next() {
+        Some("html") => ("text/html; charset=utf-8", "no-store"),
+        Some("js") => ("application/javascript; charset=utf-8", "max-age=31536000, immutable"),
+        Some("css") => ("text/css; charset=utf-8", "max-age=31536000, immutable"),
+        Some("woff") => ("font/woff", "max-age=31536000, immutable"),
+        Some("woff2") => ("font/woff2", "max-age=31536000, immutable"),
+        Some("ttf") => ("font/ttf", "max-age=31536000, immutable"),
+        Some("otf") => ("font/otf", "max-age=31536000, immutable"),
+        Some("json") => ("application/json", "no-store"),
+        Some("png") => ("image/png", "max-age=31536000, immutable"),
+        Some("jpg") | Some("jpeg") => ("image/jpeg", "max-age=31536000, immutable"),
+        Some("gif") => ("image/gif", "max-age=31536000, immutable"),
+        Some("svg") => ("image/svg+xml", "max-age=31536000, immutable"),
+        Some("ico") => ("image/x-icon", "max-age=31536000, immutable"),
+        Some("webp") => ("image/webp", "max-age=31536000, immutable"),
+        Some("avif") => ("image/avif", "max-age=31536000, immutable"),
+        Some("wasm") => ("application/wasm", "max-age=31536000, immutable"),
+        Some("map") => ("application/json", "max-age=31536000, immutable"),
+        _ => ("application/octet-stream", "max-age=31536000, immutable"),
+    }
 }
 
 /// Read request body and parse as JSON. Returns error response on failure.
@@ -78,17 +74,20 @@ pub async fn handle_admin(req: Request<Body>, state: Arc<RouterState>) -> Respon
     let path = req.uri().path();
 
     // Serve static files from /web/
-    if req.method() == Method::GET && path.starts_with("/web") {
+    let is_web = req.method() == Method::GET
+        && (path == "/web" || path == "/web/" || path.starts_with("/web/"));
+    if is_web {
         let file = path.strip_prefix("/web").unwrap_or("");
         let file = file.strip_prefix('/').unwrap_or("");
         let file = if file.is_empty() { "index.html" } else { file };
 
-        if let Some((content, content_type)) = WEB_FILES.get(file) {
+        if let Some(asset) = Asset::get(file) {
+            let (content_type, cache_control) = mime_and_cache(file);
             return Response::builder()
                 .status(200)
-                .header("content-type", *content_type)
-                .header("cache-control", "no-store")
-                .body(Body::from(*content))
+                .header("content-type", content_type)
+                .header("cache-control", cache_control)
+                .body(Body::from(asset.data.as_ref().to_vec()))
                 .unwrap();
         }
 
