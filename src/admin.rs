@@ -137,6 +137,7 @@ async fn handle_api(req: Request<Body>, state: Arc<RouterState>) -> Response<Bod
         (&Method::GET, "/admin/api/v1/requests/stream") => requests_stream(state).await,
         (&Method::GET, "/admin/api/v1/requests") => api_requests(state, req.uri()).await,
         (&Method::GET, "/admin/api/v1/metrics") => api_metrics(state, req.uri()).await,
+        (&Method::GET, "/admin/api/v1/billing/keys") => api_billing_list_keys(state).await,
         (&Method::POST, "/admin/api/v1/billing/keys") => api_billing_create_key(req, state).await,
         _ => {
             // Dynamic routes:
@@ -211,6 +212,20 @@ struct BillingCreateBody {
 #[derive(Deserialize)]
 struct BillingAdjustBody {
     delta: i64,
+}
+
+async fn api_billing_list_keys(state: Arc<RouterState>) -> Response<Body> {
+    let keys = state.billing.list_keys();
+    let items: Vec<serde_json::Value> = keys
+        .into_iter()
+        .map(|(key, balance)| {
+            serde_json::json!({
+                "key": key,
+                "balance": balance
+            })
+        })
+        .collect();
+    json_ok(&serde_json::json!({ "keys": items }))
 }
 
 async fn api_billing_create_key(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {

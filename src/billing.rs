@@ -140,6 +140,19 @@ impl BillingStore {
         }
     }
 
+    pub fn list_keys(&self) -> Vec<(String, i64)> {
+        let map = match self.balances.read() {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+        let mut keys: Vec<(String, i64)> = map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
+            .collect();
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        keys
+    }
+
     pub fn release_reservation(&self, key: &str) -> Option<i64> {
         self.adjust_balance(key, 1)
     }
