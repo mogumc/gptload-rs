@@ -241,7 +241,7 @@ async fn api_billing_create_key(req: Request<Body>, state: Arc<RouterState>) -> 
             "bad_request",
         );
     }
-    let balance = payload.balance.unwrap_or(0);
+    let balance = payload.balance.unwrap_or(0).max(0);
     let created = match state.billing.create_key(key.to_string(), balance) {
         Ok(v) => v,
         Err(e) => {
@@ -305,6 +305,15 @@ async fn api_billing_adjust_balance(
             )
         }
     };
+
+    let max_delta: i64 = 1_000_000;
+    if payload.delta > max_delta || payload.delta < -max_delta {
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            &format!("delta must be between -{} and {}", max_delta, max_delta),
+            "bad_request",
+        );
+    }
 
     match state.billing.adjust_balance(key, payload.delta) {
         Some(balance) => json_ok(&serde_json::json!({
@@ -492,6 +501,20 @@ async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Respon
             "bad_request",
         );
     }
+    if input.weight.unwrap_or(1) > 10_000 {
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            "weight must be ≤ 10000",
+            "bad_request",
+        );
+    }
+    if input.max_concurrent_per_key.unwrap_or(0) > 256 {
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            "max_concurrent_per_key must be ≤ 256",
+            "bad_request",
+        );
+    }
     let cfg = UpstreamConfig {
         id: input.id.trim().to_string(),
         base_url: input.base_url.trim().to_string(),
@@ -531,6 +554,20 @@ async fn api_update_upstream(
         return RouterState::json_error(
             http::StatusCode::BAD_REQUEST,
             "missing base_url",
+            "bad_request",
+        );
+    }
+    if input.weight.unwrap_or(1) > 10_000 {
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            "weight must be ≤ 10000",
+            "bad_request",
+        );
+    }
+    if input.max_concurrent_per_key.unwrap_or(0) > 256 {
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            "max_concurrent_per_key must be ≤ 256",
             "bad_request",
         );
     }
