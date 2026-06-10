@@ -19,6 +19,7 @@ pub enum ReserveResult {
 
 enum PersistUpdate {
     Set { key: String, balance: i64 },
+    Delete { key: String },
 }
 
 impl BillingStore {
@@ -49,6 +50,10 @@ impl BillingStore {
                     Ok(msg) => match msg {
                         PersistUpdate::Set { key, balance } => {
                             pending.insert(key, balance);
+                        }
+                        PersistUpdate::Delete { key } => {
+                            pending.remove(&key);
+                            let _ = persist_tree.remove(key.as_bytes());
                         }
                     },
                     Err(RecvTimeoutError::Timeout) => {}
@@ -84,6 +89,22 @@ impl BillingStore {
         drop(map);
         let _ = self.persist_tx.send(PersistUpdate::Set { key, balance });
         Ok(true)
+    }
+
+    pub fn delete_key(&self, key: &str) -> anyhow::Result<bool> {
+        let mut map = self
+            .balances
+            .write()
+            .map_err(|_| anyhow::anyhow!("billing balances lock poisoned"))?;
+        if map.remove(key).is_some() {
+            drop(map);
+            let _ = self.persist_tx.send(PersistUpdate::Delete {
+                key: key.to_string(),
+            });
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     pub fn get_balance(&self, key: &str) -> Option<i64> {

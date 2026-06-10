@@ -177,6 +177,7 @@ async fn handle_billing_key_subroutes(
     if action.is_empty() {
         return match *req.method() {
             Method::GET => api_billing_get_balance(state, key).await,
+            Method::DELETE => api_billing_delete_key(state, key).await,
             _ => Response::builder()
                 .status(405)
                 .header("content-type", "application/json")
@@ -276,6 +277,25 @@ async fn api_billing_get_balance(state: Arc<RouterState>, key: &str) -> Response
             http::StatusCode::NOT_FOUND,
             "key not found",
             "key_not_found",
+        ),
+    }
+}
+
+async fn api_billing_delete_key(state: Arc<RouterState>, key: &str) -> Response<Body> {
+    match state.billing.delete_key(key) {
+        Ok(true) => json_ok(&serde_json::json!({
+            "deleted": true,
+            "key": key
+        })),
+        Ok(false) => RouterState::json_error(
+            http::StatusCode::NOT_FOUND,
+            "key not found",
+            "key_not_found",
+        ),
+        Err(e) => RouterState::json_error(
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("delete failed: {e}"),
+            "billing_error",
         ),
     }
 }
