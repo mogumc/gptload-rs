@@ -1736,6 +1736,7 @@ fn apply_routes_to_upstreams(
     }
 }
 
+#[cfg(unix)]
 impl RouterState {
     pub fn apply_config_reload(&self, cfg: Config) -> anyhow::Result<()> {
         if cfg.listen_addr != self.listen_addr {
@@ -1785,6 +1786,7 @@ impl RouterState {
     }
 }
 
+#[cfg(unix)]
 fn log_runtime_config_changes(old: &RuntimeConfig, new: &RuntimeConfig) {
     if old.request_timeout != new.request_timeout {
         tracing::info!(

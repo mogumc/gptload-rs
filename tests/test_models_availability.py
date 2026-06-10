@@ -9,10 +9,12 @@ import time
 from typing import List, Dict, Tuple
 from datetime import datetime
 import concurrent.futures
+from pathlib import Path
 
 # Configuration
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROXY_URL = "http://localhost:8080"
-MODELS_FILE = "data/models_routes.json"
+MODELS_FILE = PROJECT_ROOT / "data" / "models_routes.json"
 
 # Test payload
 def create_payload(model: str) -> Dict:
