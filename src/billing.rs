@@ -96,6 +96,10 @@ impl BillingStore {
         let balance = map.get(key)?.clone();
         drop(map);
         let mut cur = balance.load(Ordering::Relaxed);
+        // -1 means unlimited, reject any adjustment to protect the sentinel
+        if cur == -1 {
+            return Some(-1);
+        }
         loop {
             let new_balance = cur.saturating_add(delta);
             match balance.compare_exchange(cur, new_balance, Ordering::Relaxed, Ordering::Relaxed) {
@@ -122,6 +126,10 @@ impl BillingStore {
         drop(map);
 
         let mut cur = balance.load(Ordering::Relaxed);
+        // -1 means unlimited, always succeed without decrementing
+        if cur == -1 {
+            return ReserveResult::Reserved;
+        }
         loop {
             if cur <= 0 {
                 return ReserveResult::Insufficient;
@@ -140,17 +148,58 @@ impl BillingStore {
         }
     }
 
+    pub fn list_keys(&self) -> Vec<(String, i64)> {
+        let map = match self.balances.read() {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+        let mut keys: Vec<(String, i64)> = map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
+            .collect();
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        keys
+    }
+
     pub fn release_reservation(&self, key: &str) -> Option<i64> {
+        // -1 means unlimited, nothing to release
+        if self.get_balance(key) == Some(-1) {
+            return Some(-1);
+        }
         self.adjust_balance(key, 1)
     }
 
     pub fn settle_reserved_usage(&self, key: &str, total_tokens: u64) -> Option<i64> {
+        let map = self.balances.read().ok()?;
+        let balance = map.get(key)?.clone();
+        drop(map);
+
         let delta = i64::try_from(total_tokens).ok()?;
         let adjustment = 1i64.saturating_sub(delta);
         if adjustment == 0 {
-            return self.get_balance(key);
+            return Some(balance.load(Ordering::Relaxed));
         }
-        self.adjust_balance(key, adjustment)
+
+        let mut cur = balance.load(Ordering::Relaxed);
+        loop {
+            // -1 means unlimited, no adjustment needed (concurrent promotion)
+            if cur == -1 {
+                return Some(-1);
+            }
+            let new_balance = cur.saturating_add(adjustment);
+            // Clamp to 0 to prevent going into debt
+            let clamped = if new_balance < 0 { 0 } else { new_balance };
+            match balance.compare_exchange(cur, clamped, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => {
+                    let _ = self.persist_tx.send(PersistUpdate::Set {
+                        key: key.to_string(),
+                        balance: clamped,
+                    });
+                    return Some(clamped);
+                }
+                Err(v) => cur = v,
+            }
+        }
     }
 }
 

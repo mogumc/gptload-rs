@@ -9,8 +9,36 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 
-const INDEX_HTML: &str = include_str!("static/index.html");
-const APP_JS: &str = include_str!("static/app.js");
+// Embedded static files from dist/
+use rust_embed::RustEmbed;
+
+#[derive(RustEmbed)]
+#[folder = "src/static/dist"]
+struct Asset;
+
+/// Get content-type and cache-control for a file path.
+fn mime_and_cache(path: &str) -> (&'static str, &'static str) {
+    match path.rsplit('.').next() {
+        Some("html") => ("text/html; charset=utf-8", "no-store"),
+        Some("js") => ("application/javascript; charset=utf-8", "max-age=31536000, immutable"),
+        Some("css") => ("text/css; charset=utf-8", "max-age=31536000, immutable"),
+        Some("woff") => ("font/woff", "max-age=31536000, immutable"),
+        Some("woff2") => ("font/woff2", "max-age=31536000, immutable"),
+        Some("ttf") => ("font/ttf", "max-age=31536000, immutable"),
+        Some("otf") => ("font/otf", "max-age=31536000, immutable"),
+        Some("json") => ("application/json", "no-store"),
+        Some("png") => ("image/png", "max-age=31536000, immutable"),
+        Some("jpg") | Some("jpeg") => ("image/jpeg", "max-age=31536000, immutable"),
+        Some("gif") => ("image/gif", "max-age=31536000, immutable"),
+        Some("svg") => ("image/svg+xml", "max-age=31536000, immutable"),
+        Some("ico") => ("image/x-icon", "max-age=31536000, immutable"),
+        Some("webp") => ("image/webp", "max-age=31536000, immutable"),
+        Some("avif") => ("image/avif", "max-age=31536000, immutable"),
+        Some("wasm") => ("application/wasm", "max-age=31536000, immutable"),
+        Some("map") => ("application/json", "max-age=31536000, immutable"),
+        _ => ("application/octet-stream", "max-age=31536000, immutable"),
+    }
+}
 
 /// Read request body and parse as JSON. Returns error response on failure.
 async fn parse_json_body<T: serde::de::DeserializeOwned>(
@@ -45,30 +73,29 @@ fn get_upstream(
 pub async fn handle_admin(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
     let path = req.uri().path();
 
-    // Redirect /admin -> /admin/
-    if path == "/admin" {
-        return Response::builder()
-            .status(301)
-            .header("location", "/admin/")
-            .body(Body::empty())
-            .unwrap();
-    }
+    // Serve static files from /web/
+    let is_web = req.method() == Method::GET
+        && (path == "/web" || path == "/web/" || path.starts_with("/web/"));
+    if is_web {
+        let file = path.strip_prefix("/web").unwrap_or("");
+        let file = file.strip_prefix('/').unwrap_or("");
+        let file = if file.is_empty() { "index.html" } else { file };
 
-    // Static UI
-    if req.method() == Method::GET && (path == "/admin/" || path == "/admin/index.html") {
+        if let Some(asset) = Asset::get(file) {
+            let (content_type, cache_control) = mime_and_cache(file);
+            return Response::builder()
+                .status(200)
+                .header("content-type", content_type)
+                .header("cache-control", cache_control)
+                .body(Body::from(asset.data.as_ref().to_vec()))
+                .unwrap();
+        }
+
+        // File not found in dist
         return Response::builder()
-            .status(200)
-            .header("content-type", "text/html; charset=utf-8")
-            .header("cache-control", "no-store")
-            .body(Body::from(INDEX_HTML))
-            .unwrap();
-    }
-    if req.method() == Method::GET && path == "/admin/app.js" {
-        return Response::builder()
-            .status(200)
-            .header("content-type", "application/javascript; charset=utf-8")
-            .header("cache-control", "no-store")
-            .body(Body::from(APP_JS))
+            .status(404)
+            .header("content-type", "text/plain; charset=utf-8")
+            .body(Body::from("404 Not Found"))
             .unwrap();
     }
 
@@ -110,6 +137,7 @@ async fn handle_api(req: Request<Body>, state: Arc<RouterState>) -> Response<Bod
         (&Method::GET, "/admin/api/v1/requests/stream") => requests_stream(state).await,
         (&Method::GET, "/admin/api/v1/requests") => api_requests(state, req.uri()).await,
         (&Method::GET, "/admin/api/v1/metrics") => api_metrics(state, req.uri()).await,
+        (&Method::GET, "/admin/api/v1/billing/keys") => api_billing_list_keys(state).await,
         (&Method::POST, "/admin/api/v1/billing/keys") => api_billing_create_key(req, state).await,
         _ => {
             // Dynamic routes:
@@ -186,6 +214,20 @@ struct BillingAdjustBody {
     delta: i64,
 }
 
+async fn api_billing_list_keys(state: Arc<RouterState>) -> Response<Body> {
+    let keys = state.billing.list_keys();
+    let items: Vec<serde_json::Value> = keys
+        .into_iter()
+        .map(|(key, balance)| {
+            serde_json::json!({
+                "key": key,
+                "balance": balance
+            })
+        })
+        .collect();
+    json_ok(&serde_json::json!({ "keys": items }))
+}
+
 async fn api_billing_create_key(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
     let payload: BillingCreateBody = match parse_json_body(req).await {
         Ok(v) => v,
@@ -199,7 +241,7 @@ async fn api_billing_create_key(req: Request<Body>, state: Arc<RouterState>) -> 
             "bad_request",
         );
     }
-    let balance = payload.balance.unwrap_or(0);
+    let balance = payload.balance.unwrap_or(0).max(-1);
     let created = match state.billing.create_key(key.to_string(), balance) {
         Ok(v) => v,
         Err(e) => {
@@ -263,6 +305,15 @@ async fn api_billing_adjust_balance(
             )
         }
     };
+
+    let max_delta: i64 = 1_000_000;
+    if payload.delta > max_delta || payload.delta < -max_delta {
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            &format!("delta must be between -{} and {}", max_delta, max_delta),
+            "bad_request",
+        );
+    }
 
     match state.billing.adjust_balance(key, payload.delta) {
         Some(balance) => json_ok(&serde_json::json!({
@@ -450,6 +501,20 @@ async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Respon
             "bad_request",
         );
     }
+    if input.weight.unwrap_or(1) > 10_000 {
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            "weight must be ≤ 10000",
+            "bad_request",
+        );
+    }
+    if input.max_concurrent_per_key.unwrap_or(0) > 256 {
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            "max_concurrent_per_key must be ≤ 256",
+            "bad_request",
+        );
+    }
     let cfg = UpstreamConfig {
         id: input.id.trim().to_string(),
         base_url: input.base_url.trim().to_string(),
@@ -489,6 +554,20 @@ async fn api_update_upstream(
         return RouterState::json_error(
             http::StatusCode::BAD_REQUEST,
             "missing base_url",
+            "bad_request",
+        );
+    }
+    if input.weight.unwrap_or(1) > 10_000 {
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            "weight must be ≤ 10000",
+            "bad_request",
+        );
+    }
+    if input.max_concurrent_per_key.unwrap_or(0) > 256 {
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            "max_concurrent_per_key must be ≤ 256",
             "bad_request",
         );
     }

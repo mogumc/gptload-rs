@@ -1,14 +1,14 @@
 version: '3.8'
 
 services:
-  gptload:
+  gptload-rs:
     build: .
     container_name: gptload-rs
     ports:
       - "8080:8080"
     volumes:
-      - ./config.toml:/app/config.toml:ro
-      - gptload-data:/app/data
+      - /opt/gptload-rs/config.toml:/app/config.toml:ro
+      - /opt/gptload-rs/data:/app/data
     restart: unless-stopped
     environment:
       - RUST_LOG=info
@@ -18,6 +18,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
-
-volumes:
-  gptload-data:
