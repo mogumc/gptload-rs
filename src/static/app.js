@@ -6,6 +6,7 @@
   const authStatus = document.getElementById('authStatus');
 
   const statsPre = document.getElementById('stats');
+  const statsGrid = document.getElementById('statsGrid');
 
   const requestsWindowSelect = document.getElementById('requestsWindow');
   const refreshRequestsChartBtn = document.getElementById('refreshRequestsChart');
@@ -1068,9 +1069,9 @@
         const data = dataLines.join('\n');
         try {
           const json = JSON.parse(data);
-          statsPre.textContent = JSON.stringify(json, null, 2);
+          renderStats(json);
         } catch (e) {
-          statsPre.textContent = data;
+          if (statsPre) statsPre.textContent = data;
         }
       }
       idx = buf.indexOf('\n\n');
@@ -1081,11 +1082,35 @@
     return buf;
   }
 
+  function renderStats(json) {
+    if (!statsGrid) return;
+    const stats = [
+      { label: '在线 Keys', value: json.keys_active ?? json.keys_total ?? '-', color: 'var(--ok)' },
+      { label: 'Invalid Keys', value: json.keys_invalid ?? '-', color: 'var(--bad)' },
+      { label: '并发请求', value: json.requests_inflight ?? '-', color: 'var(--accent)' },
+      { label: '队列深度', value: json.queue_depth ?? '-', color: json.queue_depth > 0 ? 'var(--bad)' : 'var(--ok)' },
+      { label: 'Upstreams', value: json.upstreams ?? '-', color: 'var(--text)' },
+      { label: '总请求', value: json.requests_total ?? '-', color: 'var(--text)' },
+      { label: '成功 2xx', value: json.responses_2xx ?? '-', color: 'var(--ok)' },
+      { label: '失败 4xx', value: json.responses_4xx ?? '-', color: 'var(--bad)' },
+      { label: '错误 5xx', value: json.responses_5xx ?? '-', color: 'var(--bad)' },
+      { label: '网络错误', value: json.errors_network ?? '-', color: 'var(--bad)' },
+      { label: '超时', value: json.errors_timeout ?? '-', color: 'var(--bad)' },
+      { label: '运行时间', value: json.uptime_secs != null ? formatDuration(json.uptime_secs * 1000) : '-', color: 'var(--text)' },
+    ];
+    statsGrid.innerHTML = stats.map(s => `
+      <div class="stat-card">
+        <div class="stat-label">${s.label}</div>
+        <div class="stat-value" style="color:${s.color}">${s.value}</div>
+      </div>
+    `).join('');
+  }
+
   async function startStatsStream() {
     stopStatsStream();
     const t = getToken();
     if (!t) {
-      statsPre.textContent = '未设置 token。';
+      if (statsGrid) statsGrid.innerHTML = '<div class="muted">未设置 token。</div>';
       return;
     }
 
@@ -1181,6 +1206,6 @@
     startRequestsAutoRefresh();
   } else {
     authStatus.textContent = '请输入并保存 admin token。';
-    statsPre.textContent = '未连接。';
+    if (statsGrid) statsGrid.innerHTML = '<div class="muted">未连接。</div>';
   }
 })();
