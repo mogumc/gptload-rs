@@ -21,7 +21,7 @@ env:
 
 jobs:
   build:
-    name: Build & Push Docker Image
+    name: Build (${{ matrix.arch }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -29,11 +29,9 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             arch: x86_64
-            platform: linux/amd64
             rustflags: "-C target-cpu=x86-64-v3"
           - target: aarch64-unknown-linux-gnu
             arch: arm64
-            platform: linux/arm64
             rustflags: "-C target-cpu=neoverse-n1"
 
     steps:
@@ -60,10 +58,9 @@ jobs:
 
       - name: Prepare Binary
         run: |
-          mkdir -p ./dist
           SOURCE_BIN="target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}"
           strip "$SOURCE_BIN" || true
-          cp "$SOURCE_BIN" ./dist/gptload-rs
+          cp "$SOURCE_BIN" ./gptload-rs
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -84,21 +81,21 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ matrix.arch == 'x86_64' }}
+            type=raw,value=${{ matrix.arch }}
 
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: ${{ matrix.platform }}
+          platforms: linux/${{ matrix.arch }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+
+      - name: Clean up binary
+        run: rm -f ./gptload-rs
 
   merge-manifests:
     name: Merge Multi-Arch Manifests
@@ -122,8 +119,8 @@ jobs:
           docker buildx imagetools create \
             -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG} \
             -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}-amd64 \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}-arm64
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:x86_64 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:arm64
 
       - name: Output image info
         run: |
@@ -133,3 +130,8 @@ jobs:
           echo ""
           echo "Pull command:"
           echo "  docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+
+      - name: Clean up arch tags
+        run: |
+          docker buildx imagetools delete ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:x86_64
+          docker buildx imagetools delete ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:arm64
