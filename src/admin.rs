@@ -9,8 +9,21 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 
-const INDEX_HTML: &str = include_str!("static/index.html");
-const APP_JS: &str = include_str!("static/app.js");
+// Embedded static files from dist/
+const INDEX_HTML: &str = include_str!("static/dist/index.html");
+const APP_JS: &str = include_str!("static/dist/app.js");
+const STYLE_CSS: &str = include_str!("static/dist/style.css");
+
+// File map for /web/ serving
+lazy_static::lazy_static! {
+    static ref WEB_FILES: BTreeMap<&'static str, (&'static str, &'static str)> = {
+        let mut m = BTreeMap::new();
+        m.insert("index.html", (INDEX_HTML, "text/html; charset=utf-8"));
+        m.insert("app.js", (APP_JS, "application/javascript; charset=utf-8"));
+        m.insert("style.css", (STYLE_CSS, "text/css; charset=utf-8"));
+        m
+    };
+}
 
 /// Read request body and parse as JSON. Returns error response on failure.
 async fn parse_json_body<T: serde::de::DeserializeOwned>(
@@ -45,31 +58,28 @@ fn get_upstream(
 pub async fn handle_admin(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
     let path = req.uri().path();
 
-    // Redirect /admin -> /admin/
-    if path == "/admin" {
+    // Redirect /admin -> /web/
+    if path == "/admin" || path == "/admin/" {
         return Response::builder()
             .status(301)
-            .header("location", "/admin/")
+            .header("location", "/web/")
             .body(Body::empty())
             .unwrap();
     }
 
-    // Static UI
-    if req.method() == Method::GET && (path == "/admin/" || path == "/admin/index.html") {
-        return Response::builder()
-            .status(200)
-            .header("content-type", "text/html; charset=utf-8")
-            .header("cache-control", "no-store")
-            .body(Body::from(INDEX_HTML))
-            .unwrap();
-    }
-    if req.method() == Method::GET && path == "/admin/app.js" {
-        return Response::builder()
-            .status(200)
-            .header("content-type", "application/javascript; charset=utf-8")
-            .header("cache-control", "no-store")
-            .body(Body::from(APP_JS))
-            .unwrap();
+    // Serve static files from /web/
+    if req.method() == Method::GET && path.starts_with("/web/") {
+        let file = path.strip_prefix("/web/").unwrap_or("index.html");
+        let file = if file.is_empty() || file == "/" { "index.html" } else { file };
+
+        if let Some((content, content_type)) = WEB_FILES.get(file) {
+            return Response::builder()
+                .status(200)
+                .header("content-type", *content_type)
+                .header("cache-control", "no-store")
+                .body(Body::from(*content))
+                .unwrap();
+        }
     }
 
     // API

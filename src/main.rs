@@ -82,7 +82,7 @@ fn print_startup_info(state: &Arc<state::RouterState>, addr: SocketAddr) {
     tracing::info!("  gptload-rs v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     tracing::info!(%addr, "listening");
-    tracing::info!(url = %format!("http://{}/admin/", addr), "admin panel");
+    tracing::info!(url = %format!("http://{}/web/", addr), "admin panel");
 
     // Admin tokens
     let token_count = admin_tokens.len();
