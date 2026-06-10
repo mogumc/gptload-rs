@@ -130,8 +130,3 @@ jobs:
           echo ""
           echo "Pull command:"
           echo "  docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-
-      - name: Clean up arch tags
-        run: |
-          docker buildx imagetools delete ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:x86_64
-          docker buildx imagetools delete ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:arm64
