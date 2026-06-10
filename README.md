@@ -118,7 +118,7 @@ RUST_LOG=info ./target/release/gptload-rs --config config.toml
 ```
 
 启动后：
-- **管理后台**: http://127.0.0.1:8080/admin/?token=your-admin-token
+- **管理后台**: http://127.0.0.1:8080/web/
 - **健康检查**: http://127.0.0.1:8080/health
 
 ---
