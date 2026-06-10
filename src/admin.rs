@@ -10,17 +10,36 @@ use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 
 // Embedded static files from dist/
-const INDEX_HTML: &str = include_str!("static/dist/index.html");
-const APP_JS: &str = include_str!("static/dist/app.js");
-const STYLE_CSS: &str = include_str!("static/dist/style.css");
+use include_dir::{include_dir, Dir};
+
+static DIST_DIR: Dir = include_dir!("src/static/dist");
 
 // File map for /web/ serving
 lazy_static::lazy_static! {
-    static ref WEB_FILES: BTreeMap<&'static str, (&'static str, &'static str)> = {
+    static ref WEB_FILES: BTreeMap<&'static str, (&'static [u8], &'static str)> = {
         let mut m = BTreeMap::new();
-        m.insert("index.html", (INDEX_HTML, "text/html; charset=utf-8"));
-        m.insert("app.js", (APP_JS, "application/javascript; charset=utf-8"));
-        m.insert("style.css", (STYLE_CSS, "text/css; charset=utf-8"));
+        for file in DIST_DIR.files() {
+            let path = file.path().to_str().unwrap_or("");
+            // Strip the "static/dist/" prefix to get the relative path.
+            let relative = path.strip_prefix("src/static/dist/").unwrap_or(path);
+            let content_type = match relative.rsplit('.').next() {
+                Some("html") => "text/html; charset=utf-8",
+                Some("js") => "application/javascript; charset=utf-8",
+                Some("css") => "text/css; charset=utf-8",
+                Some("woff") => "font/woff",
+                Some("woff2") => "font/woff2",
+                Some("ttf") => "font/ttf",
+                Some("otf") => "font/otf",
+                Some("json") => "application/json",
+                Some("png") => "image/png",
+                Some("jpg") | Some("jpeg") => "image/jpeg",
+                Some("gif") => "image/gif",
+                Some("svg") => "image/svg+xml",
+                Some("ico") => "image/x-icon",
+                _ => "application/octet-stream",
+            };
+            m.insert(relative, (file.contents(), content_type));
+        }
         m
     };
 }

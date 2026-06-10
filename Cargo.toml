@@ -34,6 +34,7 @@ hyper-proxy = "0.9.1"
 tokio-socks = "0.5.3"
 base64 = "0.22"
 percent-encoding = "2"
+include_dir = "0.7"
 
 # 优化编译配置
 [profile.release]
