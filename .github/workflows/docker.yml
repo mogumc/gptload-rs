@@ -1,0 +1,136 @@
+name: Docker Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag (例如 v1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  BINARY_NAME: gptload-rs
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            platform: linux/amd64
+            rustflags: "-C target-cpu=x86-64-v3"
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            platform: linux/arm64
+            rustflags: "-C target-cpu=neoverse-n1"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Cross
+        run: cargo install cross --git https://github.com/cross-rs/cross.git
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build Optimized Binary
+        run: |
+          export RUSTFLAGS="${{ matrix.rustflags }} -C codegen-units=1 -C llvm-args=-inline-threshold=500"
+          cross build --release --target ${{ matrix.target }}
+
+      - name: Prepare Binary
+        run: |
+          mkdir -p ./dist
+          SOURCE_BIN="target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}"
+          strip "$SOURCE_BIN" || true
+          cp "$SOURCE_BIN" ./dist/gptload-rs
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ matrix.arch == 'x86_64' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  merge-manifests:
+    name: Merge Multi-Arch Manifests
+    needs: build
+    runs-on: ubuntu-latest
+    if: matrix.arch == 'x86_64'
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest list
+        run: |
+          TAG="${{ github.event.inputs.tag_name || github.ref_name }}"
+          docker buildx imagetools create \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG} \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}-amd64 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}-arm64
+
+      - name: Output image info
+        run: |
+          echo "✅ Docker image published!"
+          echo "📦 Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo "🏷️ Tags: latest, ${{ github.event.inputs.tag_name || github.ref_name }}"
+          echo ""
+          echo "Pull command:"
+          echo "  docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
