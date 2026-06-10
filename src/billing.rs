@@ -170,17 +170,36 @@ impl BillingStore {
     }
 
     pub fn settle_reserved_usage(&self, key: &str, total_tokens: u64) -> Option<i64> {
-        // -1 means unlimited, no adjustment needed
-        let cur_balance = self.get_balance(key)?;
-        if cur_balance == -1 {
-            return Some(-1);
-        }
+        let map = self.balances.read().ok()?;
+        let balance = map.get(key)?.clone();
+        drop(map);
+
         let delta = i64::try_from(total_tokens).ok()?;
         let adjustment = 1i64.saturating_sub(delta);
         if adjustment == 0 {
-            return self.get_balance(key);
+            return Some(balance.load(Ordering::Relaxed));
         }
-        self.adjust_balance(key, adjustment)
+
+        let mut cur = balance.load(Ordering::Relaxed);
+        loop {
+            // -1 means unlimited, no adjustment needed (concurrent promotion)
+            if cur == -1 {
+                return Some(-1);
+            }
+            let new_balance = cur.saturating_add(adjustment);
+            // Clamp to 0 to prevent going into debt
+            let clamped = if new_balance < 0 { 0 } else { new_balance };
+            match balance.compare_exchange(cur, clamped, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => {
+                    let _ = self.persist_tx.send(PersistUpdate::Set {
+                        key: key.to_string(),
+                        balance: clamped,
+                    });
+                    return Some(clamped);
+                }
+                Err(v) => cur = v,
+            }
+        }
     }
 }
 

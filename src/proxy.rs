@@ -166,7 +166,7 @@ async fn handle_inner(
         }
     };
 
-    if balance <= 0 {
+    if balance <= 0 && balance != -1 {
         return logged_json_error(
             &state,
             &base_log_ctx,
