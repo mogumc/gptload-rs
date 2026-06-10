@@ -104,7 +104,6 @@ jobs:
     name: Merge Multi-Arch Manifests
     needs: build
     runs-on: ubuntu-latest
-    if: matrix.arch == 'x86_64'
 
     steps:
       - name: Set up Docker Buildx
