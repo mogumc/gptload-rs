@@ -96,6 +96,10 @@ impl BillingStore {
         let balance = map.get(key)?.clone();
         drop(map);
         let mut cur = balance.load(Ordering::Relaxed);
+        // -1 means unlimited, reject any adjustment to protect the sentinel
+        if cur == -1 {
+            return Some(-1);
+        }
         loop {
             let new_balance = cur.saturating_add(delta);
             match balance.compare_exchange(cur, new_balance, Ordering::Relaxed, Ordering::Relaxed) {
@@ -122,6 +126,10 @@ impl BillingStore {
         drop(map);
 
         let mut cur = balance.load(Ordering::Relaxed);
+        // -1 means unlimited, always succeed without decrementing
+        if cur == -1 {
+            return ReserveResult::Reserved;
+        }
         loop {
             if cur <= 0 {
                 return ReserveResult::Insufficient;
@@ -154,10 +162,19 @@ impl BillingStore {
     }
 
     pub fn release_reservation(&self, key: &str) -> Option<i64> {
+        // -1 means unlimited, nothing to release
+        if self.get_balance(key) == Some(-1) {
+            return Some(-1);
+        }
         self.adjust_balance(key, 1)
     }
 
     pub fn settle_reserved_usage(&self, key: &str, total_tokens: u64) -> Option<i64> {
+        // -1 means unlimited, no adjustment needed
+        let cur_balance = self.get_balance(key)?;
+        if cur_balance == -1 {
+            return Some(-1);
+        }
         let delta = i64::try_from(total_tokens).ok()?;
         let adjustment = 1i64.saturating_sub(delta);
         if adjustment == 0 {

@@ -241,7 +241,7 @@ async fn api_billing_create_key(req: Request<Body>, state: Arc<RouterState>) -> 
             "bad_request",
         );
     }
-    let balance = payload.balance.unwrap_or(0).max(0);
+    let balance = payload.balance.unwrap_or(0).max(-1);
     let created = match state.billing.create_key(key.to_string(), balance) {
         Ok(v) => v,
         Err(e) => {
