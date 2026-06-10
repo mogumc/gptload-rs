@@ -35,3 +35,12 @@ venv/
 .DS_Store
 Thumbs.db
 mimo_testkeys.txt
+
+# Agent
+.copilt/
+.trae/
+.claude/
+.codex/
+.codebuddy/
+.workbuddy/
+.trellis/
