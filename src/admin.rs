@@ -58,19 +58,11 @@ fn get_upstream(
 pub async fn handle_admin(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
     let path = req.uri().path();
 
-    // Redirect /admin -> /web/
-    if path == "/admin" || path == "/admin/" {
-        return Response::builder()
-            .status(301)
-            .header("location", "/web/")
-            .body(Body::empty())
-            .unwrap();
-    }
-
     // Serve static files from /web/
-    if req.method() == Method::GET && path.starts_with("/web/") {
-        let file = path.strip_prefix("/web/").unwrap_or("index.html");
-        let file = if file.is_empty() || file == "/" { "index.html" } else { file };
+    if req.method() == Method::GET && path.starts_with("/web") {
+        let file = path.strip_prefix("/web").unwrap_or("");
+        let file = file.strip_prefix('/').unwrap_or("");
+        let file = if file.is_empty() { "index.html" } else { file };
 
         if let Some((content, content_type)) = WEB_FILES.get(file) {
             return Response::builder()
@@ -80,6 +72,13 @@ pub async fn handle_admin(req: Request<Body>, state: Arc<RouterState>) -> Respon
                 .body(Body::from(*content))
                 .unwrap();
         }
+
+        // File not found in dist
+        return Response::builder()
+            .status(404)
+            .header("content-type", "text/plain; charset=utf-8")
+            .body(Body::from("404 Not Found"))
+            .unwrap();
     }
 
     // API

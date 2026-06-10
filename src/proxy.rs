@@ -101,7 +101,7 @@ async fn handle_inner(
     }
 
     // Admin UI/API.
-    if path.starts_with("/admin") {
+    if path.starts_with("/admin") || path.starts_with("/web") {
         return admin::handle_admin(req, state).await;
     }
 
