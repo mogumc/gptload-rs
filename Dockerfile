@@ -1,6 +1,6 @@
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata libssl3
 
 WORKDIR /app
 
