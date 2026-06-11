@@ -2091,27 +2091,25 @@ async fn cleanup_request_log(path: &Path, retention_days: u64) -> (usize, usize)
     (kept, removed)
 }
 
-/// Spawn a task that periodically cleans old request log entries.
-/// Runs immediately at startup, then every 24 hours.
+/// Spawn a task that cleans old request log entries once daily at a fixed time (03:00 UTC).
 pub fn spawn_request_log_cleanup(path: PathBuf, retention_days: u64) {
     if retention_days == 0 {
         return;
     }
     tokio::spawn(async move {
-        // Run immediately.
-        let (kept, removed) = cleanup_request_log(&path, retention_days).await;
-        tracing::info!(
-            path = %path.display(),
-            kept,
-            removed,
-            retention_days,
-            "request log cleanup: {kept} kept, {removed} removed (>{retention_days}d)"
-        );
-
-        // Then every 24 hours.
-        let mut interval = tokio::time::interval(Duration::from_secs(86_400));
         loop {
-            interval.tick().await;
+            // Sleep until next 03:00 UTC.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let day_secs = 86_400;
+            let target_hour = 3;
+            let target_secs = target_hour * 3600;
+            let today_target = (now.as_secs() / day_secs as u64) * day_secs as u64 + target_secs as u64;
+            let next_target = if today_target > now.as_secs() { today_target } else { today_target + day_secs as u64 };
+            let wait_secs = next_target.saturating_sub(now.as_secs());
+            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+
             let (kept, removed) = cleanup_request_log(&path, retention_days).await;
             tracing::info!(
                 path = %path.display(),
