@@ -287,7 +287,21 @@ async fn api_billing_overview(state: Arc<RouterState>) -> Response<Body> {
     }).collect();
 
     let stats = &state.stats;
-    json_ok(&serde_json::json!({
+        let mut platform_tokens: u64 = 0;
+        let mut platform_credits: i64 = 0;
+        let mut key_usages: Vec<serde_json::Value> = Vec::with_capacity(keys.len());
+        for (key, _balance) in &keys {
+            let (tokens, credits) = state.store.get_key_usage(key);
+            platform_tokens += tokens;
+            platform_credits += credits;
+            key_usages.push(serde_json::json!({
+                "key": key,
+                "tokens": tokens,
+                "credits": credits as f64 / crate::billing::MICRO_PER_CREDIT as f64
+            }));
+        }
+
+        json_ok(&serde_json::json!({
         "billing": {
             "total_keys": total_keys,
             "unlimited_keys": unlimited_count,
@@ -296,6 +310,11 @@ async fn api_billing_overview(state: Arc<RouterState>) -> Response<Body> {
             "total_balance": total_balance as f64 / crate::billing::MICRO_PER_CREDIT as f64,
         },
         "model_costs": model_costs,
+        "usage": {
+            "tokens": platform_tokens,
+            "credits": platform_credits as f64 / crate::billing::MICRO_PER_CREDIT as f64,
+        },
+        "key_usage": key_usages,
         "upstreams": upstream_summary,
         "requests_total": stats.requests_total.load(std::sync::atomic::Ordering::Relaxed),
         "requests_inflight": stats.requests_inflight.load(std::sync::atomic::Ordering::Relaxed),
@@ -319,6 +338,17 @@ async fn api_billing_create_key(req: Request<Body>, state: Arc<RouterState>) -> 
         return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request");
     }
     let balance_credits = payload.balance.unwrap_or(0).max(-1);
+    // Reject balances that would overflow i64 when converted to micro-credits.
+    if balance_credits > 0 && balance_credits > crate::billing::MAX_BALANCE_CREDITS {
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            &format!(
+                "balance exceeds maximum allowed ({} credits)",
+                crate::billing::MAX_BALANCE_CREDITS
+            ),
+            "bad_request",
+        );
+    }
     let balance_micro = if balance_credits == -1 { -1 } else { balance_credits.saturating_mul(crate::billing::MICRO_PER_CREDIT) };
     let created = match state.billing.create_key(key.to_string(), balance_micro) {
         Ok(v) => v,
@@ -1105,22 +1135,7 @@ async fn api_requests_history(state: Arc<RouterState>, uri: &http::Uri) -> Respo
 
     let path = state.requests_log_path.clone();
     let items = tokio::task::spawn_blocking(move || {
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        let mut out: Vec<serde_json::Value> = Vec::with_capacity(limit);
-        for line in content.lines().rev() {
-            if out.len() >= limit { break; }
-            let line = line.trim();
-            if line.is_empty() { continue; }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if let Some(before) = before {
-                    if let Some(ts) = v.get("ts_ms").and_then(|t| t.as_u64()) {
-                        if ts >= before { continue; }
-                    }
-                }
-                out.push(v);
-            }
-        }
-        out
+        read_request_log_reverse(&path, limit, before)
     }).await.unwrap_or_default();
 
     json_ok(&serde_json::json!({
@@ -2062,4 +2077,112 @@ fn json_ok<T: ?Sized + Serialize>(v: &T) -> Response<Body> {
         .header("cache-control", "no-store")
         .body(Body::from(body))
         .unwrap()
+}
+
+/// Read JSONL log file from end to start using reverse chunk reading.
+/// Avoids loading the entire file into memory — only accumulates matching entries.
+fn read_request_log_reverse(
+    path: &std::path::Path,
+    limit: usize,
+    before: Option<u64>,
+) -> Vec<serde_json::Value> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let file_size = match file.seek(SeekFrom::End(0)) {
+        Ok(n) => n,
+        Err(_) => return Vec::new(),
+    };
+    if file_size == 0 {
+        return Vec::new();
+    }
+
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(limit);
+    let mut leftover: Vec<u8> = Vec::new(); // bytes of a line that crosses chunk boundary
+    let mut chunk = vec![0u8; 4096];
+    let mut pos = file_size;
+
+    while pos > 0 && out.len() < limit {
+        let read_size = (pos as usize).min(chunk.len());
+        pos -= read_size as u64;
+        if file.seek(SeekFrom::Start(pos)).is_err() {
+            break;
+        }
+        if file.read_exact(&mut chunk[..read_size]).is_err() {
+            break;
+        }
+
+        // Prepend the current chunk to leftover to form complete lines at the boundary.
+        let mut combined = chunk[..read_size].to_vec();
+        combined.extend_from_slice(&leftover);
+        leftover.clear();
+
+        // Split into lines (keep empty slices to detect trailing newline).
+        let mut lines: Vec<&[u8]> = combined.split(|&b| b == b'\n').collect();
+
+        // If the file doesn't end with a newline, the first segment of the
+        // first chunk is not really a line — it's the last incomplete line.
+        if pos == 0 && lines.len() == 1 && !lines[0].is_empty() {
+            // Single line at the very beginning, no trailing newline.
+            if let Ok(text) = std::str::from_utf8(lines[0]) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                        if passes_before(&v, before) && out.len() < limit {
+                            out.push(v);
+                        }
+                    }
+                }
+            }
+            break;
+        }
+
+        // The first entry (after split) is the start of a line that was cut;
+        // save it for the previous chunk. Process the rest in reverse.
+        let carry = lines.remove(0);
+        leftover = carry.to_vec();
+
+        for raw in lines.iter().rev() {
+            if out.len() >= limit {
+                break;
+            }
+            if let Ok(text) = std::str::from_utf8(raw) {
+                let text = text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                    if passes_before(&v, before) {
+                        out.push(v);
+                    }
+                }
+            }
+        }
+    }
+
+    // Process the final leftover from the beginning of the file.
+    if !leftover.is_empty() && out.len() < limit {
+        if let Ok(text) = std::str::from_utf8(&leftover) {
+            let text = text.trim();
+            if !text.is_empty() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                    if passes_before(&v, before) {
+                        out.push(v);
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn passes_before(v: &serde_json::Value, before: Option<u64>) -> bool {
+    match before {
+        Some(b) => v.get("ts_ms").and_then(|t| t.as_u64()).map(|ts| ts < b).unwrap_or(true),
+        None => true,
+    }
 }

@@ -38,6 +38,10 @@ impl KeyStore {
         Ok(self.db.open_tree("key_levels")?)
     }
 
+    pub fn open_key_usage_tree(&self) -> anyhow::Result<sled::Tree> {
+        Ok(self.db.open_tree("key_usage")?)
+    }
+
     /// Get the permission level for a key. Default 0 if not set.
     pub fn get_key_level(&self, key: &str) -> i32 {
         let tree = match self.open_key_levels_tree() {
@@ -72,6 +76,71 @@ impl KeyStore {
         let tree = self.open_key_levels_tree()?;
         tree.insert(key.as_bytes(), &level.to_le_bytes())?;
         tree.flush()?;
+        Ok(())
+    }
+
+    /// Monthly usage per key: (total_tokens, credits_micro) as 2×8 LE bytes.
+    pub fn get_key_usage(&self, key: &str) -> (u64, i64) {
+        let tree = match self.open_key_usage_tree() {
+            Ok(t) => t,
+            Err(_) => return (0, 0),
+        };
+        match tree.get(key.as_bytes()) {
+            Ok(Some(v)) if v.len() == 16 => {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&v[0..8]);  let tokens = u64::from_le_bytes(arr);
+                arr.copy_from_slice(&v[8..16]); let credits = i64::from_le_bytes(arr);
+                (tokens, credits)
+            }
+            _ => (0, 0),
+        }
+    }
+
+    pub fn add_key_usage(&self, key: &str, tokens: u64, credits: i64) -> anyhow::Result<()> {
+        let tree = self.open_key_usage_tree()?;
+        let (ct, cc) = self.get_key_usage(key);
+        let new = [
+            (ct + tokens).to_le_bytes(),
+            (cc + credits).to_le_bytes(),
+        ].concat();
+        tree.insert(key.as_bytes(), new.as_slice())?;
+        tree.flush()?;
+        Ok(())
+    }
+
+    /// Check and reset monthly usage if month changed.
+    pub fn check_monthly_reset(&self) -> anyhow::Result<()> {
+        let tree = self.open_key_usage_tree()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Calendar month: year*12 + month (UTC), using civil_from_days algorithm.
+        let days = now / 86_400;
+        let z = days + 719468;
+        let era = z / 146097;
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let year = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let current_month: u64 = year * 12 + month as u64;
+        let reset_key = b"__reset_month";
+        let last_month = tree.get(reset_key)?.and_then(|v| {
+            if v.len() == 8 {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&v);
+                Some(u64::from_le_bytes(arr))
+            } else { None }
+        }).unwrap_or(0);
+
+        if last_month != current_month {
+            tree.clear()?;
+            tree.insert(reset_key, &current_month.to_le_bytes())?;
+            tree.flush()?;
+            tracing::info!(last_month, current_month, "monthly key usage reset");
+        }
         Ok(())
     }
 

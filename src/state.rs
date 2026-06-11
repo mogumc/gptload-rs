@@ -57,6 +57,7 @@ pub struct RouterState {
     pub listen_addr: String,
     pub worker_threads: Option<usize>,
     pub data_dir: PathBuf,
+    pub log_write_pause: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -122,6 +123,7 @@ impl Clone for RouterState {
             listen_addr: self.listen_addr.clone(),
             worker_threads: self.worker_threads,
             data_dir: self.data_dir.clone(),
+            log_write_pause: self.log_write_pause.clone(),
         }
     }
 }
@@ -516,7 +518,8 @@ impl RouterState {
         let model_routes_path = data_dir.join("models_routes.json");
         let upstreams_path = data_dir.join("upstreams.json");
         let requests_log_path = data_dir.join("requests.jsonl");
-        let log_tx = start_request_log_writer(requests_log_path.clone());
+        let log_pause = Arc::new(AtomicBool::new(false));
+        let log_tx = start_request_log_writer(requests_log_path.clone(), log_pause.clone());
         let requests = Arc::new(RequestsLog::new(5000, log_tx));
 
         // Load last 5000 entries from file into memory.
@@ -542,8 +545,14 @@ impl RouterState {
             );
         }
 
+        // Check monthly usage reset.
+        if let Err(e) = store.check_monthly_reset() {
+            tracing::warn!("monthly usage reset check failed: {e}");
+        }
+        spawn_monthly_reset_check(store.clone());
+
         let retention_days = runtime.server.request_log_retention_days;
-        spawn_request_log_cleanup(requests_log_path.clone(), retention_days);
+        spawn_request_log_cleanup(requests_log_path.clone(), retention_days, log_pause.clone());
 
         let mut upstream_configs: Vec<UpstreamConfig> = Vec::new();
         if let Ok(list) = load_upstreams_override(&upstreams_path) {
@@ -605,6 +614,7 @@ impl RouterState {
             listen_addr: cfg.listen_addr.clone(),
             worker_threads: cfg.worker_threads,
             data_dir,
+            log_write_pause: log_pause,
         })
     }
 
@@ -2021,7 +2031,7 @@ fn update_bucket(
     }
 }
 
-fn start_request_log_writer(path: PathBuf) -> Option<mpsc::Sender<RequestLogEntry>> {
+fn start_request_log_writer(path: PathBuf, pause: Arc<AtomicBool>) -> Option<mpsc::Sender<RequestLogEntry>> {
     let (tx, mut rx) = mpsc::channel::<RequestLogEntry>(2048);
 
     tokio::spawn(async move {
@@ -2040,11 +2050,16 @@ fn start_request_log_writer(path: PathBuf) -> Option<mpsc::Sender<RequestLogEntr
 
         let mut pending = 0usize;
         let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut pause_buf: Vec<RequestLogEntry> = Vec::new();
 
         loop {
             tokio::select! {
                 entry = rx.recv() => {
                     let Some(entry) = entry else { break; };
+                    if pause.load(Ordering::Relaxed) {
+                        pause_buf.push(entry);
+                        continue;
+                    }
                     if let Ok(line) = serde_json::to_string(&entry) {
                         if file.write_all(line.as_bytes()).await.is_ok() {
                             let _ = file.write_all(b"\n").await;
@@ -2057,9 +2072,24 @@ fn start_request_log_writer(path: PathBuf) -> Option<mpsc::Sender<RequestLogEntr
                     }
                 }
                 _ = tick.tick() => {
-                    if pending > 0 {
-                        let _ = file.flush().await;
-                        pending = 0;
+                    if !pause.load(Ordering::Relaxed) {
+                        // Drain any buffered entries after pause ends.
+                        while let Some(entry) = pause_buf.pop() {
+                            if let Ok(line) = serde_json::to_string(&entry) {
+                                if file.write_all(line.as_bytes()).await.is_ok() {
+                                    let _ = file.write_all(b"\n").await;
+                                    pending += 1;
+                                }
+                            }
+                            if pending >= 256 {
+                                let _ = file.flush().await;
+                                pending = 0;
+                            }
+                        }
+                        if pending > 0 {
+                            let _ = file.flush().await;
+                            pending = 0;
+                        }
                     }
                 }
             }
@@ -2072,16 +2102,29 @@ fn start_request_log_writer(path: PathBuf) -> Option<mpsc::Sender<RequestLogEntr
 }
 
 /// Clean old request log entries from the JSONL file.
+/// Uses temp-file + rename to avoid data loss from concurrent writes.
 /// Returns (entries_kept, entries_removed).
-async fn cleanup_request_log(path: &Path, retention_days: u64) -> (usize, usize) {
+async fn cleanup_request_log(
+    path: &Path,
+    retention_days: u64,
+    pause: &AtomicBool,
+) -> (usize, usize) {
     if retention_days == 0 {
         return (0, 0);
     }
     let cutoff_ms = now_ms().saturating_sub(retention_days * 86_400_000);
 
+    // Pause log writer to prevent concurrent writes.
+    pause.store(true, Ordering::Relaxed);
+    // Brief wait for in-flight writes to finish (writer flushes every 1s).
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
     let content = match tokio::fs::read_to_string(path).await {
         Ok(c) => c,
-        Err(_) => return (0, 0), // file doesn't exist or can't be read
+        Err(_) => {
+            pause.store(false, Ordering::Relaxed);
+            return (0, 0);
+        }
     };
 
     let mut kept = 0usize;
@@ -2093,7 +2136,6 @@ async fn cleanup_request_log(path: &Path, retention_days: u64) -> (usize, usize)
         if line.is_empty() {
             continue;
         }
-        // Parse timestamp to decide keep/remove, then clone only if kept.
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
             if let Some(ts) = v.get("ts_ms").and_then(|t| t.as_u64()) {
                 if ts < cutoff_ms {
@@ -2108,17 +2150,26 @@ async fn cleanup_request_log(path: &Path, retention_days: u64) -> (usize, usize)
     }
 
     if removed > 0 {
-        if let Err(e) = tokio::fs::write(path, &new_content).await {
+        let tmp_path = path.with_extension("jsonl.tmp");
+        let result = async {
+            tokio::fs::write(&tmp_path, &new_content).await?;
+            tokio::fs::rename(&tmp_path, path).await?;
+            Ok::<_, std::io::Error>(())
+        }.await;
+
+        if let Err(e) = result {
             tracing::warn!(path = %path.display(), error = %e, "request log cleanup write failed");
+            pause.store(false, Ordering::Relaxed);
             return (0, 0);
         }
     }
 
+    pause.store(false, Ordering::Relaxed);
     (kept, removed)
 }
 
 /// Spawn a task that cleans old request log entries once daily at a fixed time (03:00 UTC).
-pub fn spawn_request_log_cleanup(path: PathBuf, retention_days: u64) {
+pub fn spawn_request_log_cleanup(path: PathBuf, retention_days: u64, pause: Arc<AtomicBool>) {
     if retention_days == 0 {
         return;
     }
@@ -2136,7 +2187,7 @@ pub fn spawn_request_log_cleanup(path: PathBuf, retention_days: u64) {
             let wait_secs = next_target.saturating_sub(now.as_secs());
             tokio::time::sleep(Duration::from_secs(wait_secs)).await;
 
-            let (kept, removed) = cleanup_request_log(&path, retention_days).await;
+            let (kept, removed) = cleanup_request_log(&path, retention_days, &pause).await;
             tracing::info!(
                 path = %path.display(),
                 kept,
@@ -2144,6 +2195,26 @@ pub fn spawn_request_log_cleanup(path: PathBuf, retention_days: u64) {
                 retention_days,
                 "request log cleanup: {kept} kept, {removed} removed (>{retention_days}d)"
             );
+        }
+    });
+}
+
+/// Spawn a task that checks monthly key usage reset daily at 03:05 UTC.
+pub fn spawn_monthly_reset_check(store: Arc<crate::storage::KeyStore>) {
+    tokio::spawn(async move {
+        loop {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let day_secs = 86_400;
+            let target_secs = 3 * 3600 + 300; // 03:05 UTC
+            let today_target = (now.as_secs() / day_secs as u64) * day_secs as u64 + target_secs as u64;
+            let next_target = if today_target > now.as_secs() { today_target } else { today_target + day_secs as u64 };
+            tokio::time::sleep(Duration::from_secs(next_target.saturating_sub(now.as_secs()))).await;
+
+            if let Err(e) = store.check_monthly_reset() {
+                tracing::warn!("monthly usage reset failed: {e}");
+            }
         }
     });
 }

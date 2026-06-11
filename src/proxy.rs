@@ -1158,10 +1158,12 @@ fn proxy_upstream_response(
                 let _ = state.billing.settle_reserved_usage(
                     key, found.prompt, found.completion, model, model_costs,
                 );
+                let cost = crate::billing::compute_credit_cost(found.prompt, found.completion, model, model_costs);
                 state.stats.prompt_tokens_total.fetch_add(found.prompt, std::sync::atomic::Ordering::Relaxed);
                 state.stats.completion_tokens_total.fetch_add(found.completion, std::sync::atomic::Ordering::Relaxed);
                 state.stats.thought_tokens_total.fetch_add(found.thought, std::sync::atomic::Ordering::Relaxed);
                 state.stats.tokens_total.fetch_add(found.total, std::sync::atomic::Ordering::Relaxed);
+                let _ = state.store.add_key_usage(key, found.total, cost);
             } else {
                 let _ = state.billing.release_reservation(key);
             }

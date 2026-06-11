@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 /// Balance unit: 1 credit = 1,000,000 micro-credits (6 decimal places).
 pub const MICRO_PER_CREDIT: i64 = 1_000_000;
+/// Maximum balance credits that fit in i64 when converted to micro-credits.
+pub const MAX_BALANCE_CREDITS: i64 = i64::MAX / MICRO_PER_CREDIT;
 /// Minimum charge: 1 micro-credit.
 const MIN_COST_MICRO: i64 = 1;
 
@@ -271,7 +273,7 @@ fn flush_pending(tree: &sled::Tree, pending: &mut AHashMap<String, i64>) {
 
 /// Cost in micro-credits: ceil((prompt×input + completion×output)/1000 × 1_000_000).
 /// Unknown models fall back to input=0, output=1.0. Minimum 1 micro-credit.
-fn compute_credit_cost(
+pub fn compute_credit_cost(
     prompt_tokens: u64,
     completion_tokens: u64,
     model: &str,
