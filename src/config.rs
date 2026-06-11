@@ -40,9 +40,41 @@ pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
 
+    /// OpenTelemetry & structured logging configuration.
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
+
     pub key: KeyConfig,
 
     pub upstreams: Vec<UpstreamConfig>,
+}
+
+/// OpenTelemetry tracing configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TelemetryConfig {
+    /// OTLP HTTP endpoint for trace export (e.g. "http://localhost:4318/v1/traces").
+    /// When set, OpenTelemetry trace export is enabled.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+
+    /// Service name reported in traces.
+    #[serde(default = "TelemetryConfig::default_service_name")]
+    pub service_name: String,
+}
+
+impl TelemetryConfig {
+    fn default_service_name() -> String {
+        "gptload-rs".to_string()
+    }
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: None,
+            service_name: Self::default_service_name(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -32,6 +32,12 @@ export_token = "your-export-secret"
 # Where to store the embedded key database (sled). Will be created if missing.
 data_dir = "./data"
 
+# OpenTelemetry tracing. OTLP trace export is disabled when not configured.
+[telemetry]
+# OTLP HTTP endpoint for trace export (e.g. Jaeger: "http://localhost:4318/v1/traces").
+# otlp_endpoint = "http://localhost:4318/v1/traces"
+# service_name = "gptload-rs"
+
 # Enable stream usage injection for these upstream ids (adds stream_options.include_usage).
 # usage_inject_upstreams = ["openai"]
 

@@ -11,6 +11,8 @@ use hyper::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ORIGIN};
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server};
+use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
@@ -19,8 +21,81 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 static REQUEST_LOG_ID: AtomicU64 = AtomicU64::new(1);
+
+// ── W3C TraceContext helpers ──────────────────────────────────────────
+
+struct HeaderExtractor<'a>(&'a hyper::HeaderMap);
+
+impl<'a> Extractor for HeaderExtractor<'a> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|k| k.as_str()).collect()
+    }
+}
+
+struct HeaderInjector<'a>(&'a mut hyper::HeaderMap);
+
+impl<'a> Injector for HeaderInjector<'a> {
+    fn set(&mut self, key: &str, value: String) {
+        if let (Ok(name), Ok(val)) = (
+            http::HeaderName::from_bytes(key.as_bytes()),
+            http::HeaderValue::from_str(&value),
+        ) {
+            self.0.insert(name, val);
+        }
+    }
+}
+
+fn extract_trace_context(headers: &hyper::HeaderMap) -> opentelemetry::Context {
+    let propagator = TraceContextPropagator::new();
+    propagator.extract(&HeaderExtractor(headers))
+}
+
+/// Resolve the real client IP from headers set by reverse proxies (nginx, etc.).
+///
+/// Checks `X-Forwarded-For` (takes the leftmost non-trusted IP),
+/// then `X-Real-IP`, falling back to the TCP peer address.
+fn resolve_client_ip(req: &hyper::HeaderMap, peer: SocketAddr) -> String {
+    // X-Forwarded-For: client, proxy1, proxy2, ...
+    if let Some(xff) = req
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+    {
+        // Take the leftmost address (original client).
+        let first = xff.split(',').next().unwrap_or("").trim();
+        if !first.is_empty() {
+            return first.to_string();
+        }
+    }
+
+    // X-Real-IP (nginx single-IP alternative).
+    if let Some(xri) = req
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+    {
+        return xri.trim().to_string();
+    }
+
+    // Fall back to TCP peer address.
+    peer.ip().to_string()
+}
+
+fn inject_trace_context(headers: &mut hyper::HeaderMap) {
+    let cx = tracing::Span::current().context();
+    let propagator = TraceContextPropagator::new();
+    propagator.inject_context(&cx, &mut HeaderInjector(headers));
+}
+
+// ── HTTP server ───────────────────────────────────────────────────────
 
 pub async fn serve_http<F>(
     addr: SocketAddr,
@@ -69,6 +144,23 @@ async fn handle_inner(
     state: Arc<RouterState>,
     client_addr: SocketAddr,
 ) -> Response<Body> {
+    let path_for_span = req.uri().path().to_string();
+    let method_for_span = req.method().clone();
+    let parent_cx = extract_trace_context(req.headers());
+    let client_ip = resolve_client_ip(req.headers(), client_addr);
+
+    let span = {
+        let s = tracing::info_span!(
+            "proxy.request",
+            http.method = %method_for_span,
+            http.url = %path_for_span,
+            net.peer.ip = %client_ip,
+        );
+        s.set_parent(parent_cx);
+        s
+    };
+
+    async move {
     let path = req.uri().path().to_string();
 
     // Health check.
@@ -114,7 +206,6 @@ async fn handle_inner(
     }
 
     let start = Instant::now();
-    let client_ip = client_addr.ip().to_string();
     let method = req.method().clone();
     let base_log_ctx = RequestLogContext::new(
         start,
@@ -222,6 +313,9 @@ async fn handle_inner(
         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
     resp
+    }
+    .instrument(span)
+    .await
 }
 
 enum AttemptResult {
@@ -326,7 +420,16 @@ async fn execute_attempt(
         }
     }
 
-    let res = tokio::time::timeout(state.request_timeout(), upstream.client.request(out_req)).await;
+    let http_span = tracing::info_span!(
+        "proxy.upstream_http",
+        upstream.id = %sel.upstream.id,
+        upstream.base_url = %upstream.base_url,
+        model = %log_ctx.model.as_deref().unwrap_or_default(),
+    );
+
+    let res = tokio::time::timeout(state.request_timeout(), upstream.client.request(out_req))
+        .instrument(http_span)
+        .await;
 
     match res {
         Ok(Ok(up_resp)) => {
@@ -582,11 +685,22 @@ async fn forward(
 
     // Retry policy from config.
     let max_retries = state.max_retries();
+
+    let forward_span = tracing::info_span!(
+        "proxy.forward",
+        model = %model,
+        stream = stream_request,
+    );
+
+    let state_c = state.clone();
+    let mut log_ctx_c = log_ctx.clone();
+
+    async move {
     let mut retry_count = 0;
     let mut billing_reserved = false;
 
     loop {
-        log_ctx.upstream_id = Some(sel.upstream.id.to_string());
+        log_ctx_c.upstream_id = Some(sel.upstream.id.to_string());
         let upstream = &sel.upstream;
 
         // Track per-key concurrency for this attempt.
@@ -595,7 +709,7 @@ async fn forward(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let result = execute_attempt(
-            &state,
+            &state_c,
             &sel,
             upstream,
             &original_pq,
@@ -606,7 +720,7 @@ async fn forward(
             injected,
             &mut billing_reserved,
             &billing_key,
-            &log_ctx,
+            &log_ctx_c,
             stream_request,
         )
         .await;
@@ -615,7 +729,7 @@ async fn forward(
         sel.key
             .active_requests
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        state.notify_capacity();
+        state_c.notify_capacity();
 
         match result {
             AttemptResult::Success(resp) => return resp,
@@ -633,6 +747,9 @@ async fn forward(
             }
         }
     }
+    }
+    .instrument(forward_span)
+    .await
 }
 
 async fn wait_for_selection(
@@ -911,6 +1028,9 @@ fn build_upstream_request(
             out_req.headers_mut().insert(CONTENT_LENGTH, v);
         }
     }
+
+    // Inject W3C TraceContext for distributed tracing.
+    inject_trace_context(out_req.headers_mut());
 
     Ok(out_req)
 }
