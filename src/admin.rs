@@ -7,42 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio_stream::wrappers::ReceiverStream;
-
-// Embedded static files from dist/
-use rust_embed::RustEmbed;
-
-#[derive(RustEmbed)]
-#[folder = "src/static/dist"]
-struct Asset;
-
-/// Get content-type and cache-control for a file path.
-fn mime_and_cache(path: &str) -> (&'static str, &'static str) {
-    match path.rsplit('.').next() {
-        Some("html") => ("text/html; charset=utf-8", "no-store"),
-        Some("js") => ("application/javascript; charset=utf-8", "max-age=31536000, immutable"),
-        Some("css") => ("text/css; charset=utf-8", "max-age=31536000, immutable"),
-        Some("woff") => ("font/woff", "max-age=31536000, immutable"),
-        Some("woff2") => ("font/woff2", "max-age=31536000, immutable"),
-        Some("ttf") => ("font/ttf", "max-age=31536000, immutable"),
-        Some("otf") => ("font/otf", "max-age=31536000, immutable"),
-        Some("json") => ("application/json", "no-store"),
-        Some("png") => ("image/png", "max-age=31536000, immutable"),
-        Some("jpg") | Some("jpeg") => ("image/jpeg", "max-age=31536000, immutable"),
-        Some("gif") => ("image/gif", "max-age=31536000, immutable"),
-        Some("svg") => ("image/svg+xml", "max-age=31536000, immutable"),
-        Some("ico") => ("image/x-icon", "max-age=31536000, immutable"),
-        Some("webp") => ("image/webp", "max-age=31536000, immutable"),
-        Some("avif") => ("image/avif", "max-age=31536000, immutable"),
-        Some("wasm") => ("application/wasm", "max-age=31536000, immutable"),
-        Some("map") => ("application/json", "max-age=31536000, immutable"),
-        _ => ("application/octet-stream", "max-age=31536000, immutable"),
-    }
-}
 
 /// Read request body and parse as JSON. Returns error response on failure.
-async fn parse_json_body<T: serde::de::DeserializeOwned>(
+pub(crate) async fn parse_json_body<T: serde::de::DeserializeOwned>(
     req: Request<Body>,
 ) -> Result<T, Response<Body>> {
     let body = read_body_limit(req, 10 * 1024 * 1024).await.map_err(|e| {
@@ -71,444 +38,7 @@ fn get_upstream(
     })
 }
 
-pub async fn handle_admin(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
-    let path = req.uri().path();
-
-    // Serve static files from /web/ (no auth — SPA handles token input).
-    let is_web = req.method() == Method::GET
-        && (path == "/web" || path == "/web/" || path.starts_with("/web/"));
-    if is_web {
-        let file = path.strip_prefix("/web").unwrap_or("");
-        let file = file.strip_prefix('/').unwrap_or("");
-        let file = if file.is_empty() { "index.html" } else { file };
-
-        if let Some(asset) = Asset::get(file) {
-            let (content_type, cache_control) = mime_and_cache(file);
-            return Response::builder()
-                .status(200)
-                .header("content-type", content_type)
-                .header("cache-control", cache_control)
-                .body(Body::from(asset.data.as_ref().to_vec()))
-                .unwrap();
-        }
-
-        // File not found in dist
-        return Response::builder()
-            .status(404)
-            .header("content-type", "text/plain; charset=utf-8")
-            .body(Body::from("404 Not Found"))
-            .unwrap();
-    }
-
-    // API
-    if path.starts_with("/admin/api/") {
-        return handle_api(req, state).await;
-    }
-
-    Response::builder()
-        .status(404)
-        .header("content-type", "text/plain; charset=utf-8")
-        .body(Body::from("not found"))
-        .unwrap()
-}
-
-async fn handle_api(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
-    let path = req.uri().path().to_string();
-    let method = req.method().clone();
-
-    // All admin API endpoints require admin token via X-Admin-Token header.
-    let admin_ok = state.authorize_admin_header(&req);
-    if !admin_ok {
-        return RouterState::json_error(
-            http::StatusCode::UNAUTHORIZED,
-            "missing or invalid admin token",
-            "admin_unauthorized",
-        );
-    }
-
-    match (&method, path.as_str()) {
-        (&Method::GET, "/admin/api/v1/stats/stream") => stats_stream(state).await,
-        (&Method::GET, "/admin/api/v1/upstreams") => api_list_upstreams(state).await,
-        (&Method::POST, "/admin/api/v1/upstreams") => api_add_upstream(req, state).await,
-        (&Method::GET, "/admin/api/v1/stats") => api_stats_snapshot(state).await,
-        (&Method::GET, "/admin/api/v1/model-costs") => api_get_model_costs(state).await,
-        (&Method::POST, "/admin/api/v1/model-costs") => api_set_model_costs(req, state).await,
-        (&Method::POST, "/admin/api/v1/reload") => api_reload_all(state).await,
-        (&Method::GET, "/admin/api/v1/config") => api_config_preview(state).await,
-        (&Method::GET, "/admin/api/v1/models/routes") => api_get_model_routes(state).await,
-        (&Method::PUT, "/admin/api/v1/models/routes") => api_put_model_routes(req, state).await,
-        (&Method::GET, "/admin/api/v1/requests/stream") => requests_stream(state).await,
-        (&Method::GET, "/admin/api/v1/requests") => api_requests(state, req.uri()).await,
-        (&Method::GET, "/admin/api/v1/requests/history") => api_requests_history(state, req.uri()).await,
-        (&Method::GET, "/admin/api/v1/metrics") => api_metrics(state, req.uri()).await,
-        (&Method::GET, "/admin/api/v1/billing/keys") => api_billing_list_keys(state).await,
-        (&Method::GET, "/admin/api/v1/billing/overview") => api_billing_overview(state).await,
-        (&Method::POST, "/admin/api/v1/billing/keys") => api_billing_create_key(req, state).await,
-        _ => {
-            // Dynamic routes:
-            if let Some(rest) = path.strip_prefix("/admin/api/v1/billing/") {
-                if rest != "keys" && rest != "overview" {
-                    return handle_billing_key_subroutes(req, state, rest).await;
-                }
-            }
-            if let Some(rest) = path.strip_prefix("/admin/api/v1/upstreams/") {
-                return handle_upstream_subroutes(req, state, rest).await;
-            }
-            Response::builder()
-                .status(404)
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"error":"not_found"}"#))
-                .unwrap()
-        }
-    }
-}
-
-async fn handle_billing_key_subroutes(
-    req: Request<Body>,
-    state: Arc<RouterState>,
-    rest: &str,
-) -> Response<Body> {
-    let mut parts = rest.split('/');
-    let key = match parts.next() {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            return RouterState::json_error(
-                http::StatusCode::BAD_REQUEST,
-                "missing key",
-                "bad_request",
-            )
-        }
-    };
-    let action = parts.next().unwrap_or("");
-
-    if action.is_empty() {
-        return match *req.method() {
-            Method::GET => api_billing_get_balance(state, key).await,
-            Method::DELETE => api_billing_delete_key(state, key).await,
-            _ => Response::builder()
-                .status(405)
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"error":"method_not_allowed"}"#))
-                .unwrap(),
-        };
-    }
-
-    if action == "adjust" {
-        return match *req.method() {
-            Method::POST => api_billing_adjust_balance(req, state, key).await,
-            _ => method_not_allowed(),
-        };
-    }
-
-    if action == "level" {
-        return match *req.method() {
-            Method::GET => api_billing_get_level(state, key).await,
-            Method::POST => api_billing_set_level(req, state, key).await,
-            _ => method_not_allowed(),
-        };
-    }
-
-    Response::builder()
-        .status(404)
-        .header("content-type", "application/json")
-        .body(Body::from(r#"{"error":"not_found"}"#))
-        .unwrap()
-}
-
-#[derive(Deserialize)]
-struct BillingCreateBody {
-    key: String,
-    balance: Option<i64>,
-}
-
-#[derive(Deserialize)]
-struct BillingAdjustBody {
-    delta: i64,
-}
-
-async fn api_billing_list_keys(state: Arc<RouterState>) -> Response<Body> {
-    let keys = state.billing.list_keys();
-    let items: Vec<serde_json::Value> = keys
-        .into_iter()
-        .map(|(key, balance)| {
-            let level = state.store.get_key_level(&key);
-            serde_json::json!({
-                "key": key,
-                "balance": if balance == -1 { -1.0_f64 } else { balance as f64 / crate::billing::MICRO_PER_CREDIT as f64 },
-                "level": level
-            })
-        })
-        .collect();
-    json_ok(&serde_json::json!({ "keys": items }))
-}
-
-async fn api_billing_overview(state: Arc<RouterState>) -> Response<Body> {
-    let keys = state.billing.list_keys();
-    let total_keys = keys.len();
-    let mut total_balance: i64 = 0;
-    let mut unlimited_count = 0;
-    let mut zero_or_less = 0;
-    let mut key_details: Vec<serde_json::Value> = Vec::with_capacity(keys.len());
-    for (key, balance) in &keys {
-        if *balance == -1 {
-            unlimited_count += 1;
-        } else {
-            total_balance = total_balance.saturating_add(*balance);
-            if *balance <= 0 {
-                zero_or_less += 1;
-            }
-        }
-        key_details.push(serde_json::json!({
-            "key": key,
-            "balance": balance,
-            "label": if *balance == -1 { "unlimited" } else if *balance <= 0 { "exhausted" } else { "active" }
-        }));
-    }
-
-    let rt = state.runtime.load_full();
-    let model_costs: serde_json::Value = rt
-        .model_costs
-        .iter()
-        .map(|(m, c)| serde_json::json!({ "model": m, "input": c.input, "output": c.output }))
-        .collect();
-
-    let snap = state.snapshot.load_full();
-    let upstream_summary: Vec<serde_json::Value> = snap.upstreams.iter().map(|u| {
-        let keys = u.keys.load_full();
-        let active = keys.iter().filter(|k| k.is_active()).count();
-        serde_json::json!({
-            "id": u.id.as_ref(),
-            "total_keys": keys.len(),
-            "active_keys": active,
-            "format": u.format.as_str(),
-            "min_key_level": u.min_key_level,
-            "model_map": u.model_map.iter().map(|(k, v)| serde_json::json!({k: v})).collect::<Vec<_>>(),
-        })
-    }).collect();
-
-    let stats = &state.stats;
-        let mut platform_tokens: u64 = 0;
-        let mut platform_credits: i64 = 0;
-        let mut key_usages: Vec<serde_json::Value> = Vec::with_capacity(keys.len());
-        for (key, _balance) in &keys {
-            let (tokens, credits) = state.store.get_key_usage(key);
-            platform_tokens += tokens;
-            platform_credits += credits;
-            key_usages.push(serde_json::json!({
-                "key": key,
-                "tokens": tokens,
-                "credits": credits as f64 / crate::billing::MICRO_PER_CREDIT as f64
-            }));
-        }
-
-        json_ok(&serde_json::json!({
-        "billing": {
-            "total_keys": total_keys,
-            "unlimited_keys": unlimited_count,
-            "active_keys": total_keys - unlimited_count - zero_or_less,
-            "exhausted_keys": zero_or_less,
-            "total_balance": total_balance as f64 / crate::billing::MICRO_PER_CREDIT as f64,
-        },
-        "model_costs": model_costs,
-        "usage": {
-            "tokens": platform_tokens,
-            "credits": platform_credits as f64 / crate::billing::MICRO_PER_CREDIT as f64,
-        },
-        "key_usage": key_usages,
-        "upstreams": upstream_summary,
-        "requests_total": stats.requests_total.load(std::sync::atomic::Ordering::Relaxed),
-        "requests_inflight": stats.requests_inflight.load(std::sync::atomic::Ordering::Relaxed),
-    }))
-}
-
-async fn api_billing_create_key(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
-    let payload: BillingCreateBody = match parse_json_body(req).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    let key = payload.key.trim();
-    if key.is_empty() {
-        return RouterState::json_error(
-            http::StatusCode::BAD_REQUEST,
-            "key must not be empty",
-            "bad_request",
-        );
-    }
-    if let Err(e) = crate::util::validate_key_chars(key) {
-        return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request");
-    }
-    let balance_credits = payload.balance.unwrap_or(0).max(-1);
-    // Reject balances that would overflow i64 when converted to micro-credits.
-    if balance_credits > 0 && balance_credits > crate::billing::MAX_BALANCE_CREDITS {
-        return RouterState::json_error(
-            http::StatusCode::BAD_REQUEST,
-            &format!(
-                "balance exceeds maximum allowed ({} credits)",
-                crate::billing::MAX_BALANCE_CREDITS
-            ),
-            "bad_request",
-        );
-    }
-    let balance_micro = if balance_credits == -1 { -1 } else { balance_credits.saturating_mul(crate::billing::MICRO_PER_CREDIT) };
-    let created = match state.billing.create_key(key.to_string(), balance_micro) {
-        Ok(v) => v,
-        Err(e) => {
-            return RouterState::json_error(
-                http::StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("create key failed: {e}"),
-                "billing_error",
-            )
-        }
-    };
-    if !created {
-        return RouterState::json_error(
-            http::StatusCode::CONFLICT,
-            "key already exists",
-            "key_exists",
-        );
-    }
-    json_ok(&serde_json::json!({
-        "key": key,
-        "balance": balance_credits,
-        "created": true
-    }))
-}
-
-async fn api_billing_get_balance(state: Arc<RouterState>, key: &str) -> Response<Body> {
-    match state.billing.get_balance(key) {
-        Some(balance) => {
-            let credits = if balance == -1 { -1.0 } else { balance as f64 / crate::billing::MICRO_PER_CREDIT as f64 };
-            json_ok(&serde_json::json!({
-                "key": key,
-                "balance": credits,
-                "balance_micro": balance,
-            }))
-        }
-        None => RouterState::json_error(
-            http::StatusCode::NOT_FOUND,
-            "key not found",
-            "key_not_found",
-        ),
-    }
-}
-
-async fn api_billing_get_level(state: Arc<RouterState>, key: &str) -> Response<Body> {
-    let level = state.store.get_key_level(key);
-    json_ok(&serde_json::json!({"key": key, "level": level}))
-}
-
-async fn api_billing_set_level(
-    req: Request<Body>,
-    state: Arc<RouterState>,
-    key: &str,
-) -> Response<Body> {
-    let body: serde_json::Value = match parse_json_body(req).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    let level = match body.get("level").and_then(|v| v.as_i64()) {
-        Some(n) if n >= 0 || n == -1 => n as i32,
-        Some(_) => {
-            return RouterState::json_error(
-                http::StatusCode::BAD_REQUEST,
-                "level must be >= 0 or -1",
-                "bad_request",
-            );
-        }
-        None => {
-            return RouterState::json_error(
-                http::StatusCode::BAD_REQUEST,
-                "missing 'level' field",
-                "bad_request",
-            );
-        }
-    };
-    let key_str = key.to_string();
-    let store = state.store.clone();
-    let res = tokio::task::spawn_blocking(move || store.set_key_level(&key_str, level)).await;
-    match res {
-        Ok(Ok(())) => json_ok(&serde_json::json!({"ok": true, "key": key, "level": level})),
-        Ok(Err(e)) => RouterState::json_error(
-            http::StatusCode::BAD_REQUEST,
-            &e.to_string(),
-            "bad_request",
-        ),
-        Err(_) => RouterState::json_error(
-            http::StatusCode::INTERNAL_SERVER_ERROR,
-            "spawn_blocking failed",
-            "internal_error",
-        ),
-    }
-}
-
-async fn api_billing_delete_key(state: Arc<RouterState>, key: &str) -> Response<Body> {
-    match state.billing.delete_key(key) {
-        Ok(true) => json_ok(&serde_json::json!({
-            "deleted": true,
-            "key": key
-        })),
-        Ok(false) => RouterState::json_error(
-            http::StatusCode::NOT_FOUND,
-            "key not found",
-            "key_not_found",
-        ),
-        Err(e) => RouterState::json_error(
-            http::StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("delete failed: {e}"),
-            "billing_error",
-        ),
-    }
-}
-
-async fn api_billing_adjust_balance(
-    req: Request<Body>,
-    state: Arc<RouterState>,
-    key: &str,
-) -> Response<Body> {
-    let body = match read_body_limit(req, 256 * 1024).await {
-        Ok(b) => b,
-        Err(e) => {
-            return RouterState::json_error(
-                http::StatusCode::BAD_REQUEST,
-                &format!("read body: {e}"),
-                "bad_request",
-            )
-        }
-    };
-    let payload: BillingAdjustBody = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            return RouterState::json_error(
-                http::StatusCode::BAD_REQUEST,
-                &format!("invalid json: {e}"),
-                "bad_request",
-            )
-        }
-    };
-
-    let max_delta: i64 = 1_000_000;
-    if payload.delta > max_delta || payload.delta < -max_delta {
-        return RouterState::json_error(
-            http::StatusCode::BAD_REQUEST,
-            &format!("delta must be between -{} and {}", max_delta, max_delta),
-            "bad_request",
-        );
-    }
-
-    match state.billing.adjust_balance(key, payload.delta.saturating_mul(crate::billing::MICRO_PER_CREDIT)) {
-        Some(balance) => {
-            let credits = if balance == -1 { -1.0 } else { balance as f64 / crate::billing::MICRO_PER_CREDIT as f64 };
-            json_ok(&serde_json::json!({ "key": key, "delta": payload.delta, "balance": credits }))
-        }
-        None => RouterState::json_error(
-            http::StatusCode::NOT_FOUND,
-            "key not found",
-            "key_not_found",
-        ),
-    }
-}
-
-async fn handle_upstream_subroutes(
+pub(crate) async fn handle_upstream_subroutes(
     req: Request<Body>,
     state: Arc<RouterState>,
     rest: &str,
@@ -602,7 +132,7 @@ async fn handle_upstream_subroutes(
     }
 }
 
-fn method_not_allowed() -> Response<Body> {
+pub(crate) fn method_not_allowed() -> Response<Body> {
     Response::builder()
         .status(405)
         .header("content-type", "application/json")
@@ -610,7 +140,7 @@ fn method_not_allowed() -> Response<Body> {
         .unwrap()
 }
 
-async fn api_get_model_routes(state: Arc<RouterState>) -> Response<Body> {
+pub(crate) async fn api_get_model_routes(state: Arc<RouterState>) -> Response<Body> {
     let routes = state.get_model_routes();
     json_ok(&routes)
 }
@@ -620,7 +150,7 @@ struct ModelRoutesBody {
     upstreams: BTreeMap<String, Vec<String>>,
 }
 
-async fn api_put_model_routes(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
+pub(crate) async fn api_put_model_routes(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
     let routes_body: ModelRoutesBody = match parse_json_body(req).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -673,7 +203,7 @@ struct UpstreamUpdateBody {
     min_key_level: Option<i32>,
 }
 
-async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
+pub(crate) async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
     let input: UpstreamBody = match parse_json_body(req).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -827,7 +357,7 @@ async fn api_delete_upstream(
 }
 
 #[derive(Serialize)]
-struct UpstreamInfo {
+pub(crate) struct UpstreamInfo {
     id: String,
     base_url: String,
     format: String,
@@ -908,7 +438,7 @@ fn build_upstream_info(u: &crate::state::Upstream, global_max: u32) -> UpstreamI
     }
 }
 
-async fn api_get_model_costs(state: Arc<RouterState>) -> Response<Body> {
+pub(crate) async fn api_get_model_costs(state: Arc<RouterState>) -> Response<Body> {
     let rt = state.runtime.load_full();
     let costs: std::collections::BTreeMap<&str, &crate::config::ModelCost> = rt
         .model_costs
@@ -918,7 +448,7 @@ async fn api_get_model_costs(state: Arc<RouterState>) -> Response<Body> {
     json_ok(&serde_json::json!(costs))
 }
 
-async fn api_set_model_costs(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
+pub(crate) async fn api_set_model_costs(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
     let input: serde_json::Value = match parse_json_body(req).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -951,7 +481,7 @@ async fn api_set_model_costs(req: Request<Body>, state: Arc<RouterState>) -> Res
     json_ok(&serde_json::json!({"ok": true}))
 }
 
-async fn api_list_upstreams(state: Arc<RouterState>) -> Response<Body> {
+pub(crate) async fn api_list_upstreams(state: Arc<RouterState>) -> Response<Body> {
     let snap = state.snapshot.load_full();
     let global_max = state.key_config().max_concurrent_per_key;
 
@@ -964,41 +494,41 @@ async fn api_list_upstreams(state: Arc<RouterState>) -> Response<Body> {
 }
 
 #[derive(Serialize)]
-struct StatsSnapshot {
-    ts_ms: u64,
-    uptime_s: u64,
+pub(crate) struct StatsSnapshot {
+    pub(crate) ts_ms: u64,
+    pub(crate) uptime_s: u64,
 
-    max_retries: usize,
-    retry_status_codes: Vec<u16>,
+    pub(crate) max_retries: usize,
+    pub(crate) retry_status_codes: Vec<u16>,
 
-    requests_total: u64,
-    requests_inflight: u64,
-    upstream_selected_total: u64,
+    pub(crate) requests_total: u64,
+    pub(crate) requests_inflight: u64,
+    pub(crate) upstream_selected_total: u64,
 
-    responses_2xx: u64,
-    responses_3xx: u64,
-    responses_4xx: u64,
-    responses_5xx: u64,
+    pub(crate) responses_2xx: u64,
+    pub(crate) responses_3xx: u64,
+    pub(crate) responses_4xx: u64,
+    pub(crate) responses_5xx: u64,
 
-    errors_timeout: u64,
-    errors_network: u64,
-    queue_depth: u64,
-    queue_timeout_total: u64,
-    queue_enabled: bool,
+    pub(crate) errors_timeout: u64,
+    pub(crate) errors_network: u64,
+    pub(crate) queue_depth: u64,
+    pub(crate) queue_timeout_total: u64,
+    pub(crate) queue_enabled: bool,
 
-    latency_avg_ms: f64,
-    latency_max_ms: f64,
-    latency_count: u64,
+    pub(crate) latency_avg_ms: f64,
+    pub(crate) latency_max_ms: f64,
+    pub(crate) latency_count: u64,
 
-    prompt_tokens_total: u64,
-    completion_tokens_total: u64,
-    thought_tokens_total: u64,
-    tokens_total: u64,
+    pub(crate) prompt_tokens_total: u64,
+    pub(crate) completion_tokens_total: u64,
+    pub(crate) thought_tokens_total: u64,
+    pub(crate) tokens_total: u64,
 
-    upstreams: Vec<UpstreamInfo>,
+    pub(crate) upstreams: Vec<UpstreamInfo>,
 }
 
-fn build_snapshot(state: &RouterState) -> StatsSnapshot {
+pub(crate) fn build_snapshot(state: &RouterState) -> StatsSnapshot {
     let ts = now_ms();
     let uptime_s = (ts.saturating_sub(state.stats.started_at_ms)) / 1000;
 
@@ -1105,12 +635,12 @@ fn build_snapshot(state: &RouterState) -> StatsSnapshot {
     }
 }
 
-async fn api_stats_snapshot(state: Arc<RouterState>) -> Response<Body> {
+pub(crate) async fn api_stats_snapshot(state: Arc<RouterState>) -> Response<Body> {
     let snap = build_snapshot(&state);
     json_ok(&snap)
 }
 
-async fn api_requests(state: Arc<RouterState>, uri: &http::Uri) -> Response<Body> {
+pub(crate) async fn api_requests(state: Arc<RouterState>, uri: &http::Uri) -> Response<Body> {
     let limit: usize = query_get(uri, "limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(200)
@@ -1126,7 +656,7 @@ async fn api_requests(state: Arc<RouterState>, uri: &http::Uri) -> Response<Body
 /// Read historical requests from the JSONL file, newest first.
 /// ?limit=N  (default 100, max 5000)
 /// ?before=ts_ms  (optional, only return entries before this timestamp)
-async fn api_requests_history(state: Arc<RouterState>, uri: &http::Uri) -> Response<Body> {
+pub(crate) async fn api_requests_history(state: Arc<RouterState>, uri: &http::Uri) -> Response<Body> {
     let limit: usize = query_get(uri, "limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100)
@@ -1146,7 +676,7 @@ async fn api_requests_history(state: Arc<RouterState>, uri: &http::Uri) -> Respo
     }))
 }
 
-async fn api_metrics(state: Arc<RouterState>, uri: &http::Uri) -> Response<Body> {
+pub(crate) async fn api_metrics(state: Arc<RouterState>, uri: &http::Uri) -> Response<Body> {
     let window = query_get(uri, "window").unwrap_or("minute");
     let win = MetricsWindow::from_str(window);
     let buckets = state.metrics_snapshot(win);
@@ -1157,7 +687,7 @@ async fn api_metrics(state: Arc<RouterState>, uri: &http::Uri) -> Response<Body>
     }))
 }
 
-async fn api_config_preview(state: Arc<RouterState>) -> Response<Body> {
+pub(crate) async fn api_config_preview(state: Arc<RouterState>) -> Response<Body> {
     json_ok(&state.config_preview())
 }
 
@@ -1388,80 +918,7 @@ fn write_prometheus_keys(buf: &mut String, upstreams: &[Arc<crate::state::Upstre
     let _ = writeln!(buf, "gptload_keys_cooldown {}", cooldown_keys);
 }
 
-async fn stats_stream(state: Arc<RouterState>) -> Response<Body> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
-    let state2 = state.clone();
-
-    tokio::spawn(async move {
-        let mut last_total = state2
-            .stats
-            .requests_total
-            .load(std::sync::atomic::Ordering::Relaxed);
-        loop {
-            let snap = build_snapshot(&state2);
-            let total = snap.requests_total;
-            let raw = total.saturating_sub(last_total); // requests since last tick (2s)
-            last_total = total;
-            let rpm = raw.saturating_mul(30); // extrapolate to per-minute
-
-            let mut v = serde_json::to_value(&snap)
-                .unwrap_or(serde_json::json!({"error":"snapshot_failed"}));
-            if let serde_json::Value::Object(ref mut m) = v {
-                m.insert("rpm".into(), serde_json::json!(rpm));
-            }
-            let s = match serde_json::to_string(&v) {
-                Ok(s) => s,
-                Err(_) => String::from(r#"{"error":"json"}"#),
-            };
-            let msg = format!("data: {}\n\n", s);
-
-            if tx.send(Ok(Bytes::from(msg))).await.is_err() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    });
-
-    Response::builder()
-        .status(200)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .header("connection", "keep-alive")
-        .body(Body::wrap_stream(ReceiverStream::new(rx)))
-        .unwrap()
-}
-
-async fn requests_stream(state: Arc<RouterState>) -> Response<Body> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(128);
-    let mut sub = state.subscribe_requests();
-
-    tokio::spawn(async move {
-        loop {
-            match sub.recv().await {
-                Ok(entry) => {
-                    let payload = serde_json::to_string(&entry)
-                        .unwrap_or_else(|_| String::from(r#"{"error":"json"}"#));
-                    let msg = format!("data: {}\n\n", payload);
-                    if tx.send(Ok(Bytes::from(msg))).await.is_err() {
-                        break;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
-
-    Response::builder()
-        .status(200)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .header("connection", "keep-alive")
-        .body(Body::wrap_stream(ReceiverStream::new(rx)))
-        .unwrap()
-}
-
-async fn api_reload_all(state: Arc<RouterState>) -> Response<Body> {
+pub(crate) async fn api_reload_all(state: Arc<RouterState>) -> Response<Body> {
     let mut results = Vec::new();
     let snap = state.snapshot.load_full();
     for u in snap.upstreams.iter() {
@@ -2038,7 +1495,7 @@ async fn parse_keys_body(req: Request<Body>) -> Result<(Vec<String>, bool), Stri
     }
 }
 
-async fn read_body_limit(mut req: Request<Body>, limit: usize) -> anyhow::Result<Bytes> {
+pub(crate) async fn read_body_limit(mut req: Request<Body>, limit: usize) -> anyhow::Result<Bytes> {
     use hyper::body::HttpBody;
     let mut buf = Vec::new();
     while let Some(chunk) = req.body_mut().data().await {
@@ -2066,7 +1523,7 @@ fn dedupe_keys(keys: Vec<String>) -> Vec<String> {
     out
 }
 
-fn json_ok<T: ?Sized + Serialize>(v: &T) -> Response<Body> {
+pub(crate) fn json_ok<T: ?Sized + Serialize>(v: &T) -> Response<Body> {
     let body = match serde_json::to_vec(v) {
         Ok(b) => b,
         Err(_) => br#"{"error":"json"}"#.to_vec(),
@@ -2143,7 +1600,11 @@ fn read_request_log_reverse(
         // The first entry (after split) is the start of a line that was cut;
         // save it for the previous chunk. Process the rest in reverse.
         let carry = lines.remove(0);
-        leftover = carry.to_vec();
+        if !carry.is_empty() {
+            leftover = carry.to_vec();
+        } else {
+            leftover.clear();
+        }
 
         for raw in lines.iter().rev() {
             if out.len() >= limit {

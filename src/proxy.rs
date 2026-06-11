@@ -213,7 +213,7 @@ async fn handle_inner(
 
     // Admin UI/API.
     if path.starts_with("/admin") || path.starts_with("/web") {
-        return admin::handle_admin(req, state).await;
+        return crate::route::handle_admin(req, state).await;
     }
 
     if state.is_shutting_down() {

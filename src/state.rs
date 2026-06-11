@@ -2051,6 +2051,7 @@ fn start_request_log_writer(path: PathBuf, pause: Arc<AtomicBool>) -> Option<mps
         let mut pending = 0usize;
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         let mut pause_buf: Vec<RequestLogEntry> = Vec::new();
+        let mut was_paused = false;
 
         loop {
             tokio::select! {
@@ -2072,7 +2073,27 @@ fn start_request_log_writer(path: PathBuf, pause: Arc<AtomicBool>) -> Option<mps
                     }
                 }
                 _ = tick.tick() => {
-                    if !pause.load(Ordering::Relaxed) {
+                    let paused = pause.load(Ordering::Relaxed);
+                    if paused {
+                        was_paused = true;
+                    } else {
+                        // Reopen file after cleanup may have renamed it.
+                        if was_paused {
+                            was_paused = false;
+                            let _ = file.flush().await;
+                            match tokio::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&path)
+                                .await
+                            {
+                                Ok(f) => file = f,
+                                Err(e) => tracing::warn!(
+                                    path = %path.display(), error = %e,
+                                    "request log reopen failed after cleanup"
+                                ),
+                            }
+                        }
                         // Drain any buffered entries after pause ends.
                         while let Some(entry) = pause_buf.pop() {
                             if let Ok(line) = serde_json::to_string(&entry) {

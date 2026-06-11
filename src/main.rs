@@ -9,6 +9,7 @@ mod billing;
 mod config;
 mod format;
 mod proxy;
+mod route;
 mod state;
 mod storage;
 mod upstream_client;
