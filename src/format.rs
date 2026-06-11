@@ -128,6 +128,36 @@ fn adapt_anthropic_request(
     if !system_parts.is_empty() {
         out["system"] = serde_json::Value::String(system_parts.join("\n\n"));
     }
+    // Pass through tools and tool_choice.
+    if let Some(tools) = v.get("tools") {
+        let anthropic_tools: Vec<serde_json::Value> = tools
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.get("function"))
+                    .map(|f| {
+                        serde_json::json!({
+                            "name": f.get("name"),
+                            "description": f.get("description"),
+                            "input_schema": f.get("parameters").cloned().unwrap_or(serde_json::json!({})),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !anthropic_tools.is_empty() {
+            out["tools"] = serde_json::Value::Array(anthropic_tools);
+        }
+    }
+    if let Some(tc) = v.get("tool_choice") {
+        if tc.as_str() == Some("auto") || tc.as_str() == Some("any") {
+            out["tool_choice"] = serde_json::json!({"type": "auto"});
+        } else if tc.as_str() == Some("required") {
+            out["tool_choice"] = serde_json::json!({"type": "any"});
+        } else if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
+            out["tool_choice"] = serde_json::json!({"type": "tool", "name": name});
+        }
+    }
     copy_number(&v, &mut out, "temperature", "temperature");
     copy_number(&v, &mut out, "top_p", "top_p");
     if let Some(stop) = v.get("stop") {
@@ -328,7 +358,15 @@ async fn transform_json_response(
         }
     };
     if !parts.status.is_success() {
-        return Response::from_parts(parts, Body::from(body));
+        let error_msg = extract_upstream_error(&body);
+        let error_body = serde_json::json!({
+            "error": {
+                "message": error_msg,
+                "type": "upstream_error",
+                "code": parts.status.as_u16()
+            }
+        });
+        return Response::from_parts(parts, Body::from(error_body.to_string()));
     }
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -485,16 +523,25 @@ fn chat_completion_json(
 fn anthropic_sse_to_openai(v: &serde_json::Value, model: Option<&str>) -> Vec<serde_json::Value> {
     let ty = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
     match ty {
-        "message_start" => vec![chat_chunk_json(
-            v.get("message")
+        "message_start" => {
+            let id = v
+                .get("message")
                 .and_then(|m| m.get("id"))
                 .and_then(|s| s.as_str())
-                .unwrap_or("chatcmpl-anthropic"),
-            model.unwrap_or(""),
-            serde_json::json!({"role": "assistant"}),
-            None,
-            None,
-        )],
+                .unwrap_or("chatcmpl-anthropic");
+            let model_str = v
+                .get("message")
+                .and_then(|m| m.get("model"))
+                .and_then(|s| s.as_str())
+                .unwrap_or(model.unwrap_or(""));
+            vec![chat_chunk_json(
+                id,
+                model_str,
+                serde_json::json!({"role": "assistant", "content": ""}),
+                None,
+                None,
+            )]
+        }
         "content_block_delta" => {
             let text = v
                 .get("delta")
@@ -605,6 +652,23 @@ fn gemini_sse_to_openai(v: &serde_json::Value, model: Option<&str>) -> Vec<serde
         ));
     }
     out
+}
+
+/// Extract a human-readable error message from an upstream error response.
+fn extract_upstream_error(body: &[u8]) -> String {
+    let v: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return String::from_utf8_lossy(body).into_owned(),
+    };
+    // Anthropic / Gemini / OpenAI all use error.message
+    if let Some(msg) = v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+        return msg.to_string();
+    }
+    // Generic fallback: error object as string
+    v.get("error")
+        .and_then(|e| e.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "unknown upstream error".to_string())
 }
 
 fn chat_chunk_json(
