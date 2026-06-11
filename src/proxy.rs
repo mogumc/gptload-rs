@@ -1190,10 +1190,14 @@ fn sanitize_log_headers(
 }
 
 fn extract_api_key(headers: &hyper::HeaderMap) -> Option<String> {
+    // Validate key chars inline (hot path, no allocation for invalid keys).
+    fn key_ok(k: &str) -> bool {
+        !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
     if let Some(h) = headers.get("x-api-key") {
         if let Ok(s) = h.to_str() {
             let key = s.trim();
-            if !key.is_empty() {
+            if key_ok(key) {
                 return Some(key.to_string());
             }
         }
@@ -1209,7 +1213,7 @@ fn extract_api_key(headers: &hyper::HeaderMap) -> Option<String> {
                 .or_else(|| raw.strip_prefix("bearer "))
                 .unwrap_or(raw)
                 .trim();
-            if !key.is_empty() {
+            if key_ok(key) {
                 return Some(key.to_string());
             }
         }

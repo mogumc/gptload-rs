@@ -1315,6 +1315,10 @@ pub fn build_key_states(keys: Vec<String>, store: Option<&crate::storage::KeySto
         if k.is_empty() {
             continue;
         }
+        if let Err(e) = crate::util::validate_key_chars(k) {
+            tracing::warn!(key = %k, error = %e, "key rejected");
+            continue;
+        }
         let key_arc: Arc<str> = Arc::<str>::from(k.to_string());
         let auth_header = hyper::header::HeaderValue::from_str(&format!("Bearer {}", key_arc))
             .map_err(|_| anyhow::anyhow!("invalid key (cannot be used in HTTP header)"))?;

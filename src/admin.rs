@@ -74,7 +74,7 @@ fn get_upstream(
 pub async fn handle_admin(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
     let path = req.uri().path();
 
-    // Serve static files from /web/
+    // Serve static files from /web/ (no auth — SPA handles token input).
     let is_web = req.method() == Method::GET
         && (path == "/web" || path == "/web/" || path.starts_with("/web/"));
     if is_web {
@@ -116,7 +116,7 @@ async fn handle_api(req: Request<Body>, state: Arc<RouterState>) -> Response<Bod
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
-    // All admin API endpoints require admin token.
+    // All admin API endpoints require admin token via X-Admin-Token header.
     let admin_ok = state.authorize_admin_header(&req);
     if !admin_ok {
         return RouterState::json_error(
@@ -193,11 +193,15 @@ async fn handle_billing_key_subroutes(
     if action == "adjust" {
         return match *req.method() {
             Method::POST => api_billing_adjust_balance(req, state, key).await,
-            _ => Response::builder()
-                .status(405)
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"error":"method_not_allowed"}"#))
-                .unwrap(),
+            _ => method_not_allowed(),
+        };
+    }
+
+    if action == "level" {
+        return match *req.method() {
+            Method::GET => api_billing_get_level(state, key).await,
+            Method::POST => api_billing_set_level(req, state, key).await,
+            _ => method_not_allowed(),
         };
     }
 
@@ -306,6 +310,9 @@ async fn api_billing_create_key(req: Request<Body>, state: Arc<RouterState>) -> 
             "bad_request",
         );
     }
+    if let Err(e) = crate::util::validate_key_chars(key) {
+        return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request");
+    }
     let balance = payload.balance.unwrap_or(0).max(-1);
     let created = match state.billing.create_key(key.to_string(), balance) {
         Ok(v) => v,
@@ -341,6 +348,55 @@ async fn api_billing_get_balance(state: Arc<RouterState>, key: &str) -> Response
             http::StatusCode::NOT_FOUND,
             "key not found",
             "key_not_found",
+        ),
+    }
+}
+
+async fn api_billing_get_level(state: Arc<RouterState>, key: &str) -> Response<Body> {
+    let level = state.store.get_key_level(key);
+    json_ok(&serde_json::json!({"key": key, "level": level}))
+}
+
+async fn api_billing_set_level(
+    req: Request<Body>,
+    state: Arc<RouterState>,
+    key: &str,
+) -> Response<Body> {
+    let body: serde_json::Value = match parse_json_body(req).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let level = match body.get("level").and_then(|v| v.as_i64()) {
+        Some(n) if n >= 0 || n == -1 => n as i32,
+        Some(_) => {
+            return RouterState::json_error(
+                http::StatusCode::BAD_REQUEST,
+                "level must be >= 0 or -1",
+                "bad_request",
+            );
+        }
+        None => {
+            return RouterState::json_error(
+                http::StatusCode::BAD_REQUEST,
+                "missing 'level' field",
+                "bad_request",
+            );
+        }
+    };
+    let key_str = key.to_string();
+    let store = state.store.clone();
+    let res = tokio::task::spawn_blocking(move || store.set_key_level(&key_str, level)).await;
+    match res {
+        Ok(Ok(())) => json_ok(&serde_json::json!({"ok": true, "key": key, "level": level})),
+        Ok(Err(e)) => RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            &e.to_string(),
+            "bad_request",
+        ),
+        Err(_) => RouterState::json_error(
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            "spawn_blocking failed",
+            "internal_error",
         ),
     }
 }
@@ -1643,7 +1699,9 @@ fn scoped_key_set(body: &KeyStatusBody) -> Result<KeyStatusScope, String> {
     for k in keys {
         let k = k.trim();
         if !k.is_empty() {
-            set.insert(k.to_string());
+            if crate::util::validate_key_chars(k).is_ok() {
+                set.insert(k.to_string());
+            }
         }
     }
     if set.is_empty() {
@@ -1855,14 +1913,20 @@ async fn parse_keys_body(req: Request<Body>) -> Result<(Vec<String>, bool), Stri
     if content_type.starts_with("application/json") {
         let v: JsonKeysBody =
             serde_json::from_slice(&body_bytes).map_err(|e| format!("invalid json: {e}"))?;
-        Ok((v.keys, v.dedupe.unwrap_or(true)))
+        let keys: Vec<String> = v.keys.into_iter().filter_map(|k| {
+            let k = k.trim().to_string();
+            if k.is_empty() { return None; }
+            if let Err(_) = crate::util::validate_key_chars(&k) { return None; }
+            Some(k)
+        }).collect();
+        Ok((keys, v.dedupe.unwrap_or(true)))
     } else {
         // Treat as plain text.
         let s = std::str::from_utf8(&body_bytes).map_err(|_| "body is not utf-8".to_string())?;
         let mut keys: Vec<String> = Vec::new();
         for line in s.lines() {
             let k = line.trim();
-            if !k.is_empty() {
+            if !k.is_empty() && crate::util::validate_key_chars(k).is_ok() {
                 keys.push(k.to_string());
             }
         }
