@@ -97,6 +97,92 @@ fn inject_trace_context(headers: &mut hyper::HeaderMap) {
     TRACE_PROPAGATOR.inject_context(&cx, &mut HeaderInjector(headers));
 }
 
+// ── Route helpers ─────────────────────────────────────────────────────
+
+/// Health-check endpoint: returns upstream/key counts and inflight requests.
+fn check_health(state: &Arc<RouterState>) -> Response<Body> {
+    let snap = state.snapshot.load_full();
+    let mut total_keys = 0usize;
+    let mut active_keys = 0usize;
+    for u in snap.upstreams.iter() {
+        let keys = u.keys.load_full();
+        total_keys += keys.len();
+        active_keys += keys.iter().filter(|k| k.is_active()).count();
+    }
+    let inflight = state
+        .stats
+        .requests_inflight
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let body = serde_json::json!({
+        "status": "ok",
+        "upstreams": snap.upstreams.len(),
+        "keys_total": total_keys,
+        "keys_active": active_keys,
+        "requests_inflight": inflight,
+    });
+    Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Authenticate a proxy request: proxy token → API key → balance check.
+/// Returns the billing key on success, or an error response.
+fn authenticate_request(
+    state: &Arc<RouterState>,
+    req: &Request<Body>,
+    ctx: &RequestLogContext,
+) -> Result<String, Response<Body>> {
+    if !state.authorize_proxy(req) {
+        return Err(logged_json_error(
+            state,
+            ctx,
+            http::StatusCode::UNAUTHORIZED,
+            "missing or invalid X-Proxy-Token",
+            "proxy_unauthorized",
+        ));
+    }
+
+    let billing_key = match extract_api_key(req.headers()) {
+        Some(key) => key,
+        None => {
+            return Err(logged_json_error(
+                state,
+                ctx,
+                http::StatusCode::UNAUTHORIZED,
+                "missing api key",
+                "api_key_required",
+            ));
+        }
+    };
+
+    let balance = match state.billing.get_balance(&billing_key) {
+        Some(b) => b,
+        None => {
+            return Err(logged_json_error(
+                state,
+                ctx,
+                http::StatusCode::UNAUTHORIZED,
+                "invalid api key",
+                "api_key_invalid",
+            ));
+        }
+    };
+
+    if balance <= 0 && balance != -1 {
+        return Err(logged_json_error(
+            state,
+            ctx,
+            http::StatusCode::UNAUTHORIZED,
+            "insufficient balance",
+            "balance_insufficient",
+        ));
+    }
+
+    Ok(billing_key)
+}
+
 // ── HTTP server ───────────────────────────────────────────────────────
 
 pub async fn serve_http<F>(
@@ -162,26 +248,7 @@ async fn handle_inner(
     async move {
     // Health check.
     if method == hyper::Method::GET && path == "/health" {
-        let snap = state.snapshot.load_full();
-        let mut total_keys = 0usize;
-        let mut active_keys = 0usize;
-        for u in snap.upstreams.iter() {
-            let keys = u.keys.load_full();
-            total_keys += keys.len();
-            active_keys += keys.iter().filter(|k| k.is_active()).count();
-        }
-        let body = serde_json::json!({
-            "status": "ok",
-            "upstreams": snap.upstreams.len(),
-            "keys_total": total_keys,
-            "keys_active": active_keys,
-            "requests_inflight": state.stats.requests_inflight.load(std::sync::atomic::Ordering::Relaxed),
-        });
-        return Response::builder()
-            .status(200)
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
+        return check_health(&state);
     }
 
     // Prometheus metrics.
@@ -216,52 +283,11 @@ async fn handle_inner(
         0,
     );
 
-    // Proxy traffic auth (optional).
-    if !state.authorize_proxy(&req) {
-        return logged_json_error(
-            &state,
-            &base_log_ctx,
-            http::StatusCode::UNAUTHORIZED,
-            "missing or invalid X-Proxy-Token",
-            "proxy_unauthorized",
-        );
-    }
-
-    let billing_key = match extract_api_key(req.headers()) {
-        Some(key) => key,
-        None => {
-            return logged_json_error(
-                &state,
-                &base_log_ctx,
-                http::StatusCode::UNAUTHORIZED,
-                "missing api key",
-                "api_key_required",
-            );
-        }
+    // Authenticate (proxy token → API key → balance).
+    let billing_key = match authenticate_request(&state, &req, &base_log_ctx) {
+        Ok(key) => key,
+        Err(resp) => return resp,
     };
-
-    let balance = match state.billing.get_balance(&billing_key) {
-        Some(b) => b,
-        None => {
-            return logged_json_error(
-                &state,
-                &base_log_ctx,
-                http::StatusCode::UNAUTHORIZED,
-                "invalid api key",
-                "api_key_invalid",
-            );
-        }
-    };
-
-    if balance <= 0 && balance != -1 {
-        return logged_json_error(
-            &state,
-            &base_log_ctx,
-            http::StatusCode::UNAUTHORIZED,
-            "insufficient balance",
-            "balance_insufficient",
-        );
-    }
 
     // Stats: request start (only /v1 paths).
     if path.starts_with("/v1") {
@@ -534,6 +560,35 @@ async fn execute_attempt(
     }
 }
 
+async fn read_request_body(body: Body) -> Result<bytes::Bytes, Response<Body>> {
+    const MAX_BYTES: usize = 16 * 1024 * 1024;
+    use hyper::body::HttpBody;
+    let mut body_bytes = Vec::new();
+    let mut body_reader = body;
+    while let Some(chunk_result) = body_reader.data().await {
+        match chunk_result {
+            Ok(chunk) => {
+                if body_bytes.len().saturating_add(chunk.len()) > MAX_BYTES {
+                    return Err(RouterState::json_error(
+                        http::StatusCode::PAYLOAD_TOO_LARGE,
+                        "request body too large",
+                        "body_too_large",
+                    ));
+                }
+                body_bytes.extend_from_slice(&chunk);
+            }
+            Err(_) => {
+                return Err(RouterState::json_error(
+                    http::StatusCode::BAD_GATEWAY,
+                    "failed to read request body",
+                    "body_read_error",
+                ));
+            }
+        }
+    }
+    Ok(bytes::Bytes::from(body_bytes))
+}
+
 async fn forward(
     req: Request<Body>,
     state: Arc<RouterState>,
@@ -543,8 +598,6 @@ async fn forward(
     path: String,
     billing_key: String,
 ) -> Response<Body> {
-    const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
-
     let (parts, body) = req.into_parts();
 
     // Extract URI and method early (before moving parts)
@@ -568,32 +621,11 @@ async fn forward(
     let headers = parts.headers.clone();
     let request_headers = sanitize_log_headers(&headers);
 
-    // Read body into bytes for potential retries (necessary for 429 retry)
-    use hyper::body::HttpBody;
-    let mut body_bytes = Vec::new();
-    let mut body_reader = body;
-    while let Some(chunk_result) = body_reader.data().await {
-        match chunk_result {
-            Ok(chunk) => {
-                if body_bytes.len().saturating_add(chunk.len()) > MAX_REQUEST_BODY_BYTES {
-                    return RouterState::json_error(
-                        http::StatusCode::PAYLOAD_TOO_LARGE,
-                        "request body too large",
-                        "body_too_large",
-                    );
-                }
-                body_bytes.extend_from_slice(&chunk);
-            }
-            Err(_) => {
-                return RouterState::json_error(
-                    http::StatusCode::BAD_GATEWAY,
-                    "failed to read request body",
-                    "body_read_error",
-                );
-            }
-        }
-    }
-    let body_bytes = bytes::Bytes::from(body_bytes);
+    // Read body into bytes for potential retries.
+    let body_bytes = match read_request_body(body).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
     let req_bytes = body_bytes.len();
     let request_body = String::from_utf8(body_bytes.to_vec())
         .ok()

@@ -5,6 +5,7 @@ use bytes::Bytes;
 use hyper::{Body, Method, Request, Response};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
@@ -880,109 +881,85 @@ async fn api_config_preview(state: Arc<RouterState>) -> Response<Body> {
 /// Prometheus metrics endpoint.
 /// Returns metrics in Prometheus text exposition format (OpenMetrics compatible).
 pub async fn prometheus_metrics(state: Arc<RouterState>) -> Response<Body> {
-    use std::fmt::Write;
     let snap = state.snapshot.load_full();
     let now = now_ms();
     let uptime_s = (now.saturating_sub(state.stats.started_at_ms)) / 1000;
-
     let mut buf = String::with_capacity(4096);
 
+    write_prometheus_global(&mut buf, &state, uptime_s);
+    write_prometheus_upstreams(&mut buf, snap.upstreams.as_slice(), now);
+    write_prometheus_keys(&mut buf, snap.upstreams.as_slice(), now);
+
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(Body::from(buf))
+        .unwrap()
+}
+
+/// Global metrics: uptime, requests, inflight, queue, responses, errors, latency, selection.
+fn write_prometheus_global(buf: &mut String, state: &RouterState, uptime_s: u64) {
     // Uptime
     let _ = writeln!(buf, "# HELP gptload_uptime_seconds Uptime in seconds");
     let _ = writeln!(buf, "# TYPE gptload_uptime_seconds gauge");
     let _ = writeln!(buf, "gptload_uptime_seconds {}", uptime_s);
 
     // Requests total
-    let _ = writeln!(
-        buf,
-        "# HELP gptload_requests_total Total number of requests"
-    );
+    let _ = writeln!(buf, "# HELP gptload_requests_total Total number of requests");
     let _ = writeln!(buf, "# TYPE gptload_requests_total counter");
     let _ = writeln!(
         buf,
         "gptload_requests_total {}",
-        state
-            .stats
-            .requests_total
-            .load(std::sync::atomic::Ordering::Relaxed)
+        state.stats.requests_total.load(std::sync::atomic::Ordering::Relaxed)
     );
 
     // Requests inflight
-    let _ = writeln!(
-        buf,
-        "# HELP gptload_requests_inflight Currently inflight requests"
-    );
+    let _ = writeln!(buf, "# HELP gptload_requests_inflight Currently inflight requests");
     let _ = writeln!(buf, "# TYPE gptload_requests_inflight gauge");
     let _ = writeln!(
         buf,
         "gptload_requests_inflight {}",
-        state
-            .stats
-            .requests_inflight
-            .load(std::sync::atomic::Ordering::Relaxed)
+        state.stats.requests_inflight.load(std::sync::atomic::Ordering::Relaxed)
     );
 
+    // Queue
     let _ = writeln!(buf, "# HELP gptload_queue_depth Currently queued requests");
     let _ = writeln!(buf, "# TYPE gptload_queue_depth gauge");
     let _ = writeln!(
         buf,
         "gptload_queue_depth {}",
-        state
-            .stats
-            .queue_depth
-            .load(std::sync::atomic::Ordering::Relaxed)
+        state.stats.queue_depth.load(std::sync::atomic::Ordering::Relaxed)
     );
-    let _ = writeln!(
-        buf,
-        "# HELP gptload_queue_timeout_total Queue timeout/full rejections"
-    );
+    let _ = writeln!(buf, "# HELP gptload_queue_timeout_total Queue timeout/full rejections");
     let _ = writeln!(buf, "# TYPE gptload_queue_timeout_total counter");
     let _ = writeln!(
         buf,
         "gptload_queue_timeout_total {}",
-        state
-            .stats
-            .queue_timeout_total
-            .load(std::sync::atomic::Ordering::Relaxed)
+        state.stats.queue_timeout_total.load(std::sync::atomic::Ordering::Relaxed)
     );
 
     // Response status codes (global)
-    let _ = writeln!(
-        buf,
-        "# HELP gptload_responses_total Total responses by status class"
-    );
+    let _ = writeln!(buf, "# HELP gptload_responses_total Total responses by status class");
     let _ = writeln!(buf, "# TYPE gptload_responses_total counter");
     let _ = writeln!(
         buf,
         "gptload_responses_total{{status_class=\"2xx\"}} {}",
-        state
-            .stats
-            .responses_2xx
-            .load(std::sync::atomic::Ordering::Relaxed)
+        state.stats.responses_2xx.load(std::sync::atomic::Ordering::Relaxed)
     );
     let _ = writeln!(
         buf,
         "gptload_responses_total{{status_class=\"3xx\"}} {}",
-        state
-            .stats
-            .responses_3xx
-            .load(std::sync::atomic::Ordering::Relaxed)
+        state.stats.responses_3xx.load(std::sync::atomic::Ordering::Relaxed)
     );
     let _ = writeln!(
         buf,
         "gptload_responses_total{{status_class=\"4xx\"}} {}",
-        state
-            .stats
-            .responses_4xx
-            .load(std::sync::atomic::Ordering::Relaxed)
+        state.stats.responses_4xx.load(std::sync::atomic::Ordering::Relaxed)
     );
     let _ = writeln!(
         buf,
         "gptload_responses_total{{status_class=\"5xx\"}} {}",
-        state
-            .stats
-            .responses_5xx
-            .load(std::sync::atomic::Ordering::Relaxed)
+        state.stats.responses_5xx.load(std::sync::atomic::Ordering::Relaxed)
     );
 
     // Errors
@@ -991,38 +968,20 @@ pub async fn prometheus_metrics(state: Arc<RouterState>) -> Response<Body> {
     let _ = writeln!(
         buf,
         "gptload_errors_total{{type=\"timeout\"}} {}",
-        state
-            .stats
-            .errors_timeout
-            .load(std::sync::atomic::Ordering::Relaxed)
+        state.stats.errors_timeout.load(std::sync::atomic::Ordering::Relaxed)
     );
     let _ = writeln!(
         buf,
         "gptload_errors_total{{type=\"network\"}} {}",
-        state
-            .stats
-            .errors_network
-            .load(std::sync::atomic::Ordering::Relaxed)
+        state.stats.errors_network.load(std::sync::atomic::Ordering::Relaxed)
     );
 
     // Latency
-    let latency_count = state
-        .stats
-        .latency_count
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let latency_total_ns = state
-        .stats
-        .latency_ns_total
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let latency_max_ns = state
-        .stats
-        .latency_ns_max
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let latency_count = state.stats.latency_count.load(std::sync::atomic::Ordering::Relaxed);
+    let latency_total_ns = state.stats.latency_ns_total.load(std::sync::atomic::Ordering::Relaxed);
+    let latency_max_ns = state.stats.latency_ns_max.load(std::sync::atomic::Ordering::Relaxed);
 
-    let _ = writeln!(
-        buf,
-        "# HELP gptload_request_duration_seconds Request latency"
-    );
+    let _ = writeln!(buf, "# HELP gptload_request_duration_seconds Request latency");
     let _ = writeln!(buf, "# TYPE gptload_request_duration_seconds summary");
     if latency_count > 0 {
         let avg_s = (latency_total_ns as f64) / (latency_count as f64) / 1_000_000_000.0;
@@ -1045,55 +1004,33 @@ pub async fn prometheus_metrics(state: Arc<RouterState>) -> Response<Body> {
     );
 
     // Upstream selection
-    let _ = writeln!(
-        buf,
-        "# HELP gptload_upstream_selected_total Total upstream selections"
-    );
+    let _ = writeln!(buf, "# HELP gptload_upstream_selected_total Total upstream selections");
     let _ = writeln!(buf, "# TYPE gptload_upstream_selected_total counter");
     let _ = writeln!(
         buf,
         "gptload_upstream_selected_total {}",
-        state
-            .stats
-            .upstream_selected_total
-            .load(std::sync::atomic::Ordering::Relaxed)
+        state.stats.upstream_selected_total.load(std::sync::atomic::Ordering::Relaxed)
     );
+}
 
-    // Per-upstream metrics
-    let _ = writeln!(
-        buf,
-        "# HELP gptload_upstream_responses_total Per-upstream responses by status class"
-    );
+/// Per-upstream metrics: keys, responses, errors, selection.
+fn write_prometheus_upstreams(buf: &mut String, upstreams: &[Arc<crate::state::Upstream>], now: u64) {
+    let _ = writeln!(buf, "# HELP gptload_upstream_responses_total Per-upstream responses by status class");
     let _ = writeln!(buf, "# TYPE gptload_upstream_responses_total counter");
-    let _ = writeln!(
-        buf,
-        "# HELP gptload_upstream_errors_total Per-upstream errors by type"
-    );
+    let _ = writeln!(buf, "# HELP gptload_upstream_errors_total Per-upstream errors by type");
     let _ = writeln!(buf, "# TYPE gptload_upstream_errors_total counter");
-    let _ = writeln!(
-        buf,
-        "# HELP gptload_upstream_selected_total Per-upstream selection count"
-    );
+    let _ = writeln!(buf, "# HELP gptload_upstream_selected_total Per-upstream selection count");
     let _ = writeln!(buf, "# TYPE gptload_upstream_selected_total counter");
     let _ = writeln!(buf, "# HELP gptload_upstream_keys Total keys per upstream");
     let _ = writeln!(buf, "# TYPE gptload_upstream_keys gauge");
-    let _ = writeln!(
-        buf,
-        "# HELP gptload_upstream_active_keys Active keys per upstream"
-    );
+    let _ = writeln!(buf, "# HELP gptload_upstream_active_keys Active keys per upstream");
     let _ = writeln!(buf, "# TYPE gptload_upstream_active_keys gauge");
-    let _ = writeln!(
-        buf,
-        "# HELP gptload_upstream_invalid_keys Invalid keys per upstream"
-    );
+    let _ = writeln!(buf, "# HELP gptload_upstream_invalid_keys Invalid keys per upstream");
     let _ = writeln!(buf, "# TYPE gptload_upstream_invalid_keys gauge");
-    let _ = writeln!(
-        buf,
-        "# HELP gptload_upstream_cooldown_keys Keys in 429 cooldown per upstream"
-    );
+    let _ = writeln!(buf, "# HELP gptload_upstream_cooldown_keys Keys in 429 cooldown per upstream");
     let _ = writeln!(buf, "# TYPE gptload_upstream_cooldown_keys gauge");
 
-    for u in snap.upstreams.iter() {
+    for u in upstreams {
         let id = u.id.as_ref();
         let keys_arc = u.keys.load_full();
         let total = keys_arc.len();
@@ -1103,9 +1040,7 @@ pub async fn prometheus_metrics(state: Arc<RouterState>) -> Response<Body> {
         for k in keys_arc.iter() {
             if k.is_active() {
                 active += 1;
-                let until = k
-                    .cooldown_until_ms
-                    .load(std::sync::atomic::Ordering::Relaxed);
+                let until = k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed);
                 if until > 0 && now < until {
                     cooldown += 1;
                 }
@@ -1114,145 +1049,60 @@ pub async fn prometheus_metrics(state: Arc<RouterState>) -> Response<Body> {
             }
         }
 
-        let _ = writeln!(
-            buf,
-            "gptload_upstream_keys{{upstream=\"{}\"}} {}",
-            id, total
-        );
-        let _ = writeln!(
-            buf,
-            "gptload_upstream_active_keys{{upstream=\"{}\"}} {}",
-            id, active
-        );
-        let _ = writeln!(
-            buf,
-            "gptload_upstream_invalid_keys{{upstream=\"{}\"}} {}",
-            id, invalid
-        );
-        let _ = writeln!(
-            buf,
-            "gptload_upstream_cooldown_keys{{upstream=\"{}\"}} {}",
-            id, cooldown
-        );
+        let _ = writeln!(buf, "gptload_upstream_keys{{upstream=\"{}\"}} {}", id, total);
+        let _ = writeln!(buf, "gptload_upstream_active_keys{{upstream=\"{}\"}} {}", id, active);
+        let _ = writeln!(buf, "gptload_upstream_invalid_keys{{upstream=\"{}\"}} {}", id, invalid);
+        let _ = writeln!(buf, "gptload_upstream_cooldown_keys{{upstream=\"{}\"}} {}", id, cooldown);
 
-        let sel = u
-            .stats
-            .selected_total
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let _ = writeln!(
-            buf,
-            "gptload_upstream_selected_total{{upstream=\"{}\"}} {}",
-            id, sel
-        );
+        let sel = u.stats.selected_total.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = writeln!(buf, "gptload_upstream_selected_total{{upstream=\"{}\"}} {}", id, sel);
 
-        let r2 = u
-            .stats
-            .responses_2xx
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let r3 = u
-            .stats
-            .responses_3xx
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let r4 = u
-            .stats
-            .responses_4xx
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let r5 = u
-            .stats
-            .responses_5xx
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let _ = writeln!(
-            buf,
-            "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"2xx\"}} {}",
-            id, r2
-        );
-        let _ = writeln!(
-            buf,
-            "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"3xx\"}} {}",
-            id, r3
-        );
-        let _ = writeln!(
-            buf,
-            "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"4xx\"}} {}",
-            id, r4
-        );
-        let _ = writeln!(
-            buf,
-            "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"5xx\"}} {}",
-            id, r5
-        );
+        let r2 = u.stats.responses_2xx.load(std::sync::atomic::Ordering::Relaxed);
+        let r3 = u.stats.responses_3xx.load(std::sync::atomic::Ordering::Relaxed);
+        let r4 = u.stats.responses_4xx.load(std::sync::atomic::Ordering::Relaxed);
+        let r5 = u.stats.responses_5xx.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = writeln!(buf, "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"2xx\"}} {}", id, r2);
+        let _ = writeln!(buf, "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"3xx\"}} {}", id, r3);
+        let _ = writeln!(buf, "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"4xx\"}} {}", id, r4);
+        let _ = writeln!(buf, "gptload_upstream_responses_total{{upstream=\"{}\",status_class=\"5xx\"}} {}", id, r5);
 
-        let et = u
-            .stats
-            .errors_timeout
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let en = u
-            .stats
-            .errors_network
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let _ = writeln!(
-            buf,
-            "gptload_upstream_errors_total{{upstream=\"{}\",type=\"timeout\"}} {}",
-            id, et
-        );
-        let _ = writeln!(
-            buf,
-            "gptload_upstream_errors_total{{upstream=\"{}\",type=\"network\"}} {}",
-            id, en
-        );
+        let et = u.stats.errors_timeout.load(std::sync::atomic::Ordering::Relaxed);
+        let en = u.stats.errors_network.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = writeln!(buf, "gptload_upstream_errors_total{{upstream=\"{}\",type=\"timeout\"}} {}", id, et);
+        let _ = writeln!(buf, "gptload_upstream_errors_total{{upstream=\"{}\",type=\"network\"}} {}", id, en);
     }
+}
 
-    // Key status distribution (global)
+/// Global key distribution: total, active, invalid, cooldown counts.
+fn write_prometheus_keys(buf: &mut String, upstreams: &[Arc<crate::state::Upstream>], now: u64) {
     let mut total_keys = 0usize;
     let mut active_keys = 0usize;
     let mut cooldown_keys = 0usize;
-    for u in snap.upstreams.iter() {
+    for u in upstreams {
         let keys = u.keys.load_full();
         total_keys += keys.len();
         for k in keys.iter() {
             if k.is_active() {
                 active_keys += 1;
-                // Check if key is in 429 cooldown.
-                let until = k
-                    .cooldown_until_ms
-                    .load(std::sync::atomic::Ordering::Relaxed);
+                let until = k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed);
                 if until > 0 && now < until {
                     cooldown_keys += 1;
                 }
             }
         }
     }
-    let _ = writeln!(
-        buf,
-        "# HELP gptload_keys_total Total keys across all upstreams"
-    );
+    let _ = writeln!(buf, "# HELP gptload_keys_total Total keys across all upstreams");
     let _ = writeln!(buf, "# TYPE gptload_keys_total gauge");
     let _ = writeln!(buf, "gptload_keys_total {}", total_keys);
-    let _ = writeln!(
-        buf,
-        "# HELP gptload_keys_active Active keys across all upstreams"
-    );
+    let _ = writeln!(buf, "# HELP gptload_keys_active Active keys across all upstreams");
     let _ = writeln!(buf, "# TYPE gptload_keys_active gauge");
     let _ = writeln!(buf, "gptload_keys_active {}", active_keys);
-    let _ = writeln!(
-        buf,
-        "# HELP gptload_keys_invalid Invalid keys across all upstreams"
-    );
+    let _ = writeln!(buf, "# HELP gptload_keys_invalid Invalid keys across all upstreams");
     let _ = writeln!(buf, "# TYPE gptload_keys_invalid gauge");
-    let _ = writeln!(
-        buf,
-        "gptload_keys_invalid {}",
-        total_keys.saturating_sub(active_keys)
-    );
+    let _ = writeln!(buf, "gptload_keys_invalid {}", total_keys.saturating_sub(active_keys));
     let _ = writeln!(buf, "# HELP gptload_keys_cooldown Keys in 429 cooldown");
     let _ = writeln!(buf, "# TYPE gptload_keys_cooldown gauge");
     let _ = writeln!(buf, "gptload_keys_cooldown {}", cooldown_keys);
-
-    Response::builder()
-        .status(200)
-        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-        .body(Body::from(buf))
-        .unwrap()
 }
 
 async fn stats_stream(state: Arc<RouterState>) -> Response<Body> {
