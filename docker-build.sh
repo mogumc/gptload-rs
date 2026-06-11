@@ -9,12 +9,15 @@ BINARY_NAME="gptload-rs"
 # 检测当前架构
 ARCH=$(uname -m)
 case $ARCH in
-    x86_64)  DOCKER_ARCH="amd64"; RUST_TARGET="x86_64-unknown-linux-gnu" ;;
-    aarch64) DOCKER_ARCH="arm64"; RUST_TARGET="aarch64-unknown-linux-gnu" ;;
+    x86_64)  DOCKER_ARCH="amd64"; RUST_TARGET="x86_64-unknown-linux-musl" ;;
+    aarch64) DOCKER_ARCH="arm64"; RUST_TARGET="aarch64-unknown-linux-musl" ;;
     *)       echo "不支持的架构: $ARCH"; exit 1 ;;
 esac
 
 echo "==> 架构: $ARCH -> Docker: $DOCKER_ARCH, Rust target: $RUST_TARGET"
+
+# 确保 musl target 已安装
+rustup target add "$RUST_TARGET"
 
 echo "==> 编译二进制..."
 cargo build --release --target "$RUST_TARGET"

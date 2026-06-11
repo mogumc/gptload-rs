@@ -27,10 +27,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             arch: amd64
             rustflags: "-C target-cpu=x86-64-v3"
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             arch: arm64
             rustflags: "-C target-cpu=neoverse-n1"
 
