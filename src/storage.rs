@@ -64,7 +64,11 @@ impl KeyStore {
     }
 
     /// Set the permission level for a key.
+    /// Valid values: >= 0, or exactly -1 (unlimited).
     pub fn set_key_level(&self, key: &str, level: i32) -> anyhow::Result<()> {
+        if level < 0 && level != -1 {
+            anyhow::bail!("key level must be >= 0 or -1, got {}", level);
+        }
         let tree = self.open_key_levels_tree()?;
         tree.insert(key.as_bytes(), &level.to_le_bytes())?;
         tree.flush()?;

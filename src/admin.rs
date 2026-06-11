@@ -141,6 +141,7 @@ async fn handle_api(req: Request<Body>, state: Arc<RouterState>) -> Response<Bod
         (&Method::GET, "/admin/api/v1/requests") => api_requests(state, req.uri()).await,
         (&Method::GET, "/admin/api/v1/metrics") => api_metrics(state, req.uri()).await,
         (&Method::GET, "/admin/api/v1/billing/keys") => api_billing_list_keys(state).await,
+        (&Method::GET, "/admin/api/v1/billing/overview") => api_billing_overview(state).await,
         (&Method::POST, "/admin/api/v1/billing/keys") => api_billing_create_key(req, state).await,
         _ => {
             // Dynamic routes:
@@ -230,6 +231,66 @@ async fn api_billing_list_keys(state: Arc<RouterState>) -> Response<Body> {
         })
         .collect();
     json_ok(&serde_json::json!({ "keys": items }))
+}
+
+async fn api_billing_overview(state: Arc<RouterState>) -> Response<Body> {
+    let keys = state.billing.list_keys();
+    let total_keys = keys.len();
+    let mut total_balance: i64 = 0;
+    let mut unlimited_count = 0;
+    let mut zero_or_less = 0;
+    let mut key_details: Vec<serde_json::Value> = Vec::with_capacity(keys.len());
+    for (key, balance) in &keys {
+        if *balance == -1 {
+            unlimited_count += 1;
+        } else {
+            total_balance = total_balance.saturating_add(*balance);
+            if *balance <= 0 {
+                zero_or_less += 1;
+            }
+        }
+        key_details.push(serde_json::json!({
+            "key": key,
+            "balance": balance,
+            "label": if *balance == -1 { "unlimited" } else if *balance <= 0 { "exhausted" } else { "active" }
+        }));
+    }
+
+    let rt = state.runtime.load_full();
+    let model_costs: serde_json::Value = rt
+        .model_costs
+        .iter()
+        .map(|(m, c)| serde_json::json!({ "model": m, "input": c.input, "output": c.output }))
+        .collect();
+
+    let snap = state.snapshot.load_full();
+    let upstream_summary: Vec<serde_json::Value> = snap.upstreams.iter().map(|u| {
+        let keys = u.keys.load_full();
+        let active = keys.iter().filter(|k| k.is_active()).count();
+        serde_json::json!({
+            "id": u.id.as_ref(),
+            "total_keys": keys.len(),
+            "active_keys": active,
+            "format": u.format.as_str(),
+            "min_key_level": u.min_key_level,
+            "model_map": u.model_map.iter().map(|(k, v)| serde_json::json!({k: v})).collect::<Vec<_>>(),
+        })
+    }).collect();
+
+    let stats = &state.stats;
+    json_ok(&serde_json::json!({
+        "billing": {
+            "total_keys": total_keys,
+            "unlimited_keys": unlimited_count,
+            "active_keys": total_keys - unlimited_count - zero_or_less,
+            "exhausted_keys": zero_or_less,
+            "total_balance": total_balance,
+        },
+        "model_costs": model_costs,
+        "upstreams": upstream_summary,
+        "requests_total": stats.requests_total.load(std::sync::atomic::Ordering::Relaxed),
+        "requests_inflight": stats.requests_inflight.load(std::sync::atomic::Ordering::Relaxed),
+    }))
 }
 
 async fn api_billing_create_key(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
@@ -499,9 +560,9 @@ struct UpstreamBody {
     format: Option<UpstreamFormat>,
     proxy: Option<String>,
     #[serde(default)]
-    model_map: std::collections::HashMap<String, String>,
+    model_map: Option<std::collections::HashMap<String, String>>,
     #[serde(default)]
-    min_key_level: i32,
+    min_key_level: Option<i32>,
 }
 
 #[derive(Deserialize)]
@@ -512,9 +573,9 @@ struct UpstreamUpdateBody {
     format: Option<UpstreamFormat>,
     proxy: Option<String>,
     #[serde(default)]
-    model_map: std::collections::HashMap<String, String>,
+    model_map: Option<std::collections::HashMap<String, String>>,
     #[serde(default)]
-    min_key_level: i32,
+    min_key_level: Option<i32>,
 }
 
 async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
@@ -546,6 +607,14 @@ async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Respon
             "bad_request",
         );
     }
+    let min_level = input.min_key_level.unwrap_or(0);
+    if min_level < 0 && min_level != -1 {
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            "min_key_level must be >= 0 or -1",
+            "bad_request",
+        );
+    }
     let cfg = UpstreamConfig {
         id: input.id.trim().to_string(),
         base_url: input.base_url.trim().to_string(),
@@ -553,8 +622,8 @@ async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Respon
         max_concurrent_per_key: input.max_concurrent_per_key,
         format: input.format,
         proxy: input.proxy.filter(|p| !p.trim().is_empty()),
-        model_map: input.model_map,
-        min_key_level: input.min_key_level,
+        model_map: input.model_map.unwrap_or_default(),
+        min_key_level: input.min_key_level.unwrap_or(0),
     };
     let state2 = state.clone();
     let res = tokio::task::spawn_blocking(move || state2.add_upstream(cfg)).await;
@@ -604,6 +673,14 @@ async fn api_update_upstream(
             "bad_request",
         );
     }
+    let min_level = input.min_key_level.unwrap_or(0);
+    if min_level < 0 && min_level != -1 {
+        return RouterState::json_error(
+            http::StatusCode::BAD_REQUEST,
+            "min_key_level must be >= 0 or -1",
+            "bad_request",
+        );
+    }
     let state2 = state.clone();
     let id = upstream_id.to_string();
     let cfg = UpstreamConfig {
@@ -613,8 +690,8 @@ async fn api_update_upstream(
         max_concurrent_per_key: input.max_concurrent_per_key,
         format: input.format,
         proxy: input.proxy.filter(|p| !p.trim().is_empty()),
-        model_map: input.model_map,
-        min_key_level: input.min_key_level,
+        model_map: input.model_map.unwrap_or_default(),
+        min_key_level: input.min_key_level.unwrap_or(0),
     };
     let res = tokio::task::spawn_blocking(move || state2.update_upstream(&id, cfg)).await;
     match res {
