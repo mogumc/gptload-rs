@@ -27,10 +27,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            arch: x86_64
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
             rustflags: "-C target-cpu=x86-64-v3"
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             arch: arm64
             rustflags: "-C target-cpu=neoverse-n1"
 
@@ -60,7 +60,7 @@ jobs:
         run: |
           SOURCE_BIN="target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}"
           strip "$SOURCE_BIN" || true
-          cp "$SOURCE_BIN" ./gptload-rs
+          cp "$SOURCE_BIN" "./${{ env.BINARY_NAME }}-linux-${{ matrix.arch }}"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -84,7 +84,7 @@ jobs:
             type=raw,value=${{ matrix.arch }}
 
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/${{ matrix.arch }}
@@ -95,7 +95,7 @@ jobs:
           cache-to: type=gha,scope=${{ matrix.arch }},mode=max
 
       - name: Clean up binary
-        run: rm -f ./gptload-rs
+        run: rm -f "./${{ env.BINARY_NAME }}-linux-${{ matrix.arch }}"
 
   merge-manifests:
     name: Merge Multi-Arch Manifests
@@ -119,7 +119,7 @@ jobs:
           docker buildx imagetools create \
             -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG} \
             -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:x86_64 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:amd64 \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:arm64
 
       - name: Output image info
