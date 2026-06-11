@@ -139,6 +139,7 @@ async fn handle_api(req: Request<Body>, state: Arc<RouterState>) -> Response<Bod
         (&Method::PUT, "/admin/api/v1/models/routes") => api_put_model_routes(req, state).await,
         (&Method::GET, "/admin/api/v1/requests/stream") => requests_stream(state).await,
         (&Method::GET, "/admin/api/v1/requests") => api_requests(state, req.uri()).await,
+        (&Method::GET, "/admin/api/v1/requests/history") => api_requests_history(state, req.uri()).await,
         (&Method::GET, "/admin/api/v1/metrics") => api_metrics(state, req.uri()).await,
         (&Method::GET, "/admin/api/v1/billing/keys") => api_billing_list_keys(state).await,
         (&Method::GET, "/admin/api/v1/billing/overview") => api_billing_overview(state).await,
@@ -1089,6 +1090,44 @@ async fn api_requests(state: Arc<RouterState>, uri: &http::Uri) -> Response<Body
         "now_ms": now_ms(),
         "count": list.len(),
         "requests": list
+    }))
+}
+
+/// Read historical requests from the JSONL file, newest first.
+/// ?limit=N  (default 100, max 5000)
+/// ?before=ts_ms  (optional, only return entries before this timestamp)
+async fn api_requests_history(state: Arc<RouterState>, uri: &http::Uri) -> Response<Body> {
+    let limit: usize = query_get(uri, "limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 5000);
+    let before: Option<u64> = query_get(uri, "before").and_then(|s| s.parse().ok());
+
+    let path = state.requests_log_path.clone();
+    let items = tokio::task::spawn_blocking(move || {
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut out: Vec<serde_json::Value> = Vec::with_capacity(limit);
+        for line in content.lines().rev() {
+            if out.len() >= limit { break; }
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(before) = before {
+                    if let Some(ts) = v.get("ts_ms").and_then(|t| t.as_u64()) {
+                        if ts >= before { continue; }
+                    }
+                }
+                out.push(v);
+            }
+        }
+        out
+    }).await.unwrap_or_default();
+
+    json_ok(&serde_json::json!({
+        "now_ms": now_ms(),
+        "count": items.len(),
+        "source": "file",
+        "requests": items
     }))
 }
 

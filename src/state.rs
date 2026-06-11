@@ -40,6 +40,7 @@ pub struct RouterState {
     pub billing: Arc<BillingStore>,
     pub model_routes_path: PathBuf,
     pub upstreams_path: PathBuf,
+    pub requests_log_path: PathBuf,
 
     pub snapshot: ArcSwap<RouterSnapshot>,
     pub sched_rr: Arc<AtomicUsize>,
@@ -105,6 +106,7 @@ impl Clone for RouterState {
             billing: self.billing.clone(),
             model_routes_path: self.model_routes_path.clone(),
             upstreams_path: self.upstreams_path.clone(),
+            requests_log_path: self.requests_log_path.clone(),
             snapshot: ArcSwap::from(self.snapshot.load_full()),
             sched_rr: Arc::new(AtomicUsize::new(
                 self.sched_rr.load(std::sync::atomic::Ordering::Relaxed),
@@ -256,7 +258,7 @@ impl Stats {
     }
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RequestLogEntry {
     pub id: u64,
     pub ts_ms: u64,
@@ -279,7 +281,7 @@ pub struct RequestLogEntry {
     pub timing: RequestTiming,
 }
 
-#[derive(Clone, Default, serde::Serialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RequestTiming {
     pub queue_ms: u64,
     pub upstream_ms: u64,
@@ -517,8 +519,31 @@ impl RouterState {
         let log_tx = start_request_log_writer(requests_log_path.clone());
         let requests = Arc::new(RequestsLog::new(5000, log_tx));
 
+        // Load last 5000 entries from file into memory.
+        if let Ok(content) = std::fs::read_to_string(&requests_log_path) {
+            let mut loaded = 0usize;
+            let entries: Vec<RequestLogEntry> = content
+                .lines()
+                .rev()
+                .take(5000)
+                .filter_map(|line| {
+                    let entry = serde_json::from_str::<RequestLogEntry>(line.trim()).ok()?;
+                    loaded += 1;
+                    Some(entry)
+                })
+                .collect();
+            for entry in entries.into_iter().rev() {
+                requests.record(entry);
+            }
+            tracing::info!(
+                path = %requests_log_path.display(),
+                loaded,
+                "loaded historical request logs"
+            );
+        }
+
         let retention_days = runtime.server.request_log_retention_days;
-        spawn_request_log_cleanup(requests_log_path, retention_days);
+        spawn_request_log_cleanup(requests_log_path.clone(), retention_days);
 
         let mut upstream_configs: Vec<UpstreamConfig> = Vec::new();
         if let Ok(list) = load_upstreams_override(&upstreams_path) {
@@ -566,6 +591,7 @@ impl RouterState {
             billing,
             model_routes_path,
             upstreams_path,
+            requests_log_path,
             snapshot: ArcSwap::from(Arc::new(snapshot)),
             sched_rr: Arc::new(AtomicUsize::new(0)),
             client,
