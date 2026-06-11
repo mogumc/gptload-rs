@@ -16,11 +16,26 @@ esac
 
 echo "==> 架构: $ARCH -> Docker: $DOCKER_ARCH, Rust target: $RUST_TARGET"
 
-# 确保 musl target 已安装
-rustup target add "$RUST_TARGET"
+# 首选使用 cross 进行可靠交叉编译；若未安装则使用 cargo 直编
+if command -v cross &> /dev/null; then
+    echo "==> 使用 cross 编译二进制..."
+    cross build --release --target "$RUST_TARGET"
+else
+    echo "==> cross 未安装，使用 cargo 编译..."
+    # 确保 musl target 已安装
+    rustup target add "$RUST_TARGET"
 
-echo "==> 编译二进制..."
-cargo build --release --target "$RUST_TARGET"
+    # 设置 musl-gcc 交叉编译器
+    if command -v musl-gcc &> /dev/null; then
+        export CC_x86_64_unknown_linux_musl=musl-gcc
+        echo "    使用 musl-gcc 作为链接器"
+    else
+        echo "    警告: musl-gcc 未找到，可能需要安装 musl-tools"
+        echo "    安装方法: sudo apt-get install musl-tools"
+    fi
+
+    cargo build --release --target "$RUST_TARGET"
+fi
 
 echo "==> 复制二进制文件到当前目录..."
 cp "target/$RUST_TARGET/release/$BINARY_NAME" "$BINARY_NAME-linux-$DOCKER_ARCH"

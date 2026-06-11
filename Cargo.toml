@@ -47,3 +47,7 @@ strip = true              # 移除调试符号
 inherits = "release"
 lto = "thin"               # 轻量级LTO (更快的链接)
 codegen-units = 256        # 多线程编译 (更快的编译)
+
+# musl 环境下从源码编译 OpenSSL
+[target.'cfg(target_env = "musl")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
