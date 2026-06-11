@@ -76,11 +76,17 @@ fn print_startup_info(state: &Arc<state::RouterState>, addr: SocketAddr) {
     let upstreams = &snapshot.upstreams;
     let admin_tokens = &state.admin_tokens;
 
+    let display_addr = if addr.ip().is_unspecified() {
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), addr.port())
+    } else {
+        addr
+    };
+
     tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     tracing::info!("  gptload-rs v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     tracing::info!(%addr, "listening");
-    tracing::info!(url = %format!("http://{}/web/", addr), "admin panel");
+    tracing::info!(url = %format!("http://{}/web/", display_addr), "admin panel");
 
     // Admin tokens
     let token_count = admin_tokens.len();
