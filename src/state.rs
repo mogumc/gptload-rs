@@ -354,7 +354,18 @@ impl RequestsLog {
         if let Some(tx) = &self.tx {
             let _ = tx.try_send(entry.clone());
         }
+        self.push_entry(entry);
+    }
 
+    /// Load historical entries into memory only — no broadcast or file write.
+    /// Used at startup to restore in-memory state without duplicating the log file.
+    pub fn load_history<I: IntoIterator<Item = RequestLogEntry>>(&self, entries: I) {
+        for entry in entries {
+            self.push_entry(entry);
+        }
+    }
+
+    fn push_entry(&self, entry: RequestLogEntry) {
         {
             let mut entries = self.entries.lock().unwrap();
             entries.push_back(entry.clone());
@@ -362,7 +373,6 @@ impl RequestsLog {
                 entries.pop_front();
             }
         }
-
         {
             let mut metrics = self.metrics.lock().unwrap();
             metrics.update(&entry);
@@ -506,7 +516,7 @@ impl RouterState {
         let log_tx = start_request_log_writer(requests_log_path.clone(), log_pause.clone());
         let requests = Arc::new(RequestsLog::new(5000, log_tx));
 
-        // Load last 5000 entries from file into memory.
+        // Load last 5000 entries from file into memory (no file write, already persisted).
         if let Ok(content) = std::fs::read_to_string(&requests_log_path) {
             let mut loaded = 0usize;
             let entries: Vec<RequestLogEntry> = content
@@ -519,9 +529,7 @@ impl RouterState {
                     Some(entry)
                 })
                 .collect();
-            for entry in entries.into_iter().rev() {
-                requests.record(entry);
-            }
+            requests.load_history(entries.into_iter().rev());
             tracing::info!(
                 path = %requests_log_path.display(),
                 loaded,
@@ -2078,8 +2086,8 @@ fn start_request_log_writer(path: PathBuf, pause: Arc<AtomicBool>) -> Option<mps
                                 ),
                             }
                         }
-                        // Drain any buffered entries after pause ends.
-                        while let Some(entry) = pause_buf.pop() {
+                        // Drain any buffered entries in FIFO order.
+                        for entry in pause_buf.drain(..) {
                             if let Ok(line) = serde_json::to_string(&entry) {
                                 if file.write_all(line.as_bytes()).await.is_ok() {
                                     let _ = file.write_all(b"\n").await;
