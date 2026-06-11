@@ -802,6 +802,7 @@ struct UpstreamInfo {
     keys_total: usize,
     keys_active: usize,
     keys_invalid: usize,
+    keys_cooldown: usize,
 
     selected_total: u64,
 
@@ -817,6 +818,15 @@ fn build_upstream_info(u: &crate::state::Upstream, global_max: u32) -> UpstreamI
     let keys_arc = u.keys.load_full();
     let total = keys_arc.len();
     let invalid = keys_arc.iter().filter(|k| !k.is_active()).count();
+    let now = now_ms();
+    let cooldown = keys_arc
+        .iter()
+        .filter(|k| {
+            k.is_active()
+                && k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed) > 0
+                && now < k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .count();
     let effective_max = if u.max_concurrent_per_key > 0 {
         u.max_concurrent_per_key
     } else {
@@ -832,6 +842,7 @@ fn build_upstream_info(u: &crate::state::Upstream, global_max: u32) -> UpstreamI
         keys_total: total,
         keys_active: total.saturating_sub(invalid),
         keys_invalid: invalid,
+        keys_cooldown: cooldown,
         selected_total: u
             .stats
             .selected_total
@@ -1327,9 +1338,9 @@ async fn stats_stream(state: Arc<RouterState>) -> Response<Body> {
         loop {
             let snap = build_snapshot(&state2);
             let total = snap.requests_total;
-            let raw = total.saturating_sub(last_total); // requests since last tick (1s)
+            let raw = total.saturating_sub(last_total); // requests since last tick (2s)
             last_total = total;
-            let rpm = raw.saturating_mul(60); // extrapolate to per-minute
+            let rpm = raw.saturating_mul(30); // extrapolate to per-minute
 
             let mut v = serde_json::to_value(&snap)
                 .unwrap_or(serde_json::json!({"error":"snapshot_failed"}));
@@ -1345,7 +1356,7 @@ async fn stats_stream(state: Arc<RouterState>) -> Response<Body> {
             if tx.send(Ok(Bytes::from(msg))).await.is_err() {
                 break;
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
 
