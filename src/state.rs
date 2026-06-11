@@ -39,6 +39,7 @@ pub struct RouterState {
     pub store: Arc<KeyStore>,
     pub billing: Arc<BillingStore>,
     pub model_routes_path: PathBuf,
+    pub model_costs_path: PathBuf,
     pub upstreams_path: PathBuf,
     pub requests_log_path: PathBuf,
 
@@ -106,6 +107,7 @@ impl Clone for RouterState {
             store: self.store.clone(),
             billing: self.billing.clone(),
             model_routes_path: self.model_routes_path.clone(),
+            model_costs_path: self.model_costs_path.clone(),
             upstreams_path: self.upstreams_path.clone(),
             requests_log_path: self.requests_log_path.clone(),
             snapshot: ArcSwap::from(self.snapshot.load_full()),
@@ -496,7 +498,7 @@ impl RuntimeConfig {
 
 impl RouterState {
     pub fn new(cfg: Config, config_path: Option<PathBuf>) -> anyhow::Result<Self> {
-        let runtime = Arc::new(RuntimeConfig::from_config(&cfg));
+        let mut runtime = Arc::new(RuntimeConfig::from_config(&cfg));
         let queue_max_depth = runtime.server.queue_max_depth;
         let request_timeout = runtime.request_timeout;
         let max_retries = runtime.max_retries;
@@ -510,6 +512,7 @@ impl RouterState {
         let store = Arc::new(KeyStore::open(&data_dir)?);
         let billing = Arc::new(BillingStore::new(&store)?);
         let model_routes_path = data_dir.join("models_routes.json");
+        let model_costs_path = data_dir.join("models_costs.json");
         let upstreams_path = data_dir.join("upstreams.json");
         let requests_log_path = data_dir.join("requests.jsonl");
         let log_pause = Arc::new(AtomicBool::new(false));
@@ -579,6 +582,18 @@ impl RouterState {
             );
         }
 
+        // Load persisted model costs (set via admin API).
+        if let Ok(data) = std::fs::read_to_string(&model_costs_path) {
+            if let Ok(costs) = serde_json::from_str::<std::collections::HashMap<String, crate::config::ModelCost>>(&data) {
+                let mut rt = (*runtime).clone();
+                rt.model_costs = costs.into_iter().collect();
+                runtime = Arc::new(rt);
+                tracing::info!(path = %model_costs_path.display(), "loaded persisted model costs");
+            }
+        } else if model_costs_path.exists() {
+            tracing::warn!(path = %model_costs_path.display(), "failed to read model costs file");
+        }
+
         Ok(Self {
             runtime: ArcSwap::from(runtime),
             request_timeout,
@@ -591,6 +606,7 @@ impl RouterState {
             store,
             billing,
             model_routes_path,
+            model_costs_path,
             upstreams_path,
             requests_log_path,
             snapshot: ArcSwap::from(Arc::new(snapshot)),
@@ -1805,6 +1821,16 @@ impl RouterState {
     pub fn set_model_costs(&self, costs: ahash::AHashMap<String, crate::config::ModelCost>) {
         let old = self.runtime.load_full();
         let mut rt: RuntimeConfig = (*old).clone();
+
+        // Persist to disk before storing (clone for serialization).
+        let ser_costs: std::collections::HashMap<&str, &crate::config::ModelCost> =
+            costs.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        if let Ok(json) = serde_json::to_string_pretty(&ser_costs) {
+            if let Err(e) = std::fs::write(&self.model_costs_path, &json) {
+                tracing::warn!(path = %self.model_costs_path.display(), error = %e, "failed to persist model costs");
+            }
+        }
+
         rt.model_costs = costs;
         self.runtime.store(Arc::new(rt));
     }
