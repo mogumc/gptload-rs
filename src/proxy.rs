@@ -176,11 +176,13 @@ async fn handle_inner(
         );
     }
 
-    // Stats: request start.
-    state
-        .stats
-        .requests_total
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Stats: request start (only /v1 paths).
+    if path.starts_with("/v1") {
+        state
+            .stats
+            .requests_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     state
         .stats
         .requests_inflight
@@ -799,6 +801,9 @@ fn record_request(
     resp_bytes: usize,
     usage: Option<UsageTokens>,
 ) {
+    if !ctx.path.starts_with("/v1") {
+        return;
+    }
     let total_ms = ctx.start.elapsed().as_millis() as u64;
     let entry = RequestLogEntry {
         id: REQUEST_LOG_ID.fetch_add(1, Ordering::Relaxed),
