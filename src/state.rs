@@ -34,7 +34,6 @@ pub struct RouterState {
 
     pub proxy_tokens: Option<Arc<AHashSet<String>>>,
     pub admin_tokens: Arc<AHashSet<String>>,
-    pub export_token: Option<String>,
     pub usage_inject_upstreams: Option<Arc<AHashSet<String>>>,
 
     pub store: Arc<KeyStore>,
@@ -67,7 +66,6 @@ pub struct RuntimeConfig {
     pub key_config: KeyConfig,
     pub proxy_tokens: Option<Arc<AHashSet<String>>>,
     pub admin_tokens: Arc<AHashSet<String>>,
-    pub export_token: Option<String>,
     pub usage_inject_upstreams: Option<Arc<AHashSet<String>>>,
     pub model_costs: ahash::AHashMap<String, crate::config::ModelCost>,
     pub server: ServerConfig,
@@ -102,7 +100,6 @@ impl Clone for RouterState {
             key_config: self.key_config.clone(),
             proxy_tokens: self.proxy_tokens.clone(),
             admin_tokens: self.admin_tokens.clone(),
-            export_token: self.export_token.clone(),
             usage_inject_upstreams: self.usage_inject_upstreams.clone(),
             store: self.store.clone(),
             billing: self.billing.clone(),
@@ -480,7 +477,6 @@ impl RuntimeConfig {
             key_config: cfg.key.clone(),
             proxy_tokens,
             admin_tokens: Arc::new(admin_set),
-            export_token: cfg.export_token.clone(),
             usage_inject_upstreams,
             model_costs,
             server: cfg.server.clone(),
@@ -551,7 +547,6 @@ impl RouterState {
             key_config: cfg.key.clone(),
             proxy_tokens,
             admin_tokens,
-            export_token: cfg.export_token.clone(),
             usage_inject_upstreams,
             store,
             billing,
@@ -655,10 +650,6 @@ impl RouterState {
 
     pub fn key_config(&self) -> KeyConfig {
         self.runtime.load().key_config.clone()
-    }
-
-    pub fn export_token(&self) -> Option<String> {
-        self.runtime.load().export_token.clone()
     }
 
     pub fn config_preview(&self) -> serde_json::Value {

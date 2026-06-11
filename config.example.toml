@@ -3,7 +3,7 @@
 # ============================================================
 
 # 代理监听地址（HTTP），/admin 管理后台同端口
-listen_addr = "0.0.0.0:8080"
+listen_addr = "0.0.0.0:3000"
 
 # Tokio 工作线程数，省略则自动取 CPU 核心数
 # worker_threads = 4
@@ -24,9 +24,6 @@ retry_status_codes = [429, 500, 502, 503, 504, 401, 403]
 # 管理后台鉴权令牌（必填），API 须携带 X-Admin-Token，SSE 使用 ?token=
 # 公网部署请务必设置强密码
 admin_tokens = ["admin-token-1"]
-
-# 敏感操作导出令牌，客户端须携带 X-Export-Token 头
-export_token = "your-export-secret"
 
 # 持久化数据目录（sled 内嵌数据库），不存在则自动创建
 data_dir = "./data"

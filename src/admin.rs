@@ -435,7 +435,7 @@ async fn handle_upstream_subroutes(
             _ => method_not_allowed(),
         },
         "export" => match *req.method() {
-            Method::GET => api_export_keys(req, state, upstream_id).await,
+            Method::GET => api_export_keys(state, upstream_id).await,
             _ => method_not_allowed(),
         },
         _ => Response::builder()
@@ -1736,62 +1736,26 @@ async fn api_list_keys(
     }))
 }
 
-/// Export all keys for an upstream as a downloadable txt file.
-/// Requires the separate `export_token` via `X-Export-Token` header.
-/// Disabled if export_token is not configured.
-async fn api_export_keys(
-    req: Request<Body>,
-    state: Arc<RouterState>,
-    upstream_id: &str,
-) -> Response<Body> {
-    let Some(expected) = state.export_token() else {
-        return RouterState::json_error(
-            http::StatusCode::NOT_FOUND,
-            "export not configured",
-            "export_disabled",
-        );
-    };
-    // Verify export token.
-    let provided = req
-        .headers()
-        .get("x-export-token")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if provided.is_empty() || provided != expected.as_str() {
-        return RouterState::json_error(
-            http::StatusCode::UNAUTHORIZED,
-            "missing or invalid export token",
-            "export_unauthorized",
-        );
-    }
-
+async fn api_export_keys(state: Arc<RouterState>, upstream_id: &str) -> Response<Body> {
     let (_idx, upstream) = match get_upstream(&state, upstream_id) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
-
     let keys = upstream.keys.load_full();
-    let total = keys.len();
-
-    let mut body = String::with_capacity(total * 60);
+    let mut body = String::with_capacity(keys.len() * 60);
     for k in keys.iter() {
         body.push_str(k.key.as_ref());
         body.push('\n');
     }
-
-    let now = std::time::SystemTime::now()
+    let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let filename = format!("{}_keys_{}.txt", upstream_id, now);
-
+    let filename = format!("{}_keys_{}.txt", upstream_id, ts);
     Response::builder()
         .status(200)
         .header("content-type", "text/plain; charset=utf-8")
-        .header(
-            "content-disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
+        .header("content-disposition", format!("attachment; filename=\"{}\"", filename))
         .body(Body::from(body))
         .unwrap()
 }

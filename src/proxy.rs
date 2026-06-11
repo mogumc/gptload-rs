@@ -823,7 +823,7 @@ fn add_cors_headers(
         headers.insert(
             "access-control-allow-headers",
             http::HeaderValue::from_static(
-                "authorization,content-type,x-api-key,x-proxy-token,x-admin-token,x-export-token",
+                "authorization,content-type,x-api-key,x-proxy-token,x-admin-token",
             ),
         );
         headers.insert(
