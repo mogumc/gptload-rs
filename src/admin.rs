@@ -145,8 +145,10 @@ async fn handle_api(req: Request<Body>, state: Arc<RouterState>) -> Response<Bod
         (&Method::POST, "/admin/api/v1/billing/keys") => api_billing_create_key(req, state).await,
         _ => {
             // Dynamic routes:
-            if let Some(rest) = path.strip_prefix("/admin/api/v1/billing/keys/") {
-                return handle_billing_key_subroutes(req, state, rest).await;
+            if let Some(rest) = path.strip_prefix("/admin/api/v1/billing/") {
+                if rest != "keys" && rest != "overview" {
+                    return handle_billing_key_subroutes(req, state, rest).await;
+                }
             }
             if let Some(rest) = path.strip_prefix("/admin/api/v1/upstreams/") {
                 return handle_upstream_subroutes(req, state, rest).await;
@@ -228,9 +230,11 @@ async fn api_billing_list_keys(state: Arc<RouterState>) -> Response<Body> {
     let items: Vec<serde_json::Value> = keys
         .into_iter()
         .map(|(key, balance)| {
+            let level = state.store.get_key_level(&key);
             serde_json::json!({
                 "key": key,
-                "balance": balance
+                "balance": balance,
+                "level": level
             })
         })
         .collect();
