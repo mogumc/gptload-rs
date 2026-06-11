@@ -26,6 +26,10 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 static REQUEST_LOG_ID: AtomicU64 = AtomicU64::new(1);
 
+lazy_static::lazy_static! {
+    static ref TRACE_PROPAGATOR: TraceContextPropagator = TraceContextPropagator::new();
+}
+
 // ── W3C TraceContext helpers ──────────────────────────────────────────
 
 struct HeaderExtractor<'a>(&'a hyper::HeaderMap);
@@ -54,8 +58,7 @@ impl<'a> Injector for HeaderInjector<'a> {
 }
 
 fn extract_trace_context(headers: &hyper::HeaderMap) -> opentelemetry::Context {
-    let propagator = TraceContextPropagator::new();
-    propagator.extract(&HeaderExtractor(headers))
+    TRACE_PROPAGATOR.extract(&HeaderExtractor(headers))
 }
 
 /// Resolve the real client IP from headers set by reverse proxies (nginx, etc.).
@@ -91,8 +94,7 @@ fn resolve_client_ip(req: &hyper::HeaderMap, peer: SocketAddr) -> String {
 
 fn inject_trace_context(headers: &mut hyper::HeaderMap) {
     let cx = tracing::Span::current().context();
-    let propagator = TraceContextPropagator::new();
-    propagator.inject_context(&cx, &mut HeaderInjector(headers));
+    TRACE_PROPAGATOR.inject_context(&cx, &mut HeaderInjector(headers));
 }
 
 // ── HTTP server ───────────────────────────────────────────────────────
@@ -144,27 +146,22 @@ async fn handle_inner(
     state: Arc<RouterState>,
     client_addr: SocketAddr,
 ) -> Response<Body> {
-    let path_for_span = req.uri().path().to_string();
-    let method_for_span = req.method().clone();
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
     let parent_cx = extract_trace_context(req.headers());
     let client_ip = resolve_client_ip(req.headers(), client_addr);
 
-    let span = {
-        let s = tracing::info_span!(
-            "proxy.request",
-            http.method = %method_for_span,
-            http.url = %path_for_span,
-            net.peer.ip = %client_ip,
-        );
-        s.set_parent(parent_cx);
-        s
-    };
+    let span = tracing::info_span!(
+        "proxy.request",
+        http.method = %method,
+        http.url = %path,
+        net.peer.ip = %client_ip,
+    );
+    span.set_parent(parent_cx);
 
     async move {
-    let path = req.uri().path().to_string();
-
     // Health check.
-    if req.method() == hyper::Method::GET && path == "/health" {
+    if method == hyper::Method::GET && path == "/health" {
         let snap = state.snapshot.load_full();
         let mut total_keys = 0usize;
         let mut active_keys = 0usize;
@@ -188,7 +185,7 @@ async fn handle_inner(
     }
 
     // Prometheus metrics.
-    if req.method() == hyper::Method::GET && path == "/metrics" {
+    if method == hyper::Method::GET && path == "/metrics" {
         return admin::prometheus_metrics(state).await;
     }
 
@@ -206,7 +203,6 @@ async fn handle_inner(
     }
 
     let start = Instant::now();
-    let method = req.method().clone();
     let base_log_ctx = RequestLogContext::new(
         start,
         client_ip.clone(),
