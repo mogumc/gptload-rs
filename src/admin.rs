@@ -677,7 +677,7 @@ pub(crate) async fn api_requests_history(state: Arc<RouterState>, uri: &http::Ur
 }
 
 pub(crate) async fn api_metrics(state: Arc<RouterState>, uri: &http::Uri) -> Response<Body> {
-    let window = query_get(uri, "window").unwrap_or("minute");
+    let window = query_get(uri, "window").unwrap_or("1min");
     let win = MetricsWindow::from_str(window);
     let buckets = state.metrics_snapshot(win);
     json_ok(&serde_json::json!({
