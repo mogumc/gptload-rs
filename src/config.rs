@@ -75,6 +75,10 @@ pub struct ServerConfig {
     /// Maximum time a queued request waits for capacity.
     #[serde(default = "default_queue_timeout_ms")]
     pub queue_timeout_ms: u64,
+
+    /// Auto-delete request logs older than this many days. 0 = disabled, default 7.
+    #[serde(default = "default_request_log_retention_days")]
+    pub request_log_retention_days: u64,
 }
 
 impl Default for ServerConfig {
@@ -85,6 +89,7 @@ impl Default for ServerConfig {
             queue_enabled: false,
             queue_max_depth: default_queue_max_depth(),
             queue_timeout_ms: default_queue_timeout_ms(),
+            request_log_retention_days: default_request_log_retention_days(),
         }
     }
 }
@@ -103,6 +108,10 @@ fn default_queue_max_depth() -> usize {
 
 fn default_queue_timeout_ms() -> u64 {
     10_000
+}
+
+fn default_request_log_retention_days() -> u64 {
+    7
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

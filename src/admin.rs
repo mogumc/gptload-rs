@@ -945,6 +945,10 @@ struct StatsSnapshot {
     latency_max_ms: f64,
     latency_count: u64,
 
+    prompt_tokens_total: u64,
+    completion_tokens_total: u64,
+    tokens_total: u64,
+
     upstreams: Vec<UpstreamInfo>,
 }
 
@@ -1035,6 +1039,18 @@ fn build_snapshot(state: &RouterState) -> StatsSnapshot {
         latency_avg_ms,
         latency_max_ms,
         latency_count,
+        prompt_tokens_total: state
+            .stats
+            .prompt_tokens_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        completion_tokens_total: state
+            .stats
+            .completion_tokens_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        tokens_total: state
+            .stats
+            .tokens_total
+            .load(std::sync::atomic::Ordering::Relaxed),
         upstreams: ups,
     }
 }
@@ -1311,13 +1327,14 @@ async fn stats_stream(state: Arc<RouterState>) -> Response<Body> {
         loop {
             let snap = build_snapshot(&state2);
             let total = snap.requests_total;
-            let rps = total.saturating_sub(last_total);
+            let raw = total.saturating_sub(last_total); // requests since last tick (1s)
             last_total = total;
+            let rpm = raw.saturating_mul(60); // extrapolate to per-minute
 
             let mut v = serde_json::to_value(&snap)
                 .unwrap_or(serde_json::json!({"error":"snapshot_failed"}));
             if let serde_json::Value::Object(ref mut m) = v {
-                m.insert("rps".into(), serde_json::json!(rps));
+                m.insert("rpm".into(), serde_json::json!(rpm));
             }
             let s = match serde_json::to_string(&v) {
                 Ok(s) => s,

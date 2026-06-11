@@ -192,6 +192,10 @@ pub struct Stats {
     pub errors_timeout: AtomicU64,
     pub errors_network: AtomicU64,
 
+    pub prompt_tokens_total: AtomicU64,
+    pub completion_tokens_total: AtomicU64,
+    pub tokens_total: AtomicU64,
+
     pub queue_depth: AtomicU64,
     pub queue_timeout_total: AtomicU64,
 
@@ -238,6 +242,9 @@ impl Stats {
             responses_5xx: AtomicU64::new(0),
             errors_timeout: AtomicU64::new(0),
             errors_network: AtomicU64::new(0),
+            prompt_tokens_total: AtomicU64::new(0),
+            completion_tokens_total: AtomicU64::new(0),
+            tokens_total: AtomicU64::new(0),
             queue_depth: AtomicU64::new(0),
             queue_timeout_total: AtomicU64::new(0),
             latency_ns_total: AtomicU64::new(0),
@@ -503,8 +510,11 @@ impl RouterState {
         let model_routes_path = data_dir.join("models_routes.json");
         let upstreams_path = data_dir.join("upstreams.json");
         let requests_log_path = data_dir.join("requests.jsonl");
-        let log_tx = start_request_log_writer(requests_log_path);
+        let log_tx = start_request_log_writer(requests_log_path.clone());
         let requests = Arc::new(RequestsLog::new(5000, log_tx));
+
+        let retention_days = runtime.server.request_log_retention_days;
+        spawn_request_log_cleanup(requests_log_path, retention_days);
 
         let mut upstream_configs: Vec<UpstreamConfig> = Vec::new();
         if let Ok(list) = load_upstreams_override(&upstreams_path) {
@@ -2029,6 +2039,86 @@ fn start_request_log_writer(path: PathBuf) -> Option<mpsc::Sender<RequestLogEntr
     });
 
     Some(tx)
+}
+
+/// Clean old request log entries from the JSONL file.
+/// Returns (entries_kept, entries_removed).
+async fn cleanup_request_log(path: &Path, retention_days: u64) -> (usize, usize) {
+    if retention_days == 0 {
+        return (0, 0);
+    }
+    let cutoff_ms = now_ms().saturating_sub(retention_days * 86_400_000);
+
+    let content = match tokio::fs::read_to_string(path).await {
+        Ok(c) => c,
+        Err(_) => return (0, 0), // file doesn't exist or can't be read
+    };
+
+    let mut kept = 0usize;
+    let mut removed = 0usize;
+    let mut new_content = String::with_capacity(content.len());
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Parse just the timestamp to decide keep/remove
+        let ts_line = line.to_string();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(ts) = v.get("ts_ms").and_then(|t| t.as_u64()) {
+                if ts < cutoff_ms {
+                    removed += 1;
+                    continue;
+                }
+            }
+        }
+        new_content.push_str(&ts_line);
+        new_content.push('\n');
+        kept += 1;
+    }
+
+    if removed > 0 {
+        if let Err(e) = tokio::fs::write(path, &new_content).await {
+            tracing::warn!(path = %path.display(), error = %e, "request log cleanup write failed");
+            return (0, 0);
+        }
+    }
+
+    (kept, removed)
+}
+
+/// Spawn a task that periodically cleans old request log entries.
+/// Runs immediately at startup, then every 24 hours.
+pub fn spawn_request_log_cleanup(path: PathBuf, retention_days: u64) {
+    if retention_days == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        // Run immediately.
+        let (kept, removed) = cleanup_request_log(&path, retention_days).await;
+        tracing::info!(
+            path = %path.display(),
+            kept,
+            removed,
+            retention_days,
+            "request log cleanup: {kept} kept, {removed} removed (>{retention_days}d)"
+        );
+
+        // Then every 24 hours.
+        let mut interval = tokio::time::interval(Duration::from_secs(86_400));
+        loop {
+            interval.tick().await;
+            let (kept, removed) = cleanup_request_log(&path, retention_days).await;
+            tracing::info!(
+                path = %path.display(),
+                kept,
+                removed,
+                retention_days,
+                "request log cleanup: {kept} kept, {removed} removed (>{retention_days}d)"
+            );
+        }
+    });
 }
 
 #[inline]
