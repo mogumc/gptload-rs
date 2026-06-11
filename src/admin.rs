@@ -822,9 +822,8 @@ fn build_upstream_info(u: &crate::state::Upstream, global_max: u32) -> UpstreamI
     let cooldown = keys_arc
         .iter()
         .filter(|k| {
-            k.is_active()
-                && k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed) > 0
-                && now < k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed)
+            let until = k.cooldown_until_ms.load(std::sync::atomic::Ordering::Relaxed);
+            k.is_active() && until > 0 && now < until
         })
         .count();
     let effective_max = if u.max_concurrent_per_key > 0 {
@@ -1731,9 +1730,10 @@ fn scoped_key_set(body: &KeyStatusBody) -> Result<KeyStatusScope, String> {
     for k in keys {
         let k = k.trim();
         if !k.is_empty() {
-            if crate::util::validate_key_chars(k).is_ok() {
-                set.insert(k.to_string());
+            if let Err(e) = crate::util::validate_key_chars(k) {
+                return Err(e);
             }
+            set.insert(k.to_string());
         }
     }
     if set.is_empty() {
@@ -1945,12 +1945,17 @@ async fn parse_keys_body(req: Request<Body>) -> Result<(Vec<String>, bool), Stri
     if content_type.starts_with("application/json") {
         let v: JsonKeysBody =
             serde_json::from_slice(&body_bytes).map_err(|e| format!("invalid json: {e}"))?;
-        let keys: Vec<String> = v.keys.into_iter().filter_map(|k| {
+        let mut keys: Vec<String> = Vec::with_capacity(v.keys.len());
+        for k in v.keys {
             let k = k.trim().to_string();
-            if k.is_empty() { return None; }
-            if let Err(_) = crate::util::validate_key_chars(&k) { return None; }
-            Some(k)
-        }).collect();
+            if k.is_empty() {
+                continue;
+            }
+            if let Err(e) = crate::util::validate_key_chars(&k) {
+                return Err(e);
+            }
+            keys.push(k);
+        }
         Ok((keys, v.dedupe.unwrap_or(true)))
     } else {
         // Treat as plain text.
@@ -1958,9 +1963,13 @@ async fn parse_keys_body(req: Request<Body>) -> Result<(Vec<String>, bool), Stri
         let mut keys: Vec<String> = Vec::new();
         for line in s.lines() {
             let k = line.trim();
-            if !k.is_empty() && crate::util::validate_key_chars(k).is_ok() {
-                keys.push(k.to_string());
+            if k.is_empty() {
+                continue;
             }
+            if let Err(e) = crate::util::validate_key_chars(k) {
+                return Err(e);
+            }
+            keys.push(k.to_string());
         }
         Ok((keys, true))
     }

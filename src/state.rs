@@ -2063,8 +2063,7 @@ async fn cleanup_request_log(path: &Path, retention_days: u64) -> (usize, usize)
         if line.is_empty() {
             continue;
         }
-        // Parse just the timestamp to decide keep/remove
-        let ts_line = line.to_string();
+        // Parse timestamp to decide keep/remove, then clone only if kept.
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
             if let Some(ts) = v.get("ts_ms").and_then(|t| t.as_u64()) {
                 if ts < cutoff_ms {
@@ -2073,7 +2072,7 @@ async fn cleanup_request_log(path: &Path, retention_days: u64) -> (usize, usize)
                 }
             }
         }
-        new_content.push_str(&ts_line);
+        new_content.push_str(line);
         new_content.push('\n');
         kept += 1;
     }
