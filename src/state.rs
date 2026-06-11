@@ -281,6 +281,7 @@ pub struct RequestLogEntry {
     pub request_headers: Option<BTreeMap<String, String>>,
     pub request_body: Option<String>,
     pub timing: RequestTiming,
+    pub is_stream: Option<bool>,
 }
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]

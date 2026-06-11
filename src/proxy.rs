@@ -616,6 +616,7 @@ async fn forward(
         request_body,
         0,
     );
+    log_ctx.is_stream = Some(stream_request);
 
     let Some(mut model) = model else {
         return logged_json_error(
@@ -873,6 +874,7 @@ struct RequestLogContext {
     request_headers: Option<std::collections::BTreeMap<String, String>>,
     request_body: Option<String>,
     queue_ms: u64,
+    is_stream: Option<bool>,
 }
 
 impl RequestLogContext {
@@ -901,6 +903,7 @@ impl RequestLogContext {
             request_headers,
             request_body,
             queue_ms,
+            is_stream: None, // set later when parsing req body
         }
     }
 }
@@ -949,6 +952,7 @@ fn record_request(
             total_ms,
             attempts: 0,
         },
+        is_stream: ctx.is_stream,
     };
     state.record_request(entry);
 }
@@ -1379,6 +1383,14 @@ fn parse_sse_usage(buf: &mut String, chunk: &[u8]) -> Option<UsageTokens> {
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
             if let Some(u) = extract_usage_from_value(&v) {
+                tracing::debug!(
+                    prompt = u.prompt,
+                    completion = u.completion,
+                    thought = u.thought,
+                    total = u.total,
+                    raw_usage = %v.get("usage").map(|u| u.to_string()).unwrap_or_default(),
+                    "sse usage found"
+                );
                 found = Some(u);
             }
         }
