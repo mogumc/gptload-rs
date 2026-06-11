@@ -44,7 +44,7 @@ fn main() -> anyhow::Result<()> {
     let cfg = config::Config::load(&config_path)?;
 
     // Init tracing subscriber with optional OTLP layer.
-    init_tracing(&cfg)?;
+    init_tracing()?;
 
     let worker_threads = cfg.worker_threads.unwrap_or_else(num_cpus::get);
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -194,7 +194,7 @@ async fn wait_shutdown_signal() {
     }
 }
 
-fn init_tracing(cfg: &config::Config) -> anyhow::Result<()> {
+fn init_tracing() -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let fmt_layer = tracing_subscriber::fmt::layer()
@@ -202,47 +202,9 @@ fn init_tracing(cfg: &config::Config) -> anyhow::Result<()> {
         .with_level(true)
         .with_filter(filter);
 
-    if let Some(endpoint) = &cfg.telemetry.otlp_endpoint {
-        use opentelemetry::KeyValue;
-        use opentelemetry_otlp::WithExportConfig;
-        use opentelemetry_sdk::Resource;
-        use tracing_opentelemetry::OpenTelemetryLayer;
-        use tracing_subscriber::filter::LevelFilter;
-
-        let exporter = opentelemetry_otlp::new_exporter()
-            .http()
-            .with_endpoint(endpoint);
-
-        let tracer = opentelemetry_otlp::new_pipeline()
-            .tracing()
-            .with_exporter(exporter)
-            .with_trace_config(
-                opentelemetry_sdk::trace::config()
-                    .with_resource(Resource::new(vec![KeyValue::new(
-                        "service.name",
-                        cfg.telemetry.service_name.clone(),
-                    )])),
-            )
-            .install_batch(opentelemetry_sdk::runtime::Tokio)?;
-
-        let otel_layer = OpenTelemetryLayer::new(tracer)
-            .with_filter(LevelFilter::INFO);
-
-        tracing_subscriber::registry()
-            .with(fmt_layer)
-            .with(otel_layer)
-            .init();
-
-        tracing::info!(
-            endpoint = %endpoint,
-            service = %cfg.telemetry.service_name,
-            "OpenTelemetry tracing enabled"
-        );
-    } else {
-        tracing_subscriber::registry()
-            .with(fmt_layer)
-            .init();
-    }
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .init();
 
     Ok(())
 }

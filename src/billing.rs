@@ -190,25 +190,33 @@ impl BillingStore {
         self.adjust_balance(key, 1)
     }
 
-    pub fn settle_reserved_usage(&self, key: &str, total_tokens: u64) -> Option<i64> {
+    /// Settle reserved usage with model-aware credit calculation.
+    /// Cost = ceil((prompt_tokens × input_rate + completion_tokens × output_rate) / 1000).
+    /// Minimum cost is 1 credit.
+    pub fn settle_reserved_usage(
+        &self,
+        key: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        model: &str,
+        model_costs: &ahash::AHashMap<String, crate::config::ModelCost>,
+    ) -> Option<i64> {
         let map = self.balances.read().ok()?;
         let balance = map.get(key)?.clone();
         drop(map);
 
-        let delta = i64::try_from(total_tokens).ok()?;
-        let adjustment = 1i64.saturating_sub(delta);
-        if adjustment == 0 {
-            return Some(balance.load(Ordering::Relaxed));
-        }
+        let cost = compute_credit_cost(prompt_tokens, completion_tokens, model, model_costs);
 
         let mut cur = balance.load(Ordering::Relaxed);
+        // -1 means unlimited, no adjustment
+        if cur == -1 {
+            return Some(-1);
+        }
+        // Cost is positive (credits to deduct); reserve already deducted 1.
+        // Net adjustment = 1 - cost (1 was reserved, now settle for cost)
+        let adjustment = 1i64.saturating_sub(cost);
         loop {
-            // -1 means unlimited, no adjustment needed (concurrent promotion)
-            if cur == -1 {
-                return Some(-1);
-            }
             let new_balance = cur.saturating_add(adjustment);
-            // Clamp to 0 to prevent going into debt
             let clamped = if new_balance < 0 { 0 } else { new_balance };
             match balance.compare_exchange(cur, clamped, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => {
@@ -243,4 +251,22 @@ fn flush_pending(tree: &sled::Tree, pending: &mut AHashMap<String, i64>) {
         let _ = tree.insert(key.as_bytes(), &encoded);
     }
     let _ = tree.flush();
+}
+
+/// Compute credit cost: ceil((prompt × input_rate + completion × output_rate) / 1000).
+/// Unknown models use default rates (input=0, output=1.0).
+/// Minimum 1 credit.
+fn compute_credit_cost(
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    model: &str,
+    model_costs: &ahash::AHashMap<String, crate::config::ModelCost>,
+) -> i64 {
+    let rate = model_costs.get(model);
+    let input_rate = rate.map(|r| r.input).unwrap_or(0.0);
+    let output_rate = rate.map(|r| r.output).unwrap_or(1.0);
+
+    let raw = (prompt_tokens as f64 * input_rate + completion_tokens as f64 * output_rate) / 1000.0;
+    let cost = raw.ceil() as i64;
+    cost.max(1)
 }

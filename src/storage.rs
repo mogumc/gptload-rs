@@ -34,6 +34,43 @@ impl KeyStore {
         Ok(self.db.open_tree("billing")?)
     }
 
+    pub fn open_key_levels_tree(&self) -> anyhow::Result<sled::Tree> {
+        Ok(self.db.open_tree("key_levels")?)
+    }
+
+    /// Get the permission level for a key. Default 0 if not set.
+    pub fn get_key_level(&self, key: &str) -> i32 {
+        let tree = match self.open_key_levels_tree() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("key_levels tree open failed, defaulting level to 0: {e}");
+                return 0;
+            }
+        };
+        tree.get(key.as_bytes())
+            .ok()
+            .flatten()
+            .and_then(|v| {
+                if v.len() == 4 {
+                    let mut arr = [0u8; 4];
+                    arr.copy_from_slice(&v);
+                    Some(i32::from_le_bytes(arr))
+                } else {
+                    tracing::warn!("key_levels corrupt entry for key '{}', defaulting to 0", key);
+                    None
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    /// Set the permission level for a key.
+    pub fn set_key_level(&self, key: &str, level: i32) -> anyhow::Result<()> {
+        let tree = self.open_key_levels_tree()?;
+        tree.insert(key.as_bytes(), &level.to_le_bytes())?;
+        tree.flush()?;
+        Ok(())
+    }
+
     pub fn count_keys(&self, upstream_id: &str) -> anyhow::Result<usize> {
         let t = self.open_upstream_tree(upstream_id)?;
         Ok(t.len())

@@ -16,7 +16,7 @@ use hyper_rustls::HttpsConnectorBuilder;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -69,6 +69,7 @@ pub struct RuntimeConfig {
     pub admin_tokens: Arc<AHashSet<String>>,
     pub export_token: Option<String>,
     pub usage_inject_upstreams: Option<Arc<AHashSet<String>>>,
+    pub model_costs: ahash::AHashMap<String, crate::config::ModelCost>,
     pub server: ServerConfig,
     pub preview: serde_json::Value,
 }
@@ -136,6 +137,7 @@ pub struct Upstream {
 
     pub weight: usize,
     pub max_concurrent_per_key: u32,
+    pub min_key_level: i32,
     pub format: UpstreamFormat,
     pub proxy: Option<String>,
     pub client: UpstreamClient,
@@ -145,6 +147,10 @@ pub struct Upstream {
     pub keys_update_lock: Mutex<()>,
     pub key_rr: AtomicUsize,
     pub models: ArcSwap<AHashSet<String>>,
+    /// Incoming model name → upstream model name.
+    pub model_map: ahash::AHashMap<String, String>,
+    /// Reverse: upstream model name → incoming model name (for /v1/models listing).
+    pub model_rmap: ahash::AHashMap<String, String>,
 
     pub stats: UpstreamStats,
 }
@@ -159,6 +165,8 @@ pub struct KeyState {
     pub failure_count: AtomicU32,
     pub status: AtomicU8,
     pub active_requests: AtomicU32,
+    /// Permission level: higher = more access. -1 = admin (no restriction).
+    pub level: AtomicI32,
     /// Unix ms timestamp when the 429 cooldown expires. 0 = not in cooldown.
     pub cooldown_until_ms: AtomicU64,
     pub latencies_ms: Mutex<VecDeque<u64>>,
@@ -463,6 +471,8 @@ impl RuntimeConfig {
             }
         });
 
+        let model_costs = ahash::AHashMap::new();
+
         Self {
             request_timeout: Duration::from_millis(cfg.request_timeout_ms),
             max_retries: cfg.max_retries.unwrap_or(5),
@@ -472,6 +482,7 @@ impl RuntimeConfig {
             admin_tokens: Arc::new(admin_set),
             export_token: cfg.export_token.clone(),
             usage_inject_upstreams,
+            model_costs,
             server: cfg.server.clone(),
             preview: config_preview(cfg),
         }
@@ -499,7 +510,7 @@ impl RouterState {
         let log_tx = start_request_log_writer(requests_log_path);
         let requests = Arc::new(RequestsLog::new(5000, log_tx));
 
-        let mut upstream_configs = cfg.upstreams.clone();
+        let mut upstream_configs: Vec<UpstreamConfig> = Vec::new();
         if let Ok(list) = load_upstreams_override(&upstreams_path) {
             upstream_configs = list;
         } else if upstreams_path.exists() {
@@ -701,7 +712,7 @@ impl RouterState {
             let u_idx = snap.schedule[rr % sched_len];
             let u = &snap.upstreams[u_idx];
 
-            if !u.models.load().contains(model) {
+            if !u.models.load().contains(model) && !u.model_map.contains_key(model) {
                 continue;
             }
 
@@ -713,6 +724,11 @@ impl RouterState {
             };
 
             if let Some(k) = u.select_key(max) {
+                // Key level check: -1 = admin (pass always); otherwise need level >= upstream min.
+                let key_level = k.level.load(Ordering::Relaxed);
+                if key_level != -1 && key_level < u.min_key_level {
+                    continue;
+                }
                 self.stats
                     .upstream_selected_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -731,7 +747,7 @@ impl RouterState {
         let snap = self.snapshot.load_full();
         snap.upstreams
             .iter()
-            .any(|u| u.models.load().contains(model))
+            .any(|u| u.models.load().contains(model) || u.model_map.contains_key(model))
     }
 
     pub fn any_models_loaded(&self) -> bool {
@@ -1269,6 +1285,13 @@ fn parse_upstream(u: UpstreamConfig, weight: usize) -> anyhow::Result<Arc<Upstre
         base_path
     };
 
+    let mut model_map = ahash::AHashMap::new();
+    let mut model_rmap = ahash::AHashMap::new();
+    for (k, v) in u.model_map.iter() {
+        model_map.insert(k.clone(), v.clone());
+        model_rmap.insert(v.clone(), k.clone());
+    }
+
     let upstream = Upstream {
         id: Arc::<str>::from(u.id),
         base_url: Arc::<str>::from(u.base_url.clone()),
@@ -1277,6 +1300,7 @@ fn parse_upstream(u: UpstreamConfig, weight: usize) -> anyhow::Result<Arc<Upstre
         base_path: Arc::<str>::from(base_path),
         weight,
         max_concurrent_per_key: u.max_concurrent_per_key.unwrap_or(0),
+        min_key_level: u.min_key_level,
         format,
         proxy,
         client,
@@ -1285,13 +1309,15 @@ fn parse_upstream(u: UpstreamConfig, weight: usize) -> anyhow::Result<Arc<Upstre
         keys_update_lock: Mutex::new(()),
         key_rr: AtomicUsize::new(0),
         models: ArcSwap::from_pointee(AHashSet::new()),
+        model_map,
+        model_rmap,
         stats: UpstreamStats::default(),
     };
 
     Ok(Arc::new(upstream))
 }
 
-pub fn build_key_states(keys: Vec<String>) -> anyhow::Result<Arc<Vec<Arc<KeyState>>>> {
+pub fn build_key_states(keys: Vec<String>, store: Option<&crate::storage::KeyStore>) -> anyhow::Result<Arc<Vec<Arc<KeyState>>>> {
     let mut out: Vec<Arc<KeyState>> = Vec::with_capacity(keys.len());
     for k in keys {
         let k = k.trim();
@@ -1301,12 +1327,14 @@ pub fn build_key_states(keys: Vec<String>) -> anyhow::Result<Arc<Vec<Arc<KeyStat
         let key_arc: Arc<str> = Arc::<str>::from(k.to_string());
         let auth_header = hyper::header::HeaderValue::from_str(&format!("Bearer {}", key_arc))
             .map_err(|_| anyhow::anyhow!("invalid key (cannot be used in HTTP header)"))?;
+        let level = store.map(|s| s.get_key_level(k)).unwrap_or(0);
         out.push(Arc::new(KeyState {
             key: key_arc,
             auth_header,
             failure_count: AtomicU32::new(0),
             status: AtomicU8::new(KEY_STATUS_ACTIVE),
             active_requests: AtomicU32::new(0),
+            level: AtomicI32::new(level),
             cooldown_until_ms: AtomicU64::new(0),
             latencies_ms: Mutex::new(VecDeque::with_capacity(256)),
         }));
@@ -1514,7 +1542,7 @@ impl RouterState {
         if key_value.is_empty() {
             anyhow::bail!("key must not be empty");
         }
-        let key = build_key_states(vec![key_value.to_string()])?
+        let key = build_key_states(vec![key_value.to_string()], None)?
             .first()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("invalid key"))?;
@@ -1593,6 +1621,8 @@ impl RouterState {
                 },
                 format: Some(u.format),
                 proxy: u.proxy.clone(),
+                model_map: u.model_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                min_key_level: u.min_key_level,
             })
             .collect()
     }
@@ -1678,9 +1708,6 @@ fn build_snapshot_from_configs(
     store: &KeyStore,
 ) -> anyhow::Result<RouterSnapshot> {
     const MAX_WEIGHT: usize = 100;
-    if configs.is_empty() {
-        anyhow::bail!("no upstreams configured");
-    }
 
     let mut upstreams: Vec<Arc<Upstream>> = Vec::new();
     let mut upstream_index: AHashMap<String, usize> = AHashMap::new();
@@ -1696,7 +1723,7 @@ fn build_snapshot_from_configs(
         upstream_index.insert(u.id.to_string(), idx);
 
         let keys = store.load_all_keys(&u.id)?;
-        let key_states = build_key_states(keys)?;
+        let key_states = build_key_states(keys, Some(store))?;
         // active_keys starts as a copy of all keys (all active by default).
         let active = key_states.iter().cloned().collect::<Vec<_>>();
         u.keys.store(key_states);
@@ -1736,6 +1763,16 @@ fn apply_routes_to_upstreams(
     }
 }
 
+impl RouterState {
+    /// Update model costs at runtime (via admin API).
+    pub fn set_model_costs(&self, costs: ahash::AHashMap<String, crate::config::ModelCost>) {
+        let old = self.runtime.load_full();
+        let mut rt: RuntimeConfig = (*old).clone();
+        rt.model_costs = costs;
+        self.runtime.store(Arc::new(rt));
+    }
+}
+
 #[cfg(unix)]
 impl RouterState {
     pub fn apply_config_reload(&self, cfg: Config) -> anyhow::Result<()> {
@@ -1761,8 +1798,10 @@ impl RouterState {
             );
         }
 
-        let runtime = Arc::new(RuntimeConfig::from_config(&cfg));
         let old = self.runtime.load_full();
+        let mut runtime = RuntimeConfig::from_config(&cfg);
+        runtime.model_costs = old.model_costs.clone(); // preserve admin-set model costs
+        let runtime = Arc::new(runtime);
         if runtime.server.queue_max_depth > old.server.queue_max_depth {
             self.queue_slots
                 .add_permits(runtime.server.queue_max_depth - old.server.queue_max_depth);
@@ -1780,7 +1819,6 @@ impl RouterState {
             .admin_write_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("admin write lock poisoned"))?;
-        self.replace_upstreams(cfg.upstreams)?;
         self.queue_notify.notify_waiters();
         Ok(())
     }

@@ -131,6 +131,8 @@ async fn handle_api(req: Request<Body>, state: Arc<RouterState>) -> Response<Bod
         (&Method::GET, "/admin/api/v1/upstreams") => api_list_upstreams(state).await,
         (&Method::POST, "/admin/api/v1/upstreams") => api_add_upstream(req, state).await,
         (&Method::GET, "/admin/api/v1/stats") => api_stats_snapshot(state).await,
+        (&Method::GET, "/admin/api/v1/model-costs") => api_get_model_costs(state).await,
+        (&Method::POST, "/admin/api/v1/model-costs") => api_set_model_costs(req, state).await,
         (&Method::POST, "/admin/api/v1/reload") => api_reload_all(state).await,
         (&Method::GET, "/admin/api/v1/config") => api_config_preview(state).await,
         (&Method::GET, "/admin/api/v1/models/routes") => api_get_model_routes(state).await,
@@ -496,6 +498,10 @@ struct UpstreamBody {
     max_concurrent_per_key: Option<u32>,
     format: Option<UpstreamFormat>,
     proxy: Option<String>,
+    #[serde(default)]
+    model_map: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    min_key_level: i32,
 }
 
 #[derive(Deserialize)]
@@ -505,6 +511,10 @@ struct UpstreamUpdateBody {
     max_concurrent_per_key: Option<u32>,
     format: Option<UpstreamFormat>,
     proxy: Option<String>,
+    #[serde(default)]
+    model_map: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    min_key_level: i32,
 }
 
 async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
@@ -543,6 +553,8 @@ async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Respon
         max_concurrent_per_key: input.max_concurrent_per_key,
         format: input.format,
         proxy: input.proxy.filter(|p| !p.trim().is_empty()),
+        model_map: input.model_map,
+        min_key_level: input.min_key_level,
     };
     let state2 = state.clone();
     let res = tokio::task::spawn_blocking(move || state2.add_upstream(cfg)).await;
@@ -601,6 +613,8 @@ async fn api_update_upstream(
         max_concurrent_per_key: input.max_concurrent_per_key,
         format: input.format,
         proxy: input.proxy.filter(|p| !p.trim().is_empty()),
+        model_map: input.model_map,
+        min_key_level: input.min_key_level,
     };
     let res = tokio::task::spawn_blocking(move || state2.update_upstream(&id, cfg)).await;
     match res {
@@ -710,6 +724,49 @@ fn build_upstream_info(u: &crate::state::Upstream, global_max: u32) -> UpstreamI
             .errors_network
             .load(std::sync::atomic::Ordering::Relaxed),
     }
+}
+
+async fn api_get_model_costs(state: Arc<RouterState>) -> Response<Body> {
+    let rt = state.runtime.load_full();
+    let costs: std::collections::BTreeMap<&str, &crate::config::ModelCost> = rt
+        .model_costs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v))
+        .collect();
+    json_ok(&serde_json::json!(costs))
+}
+
+async fn api_set_model_costs(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
+    let input: serde_json::Value = match parse_json_body(req).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let obj = match input.as_object() {
+        Some(o) => o,
+        None => {
+            return RouterState::json_error(
+                http::StatusCode::BAD_REQUEST,
+                "expected JSON object of model costs",
+                "bad_request",
+            );
+        }
+    };
+    let mut costs = ahash::AHashMap::new();
+    for (model, v) in obj {
+        let cost: crate::config::ModelCost = match serde_json::from_value(v.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                return RouterState::json_error(
+                    http::StatusCode::BAD_REQUEST,
+                    &format!("invalid cost for model {}: {}", model, e),
+                    "bad_request",
+                );
+            }
+        };
+        costs.insert(model.clone(), cost);
+    }
+    state.set_model_costs(costs);
+    json_ok(&serde_json::json!({"ok": true}))
 }
 
 async fn api_list_upstreams(state: Arc<RouterState>) -> Response<Body> {
@@ -1197,7 +1254,7 @@ async fn api_reload_all(state: Arc<RouterState>) -> Response<Body> {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("key update lock poisoned"))?;
             let keys = store.load_all_keys(&id_clone)?;
-            let ks = build_key_states(keys)?;
+            let ks = build_key_states(keys, None)?;
             let n = ks.len();
             u2.keys.store(ks);
             u2.rebuild_active_keys();
@@ -1282,7 +1339,7 @@ async fn api_add_keys(
         let existed = add_res.existed;
 
         // Build new KeyState arcs only for inserted keys and append to in-memory list.
-        let inserted_states = build_key_states(add_res.inserted_keys)?;
+        let inserted_states = build_key_states(add_res.inserted_keys, Some(&store))?;
         let old = upstream2.keys.load_full();
         let mut merged: Vec<Arc<crate::state::KeyState>> =
             Vec::with_capacity(old.len() + inserted_states.len());
@@ -1371,7 +1428,7 @@ async fn api_replace_keys(
             .lock()
             .map_err(|_| anyhow::anyhow!("key update lock poisoned"))?;
         store.replace_keys(&id, &keys)?;
-        let ks = build_key_states(keys)?;
+        let ks = build_key_states(keys, Some(&store))?;
         let n = ks.len();
         upstream2.keys.store(ks);
         upstream2.rebuild_active_keys();

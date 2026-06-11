@@ -11,8 +11,6 @@ use hyper::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ORIGIN};
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server};
-use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
-use opentelemetry_sdk::propagation::TraceContextPropagator;
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
@@ -22,44 +20,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 static REQUEST_LOG_ID: AtomicU64 = AtomicU64::new(1);
-
-lazy_static::lazy_static! {
-    static ref TRACE_PROPAGATOR: TraceContextPropagator = TraceContextPropagator::new();
-}
-
-// ── W3C TraceContext helpers ──────────────────────────────────────────
-
-struct HeaderExtractor<'a>(&'a hyper::HeaderMap);
-
-impl<'a> Extractor for HeaderExtractor<'a> {
-    fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).and_then(|v| v.to_str().ok())
-    }
-
-    fn keys(&self) -> Vec<&str> {
-        self.0.keys().map(|k| k.as_str()).collect()
-    }
-}
-
-struct HeaderInjector<'a>(&'a mut hyper::HeaderMap);
-
-impl<'a> Injector for HeaderInjector<'a> {
-    fn set(&mut self, key: &str, value: String) {
-        if let (Ok(name), Ok(val)) = (
-            http::HeaderName::from_bytes(key.as_bytes()),
-            http::HeaderValue::from_str(&value),
-        ) {
-            self.0.insert(name, val);
-        }
-    }
-}
-
-fn extract_trace_context(headers: &hyper::HeaderMap) -> opentelemetry::Context {
-    TRACE_PROPAGATOR.extract(&HeaderExtractor(headers))
-}
 
 /// Resolve the real client IP from headers set by reverse proxies (nginx, etc.).
 ///
@@ -90,11 +52,6 @@ fn resolve_client_ip(req: &hyper::HeaderMap, peer: SocketAddr) -> String {
 
     // Fall back to TCP peer address.
     peer.ip().to_string()
-}
-
-fn inject_trace_context(headers: &mut hyper::HeaderMap) {
-    let cx = tracing::Span::current().context();
-    TRACE_PROPAGATOR.inject_context(&cx, &mut HeaderInjector(headers));
 }
 
 // ── Route helpers ─────────────────────────────────────────────────────
@@ -234,7 +191,6 @@ async fn handle_inner(
 ) -> Response<Body> {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
-    let parent_cx = extract_trace_context(req.headers());
     let client_ip = resolve_client_ip(req.headers(), client_addr);
 
     let span = tracing::info_span!(
@@ -243,7 +199,6 @@ async fn handle_inner(
         http.url = %path,
         net.peer.ip = %client_ip,
     );
-    span.set_parent(parent_cx);
 
     async move {
     // Health check.
@@ -661,7 +616,7 @@ async fn forward(
         0,
     );
 
-    let Some(model) = model else {
+    let Some(mut model) = model else {
         return logged_json_error(
             &state,
             &log_ctx,
@@ -693,6 +648,16 @@ async fn forward(
         }
     };
     log_ctx.queue_ms = queue_wait_ms;
+
+    // Apply model mapping: incoming name → upstream internal name.
+    if let Some(mapped) = sel.upstream.model_map.get(&model) {
+        let mapped = mapped.clone();
+        if let Some(ref mut json) = req_json {
+            json["model"] = serde_json::Value::String(mapped.clone());
+        }
+        log_ctx.model = Some(mapped.clone());
+        model = mapped;
+    }
 
     let mut body_bytes = body_bytes;
     let mut injected = false;
@@ -1057,9 +1022,6 @@ fn build_upstream_request(
         }
     }
 
-    // Inject W3C TraceContext for distributed tracing.
-    inject_trace_context(out_req.headers_mut());
-
     Ok(out_req)
 }
 
@@ -1180,7 +1142,11 @@ fn proxy_upstream_response(
 
         if let Some(key) = billing_key.as_deref() {
             if let Some(found) = usage {
-                let _ = state.billing.settle_reserved_usage(key, found.total);
+                let model_costs = &state.runtime.load_full().model_costs;
+                let model = log_ctx.model.as_deref().unwrap_or("");
+                let _ = state.billing.settle_reserved_usage(
+                    key, found.prompt, found.completion, model, model_costs,
+                );
             } else {
                 let _ = state.billing.release_reservation(key);
             }
@@ -1253,8 +1219,24 @@ fn extract_api_key(headers: &hyper::HeaderMap) -> Option<String> {
 
 fn models_list(state: &RouterState) -> (Response<Body>, usize) {
     let routes = state.get_model_routes();
+    let snap = state.snapshot.load_full();
     let mut models: Vec<String> = routes.models.keys().cloned().collect();
     models.sort();
+
+    // Apply reverse model mapping for each model across all upstreams.
+    let mut models: Vec<String> = models
+        .into_iter()
+        .map(|m| {
+            for u in snap.upstreams.iter() {
+                if let Some(user_name) = u.model_rmap.get(&m) {
+                    return user_name.clone();
+                }
+            }
+            m
+        })
+        .collect();
+    models.sort();
+    models.dedup();
 
     let data: Vec<serde_json::Value> = models
         .iter()
