@@ -6,6 +6,11 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Balance unit: 1 credit = 1,000,000 micro-credits (6 decimal places).
+pub const MICRO_PER_CREDIT: i64 = 1_000_000;
+/// Minimum charge: 1 micro-credit.
+const MIN_COST_MICRO: i64 = 1;
+
 pub struct BillingStore {
     balances: Arc<RwLock<AHashMap<String, Arc<AtomicI64>>>>,
     persist_tx: Sender<PersistUpdate>,
@@ -152,12 +157,16 @@ impl BillingStore {
             return ReserveResult::Reserved;
         }
         loop {
-            if cur <= 0 {
+            if cur < MICRO_PER_CREDIT {
                 return ReserveResult::Insufficient;
             }
-            let new_balance = cur.saturating_sub(1);
+            let new_balance = cur.saturating_sub(MICRO_PER_CREDIT);
             match balance.compare_exchange(cur, new_balance, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => {
+                    tracing::debug!(
+                        key, cur, new_balance,
+                        "billing: reserve key={key} {cur} → {new_balance}"
+                    );
                     let _ = self.persist_tx.send(PersistUpdate::Set {
                         key: key.to_string(),
                         balance: new_balance,
@@ -187,7 +196,9 @@ impl BillingStore {
         if self.get_balance(key) == Some(-1) {
             return Some(-1);
         }
-        self.adjust_balance(key, 1)
+        let result = self.adjust_balance(key, MICRO_PER_CREDIT);
+        tracing::debug!(key, ?result, "billing: release key={key}");
+        result
     }
 
     /// Settle reserved usage with model-aware credit calculation.
@@ -212,14 +223,19 @@ impl BillingStore {
         if cur == -1 {
             return Some(-1);
         }
-        // Cost is positive (credits to deduct); reserve already deducted 1.
-        // Net adjustment = 1 - cost (1 was reserved, now settle for cost)
-        let adjustment = 1i64.saturating_sub(cost);
+        // Cost is positive (micro-credits); reserve already deducted MICRO_PER_CREDIT.
+        // Net adjustment = MICRO_PER_CREDIT - cost
+        let adjustment = MICRO_PER_CREDIT.saturating_sub(cost);
         loop {
             let new_balance = cur.saturating_add(adjustment);
             let clamped = if new_balance < 0 { 0 } else { new_balance };
             match balance.compare_exchange(cur, clamped, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => {
+                    tracing::debug!(
+                        key, cur, new_balance, clamped, cost, adjustment,
+                        "billing: settle key={} cost={} cur={} adj={} → {clamped}",
+                        key, cost, cur, adjustment
+                    );
                     let _ = self.persist_tx.send(PersistUpdate::Set {
                         key: key.to_string(),
                         balance: clamped,
@@ -253,9 +269,8 @@ fn flush_pending(tree: &sled::Tree, pending: &mut AHashMap<String, i64>) {
     let _ = tree.flush();
 }
 
-/// Compute credit cost: ceil((prompt × input_rate + completion × output_rate) / 1000).
-/// Unknown models use default rates (input=0, output=1.0).
-/// Minimum 1 credit.
+/// Cost in micro-credits: ceil((prompt×input + completion×output)/1000 × 1_000_000).
+/// Unknown models fall back to input=0, output=1.0. Minimum 1 micro-credit.
 fn compute_credit_cost(
     prompt_tokens: u64,
     completion_tokens: u64,
@@ -267,6 +282,12 @@ fn compute_credit_cost(
     let output_rate = rate.map(|r| r.output).unwrap_or(1.0);
 
     let raw = (prompt_tokens as f64 * input_rate + completion_tokens as f64 * output_rate) / 1000.0;
-    let cost = raw.ceil() as i64;
-    cost.max(1)
+    let cost = (raw * MICRO_PER_CREDIT as f64).ceil() as i64;
+    let final_cost = cost.max(MIN_COST_MICRO);
+    tracing::debug!(
+        model, prompt_tokens, completion_tokens, input_rate, output_rate,
+        raw, cost, final_cost,
+        "billing: micro_credits={final_cost}"
+    );
+    final_cost
 }

@@ -225,7 +225,7 @@ async fn handle_inner(
     }
 
     let start = Instant::now();
-    let base_log_ctx = RequestLogContext::new(
+    let mut base_log_ctx = RequestLogContext::new(
         start,
         client_ip.clone(),
         method.to_string(),
@@ -243,6 +243,7 @@ async fn handle_inner(
         Ok(key) => key,
         Err(resp) => return resp,
     };
+    base_log_ctx.billing_key = Some(billing_key.clone());
 
     // Stats: request start (only /v1 paths).
     if path.starts_with("/v1") {
@@ -650,6 +651,8 @@ async fn forward(
     log_ctx.queue_ms = queue_wait_ms;
 
     // Apply model mapping: incoming name → upstream internal name.
+    // Save original name for cost calculation (map key is user-facing model).
+    let billing_model = model.clone();
     if let Some(mapped) = sel.upstream.model_map.get(&model) {
         let mapped = mapped.clone();
         if let Some(ref mut json) = req_json {
@@ -658,6 +661,7 @@ async fn forward(
         log_ctx.model = Some(mapped.clone());
         model = mapped;
     }
+    log_ctx.billing_model = Some(billing_model);
 
     let mut body_bytes = body_bytes;
     let mut injected = false;
@@ -863,6 +867,8 @@ struct RequestLogContext {
     path: String,
     model: Option<String>,
     upstream_id: Option<String>,
+    billing_model: Option<String>,
+    billing_key: Option<String>,
     req_bytes: usize,
     request_headers: Option<std::collections::BTreeMap<String, String>>,
     request_body: Option<String>,
@@ -889,6 +895,8 @@ impl RequestLogContext {
             path,
             model,
             upstream_id,
+            billing_model: None,
+            billing_key: None,
             req_bytes,
             request_headers,
             request_body,
@@ -901,6 +909,7 @@ impl RequestLogContext {
 struct UsageTokens {
     prompt: u64,
     completion: u64,
+    thought: u64,
     total: u64,
 }
 
@@ -923,12 +932,14 @@ fn record_request(
         path: ctx.path.clone(),
         model: ctx.model.clone(),
         upstream_id: ctx.upstream_id.clone(),
+        billing_key: ctx.billing_key.clone(),
         status,
         latency_ms: total_ms,
         req_bytes: ctx.req_bytes,
         resp_bytes,
         prompt_tokens: usage.map(|u| u.prompt),
         completion_tokens: usage.map(|u| u.completion),
+        thought_tokens: usage.map(|u| u.thought),
         total_tokens: usage.map(|u| u.total),
         request_headers: ctx.request_headers.clone(),
         request_body: ctx.request_body.clone(),
@@ -1143,12 +1154,13 @@ fn proxy_upstream_response(
         if let Some(key) = billing_key.as_deref() {
             if let Some(found) = usage {
                 let model_costs = &state.runtime.load_full().model_costs;
-                let model = log_ctx.model.as_deref().unwrap_or("");
+                let model = log_ctx.billing_model.as_deref().unwrap_or("");
                 let _ = state.billing.settle_reserved_usage(
                     key, found.prompt, found.completion, model, model_costs,
                 );
                 state.stats.prompt_tokens_total.fetch_add(found.prompt, std::sync::atomic::Ordering::Relaxed);
                 state.stats.completion_tokens_total.fetch_add(found.completion, std::sync::atomic::Ordering::Relaxed);
+                state.stats.thought_tokens_total.fetch_add(found.thought, std::sync::atomic::Ordering::Relaxed);
                 state.stats.tokens_total.fetch_add(found.total, std::sync::atomic::Ordering::Relaxed);
             } else {
                 let _ = state.billing.release_reservation(key);
@@ -1324,6 +1336,7 @@ fn extract_usage_from_value(v: &serde_json::Value) -> Option<UsageTokens> {
     let usage = v.get("usage")?;
     let prompt = usage.get("prompt_tokens").and_then(|v| v.as_u64());
     let completion = usage.get("completion_tokens").and_then(|v| v.as_u64());
+    let thought = usage.get("thought_tokens").and_then(|v| v.as_u64());
     let total = usage
         .get("total_tokens")
         .and_then(|v| v.as_u64())
@@ -1339,6 +1352,7 @@ fn extract_usage_from_value(v: &serde_json::Value) -> Option<UsageTokens> {
     Some(UsageTokens {
         prompt: prompt.unwrap_or(0),
         completion: completion.unwrap_or(0),
+        thought: thought.unwrap_or(0),
         total: total.unwrap_or(0),
     })
 }

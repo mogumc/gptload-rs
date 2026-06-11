@@ -233,7 +233,7 @@ async fn api_billing_list_keys(state: Arc<RouterState>) -> Response<Body> {
             let level = state.store.get_key_level(&key);
             serde_json::json!({
                 "key": key,
-                "balance": balance,
+                "balance": if balance == -1 { -1.0_f64 } else { balance as f64 / crate::billing::MICRO_PER_CREDIT as f64 },
                 "level": level
             })
         })
@@ -292,7 +292,7 @@ async fn api_billing_overview(state: Arc<RouterState>) -> Response<Body> {
             "unlimited_keys": unlimited_count,
             "active_keys": total_keys - unlimited_count - zero_or_less,
             "exhausted_keys": zero_or_less,
-            "total_balance": total_balance,
+            "total_balance": total_balance as f64 / crate::billing::MICRO_PER_CREDIT as f64,
         },
         "model_costs": model_costs,
         "upstreams": upstream_summary,
@@ -317,8 +317,9 @@ async fn api_billing_create_key(req: Request<Body>, state: Arc<RouterState>) -> 
     if let Err(e) = crate::util::validate_key_chars(key) {
         return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request");
     }
-    let balance = payload.balance.unwrap_or(0).max(-1);
-    let created = match state.billing.create_key(key.to_string(), balance) {
+    let balance_credits = payload.balance.unwrap_or(0).max(-1);
+    let balance_micro = if balance_credits == -1 { -1 } else { balance_credits.saturating_mul(crate::billing::MICRO_PER_CREDIT) };
+    let created = match state.billing.create_key(key.to_string(), balance_micro) {
         Ok(v) => v,
         Err(e) => {
             return RouterState::json_error(
@@ -337,17 +338,21 @@ async fn api_billing_create_key(req: Request<Body>, state: Arc<RouterState>) -> 
     }
     json_ok(&serde_json::json!({
         "key": key,
-        "balance": balance,
+        "balance": balance_credits,
         "created": true
     }))
 }
 
 async fn api_billing_get_balance(state: Arc<RouterState>, key: &str) -> Response<Body> {
     match state.billing.get_balance(key) {
-        Some(balance) => json_ok(&serde_json::json!({
-            "key": key,
-            "balance": balance
-        })),
+        Some(balance) => {
+            let credits = if balance == -1 { -1.0 } else { balance as f64 / crate::billing::MICRO_PER_CREDIT as f64 };
+            json_ok(&serde_json::json!({
+                "key": key,
+                "balance": credits,
+                "balance_micro": balance,
+            }))
+        }
         None => RouterState::json_error(
             http::StatusCode::NOT_FOUND,
             "key not found",
@@ -459,12 +464,11 @@ async fn api_billing_adjust_balance(
         );
     }
 
-    match state.billing.adjust_balance(key, payload.delta) {
-        Some(balance) => json_ok(&serde_json::json!({
-            "key": key,
-            "delta": payload.delta,
-            "balance": balance
-        })),
+    match state.billing.adjust_balance(key, payload.delta.saturating_mul(crate::billing::MICRO_PER_CREDIT)) {
+        Some(balance) => {
+            let credits = if balance == -1 { -1.0 } else { balance as f64 / crate::billing::MICRO_PER_CREDIT as f64 };
+            json_ok(&serde_json::json!({ "key": key, "delta": payload.delta, "balance": credits }))
+        }
         None => RouterState::json_error(
             http::StatusCode::NOT_FOUND,
             "key not found",
@@ -957,6 +961,7 @@ struct StatsSnapshot {
 
     prompt_tokens_total: u64,
     completion_tokens_total: u64,
+    thought_tokens_total: u64,
     tokens_total: u64,
 
     upstreams: Vec<UpstreamInfo>,
@@ -1056,6 +1061,10 @@ fn build_snapshot(state: &RouterState) -> StatsSnapshot {
         completion_tokens_total: state
             .stats
             .completion_tokens_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        thought_tokens_total: state
+            .stats
+            .thought_tokens_total
             .load(std::sync::atomic::Ordering::Relaxed),
         tokens_total: state
             .stats
