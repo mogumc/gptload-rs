@@ -331,7 +331,14 @@ fn content_to_anthropic_blocks(content: &serde_json::Value) -> serde_json::Value
                 .collect();
             serde_json::Value::Array(out)
         }
-        _ => serde_json::json!([{"type": "text", "text": content_to_text(content)}]),
+        _ => {
+            let text = content_to_text(content);
+            if text.len() > MAX_DECODED_BYTES {
+                tracing::warn!(text_len = text.len(), "anthropic: fallback text content dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+                return serde_json::Value::Array(vec![]);
+            }
+            serde_json::json!([{"type": "text", "text": text}])
+        },
     }
 }
 
@@ -362,6 +369,7 @@ fn openai_part_to_anthropic(part: &serde_json::Value) -> Option<serde_json::Valu
                 }));
             }
         }
+        tracing::warn!(part_type, "anthropic: image_url dropped (data URI parse failed or exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
         return None;
     }
 
@@ -371,6 +379,7 @@ fn openai_part_to_anthropic(part: &serde_json::Value) -> Option<serde_json::Valu
             let data = audio.get("data").and_then(|d| d.as_str()).unwrap_or("");
             let format = audio.get("format").and_then(|f| f.as_str()).unwrap_or("wav");
             if data.len() > MAX_DECODED_BYTES {
+                tracing::warn!(data_len = data.len(), format, "anthropic: input_audio dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
                 return None;
             }
             let mime = format!("audio/{}", format);
@@ -388,6 +397,7 @@ fn openai_part_to_anthropic(part: &serde_json::Value) -> Option<serde_json::Valu
             let file_data = file.get("file_data").and_then(|d| d.as_str()).unwrap_or("");
             let filename = file.get("filename").and_then(|f| f.as_str()).unwrap_or("");
             if file_data.len() > MAX_DECODED_BYTES {
+                tracing::warn!(data_len = file_data.len(), %filename, "anthropic: file dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
                 return None;
             }
             let mime = mime_from_filename(filename);
@@ -400,8 +410,12 @@ fn openai_part_to_anthropic(part: &serde_json::Value) -> Option<serde_json::Valu
     }
 
     // Fallback: plain text (when type field is absent)
-    if !text.is_none() {
-        return Some(serde_json::json!({"type": "text", "text": text.unwrap()}));
+    if let Some(s) = text {
+        if s.len() > MAX_DECODED_BYTES {
+            tracing::warn!(text_len = s.len(), "anthropic: fallback text block dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+            return None;
+        }
+        return Some(serde_json::json!({"type": "text", "text": s}));
     }
 
     None
@@ -415,11 +429,20 @@ fn content_to_gemini_parts(content: &serde_json::Value) -> Vec<serde_json::Value
             .filter_map(|part| openai_part_to_gemini(part))
             .collect(),
         serde_json::Value::String(s) => {
+            if s.len() > MAX_DECODED_BYTES {
+                tracing::warn!(text_len = s.len(), "gemini: text content dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+                return vec![];
+            }
             vec![serde_json::json!({"text": s})]
         }
         _ => {
             let text = content_to_text(content);
-            if text.is_empty() { vec![] } else { vec![serde_json::json!({"text": text})] }
+            if text.is_empty() { return vec![]; }
+            if text.len() > MAX_DECODED_BYTES {
+                tracing::warn!(text_len = text.len(), "gemini: fallback text content dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+                return vec![];
+            }
+            vec![serde_json::json!({"text": text})]
         }
     }
 }
@@ -446,6 +469,7 @@ fn openai_part_to_gemini(part: &serde_json::Value) -> Option<serde_json::Value> 
                 return Some(serde_json::json!({"inlineData": {"mimeType": mime, "data": data}}));
             }
         }
+        tracing::warn!(part_type, "gemini: image_url dropped (data URI parse failed or exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
         return None;
     }
 
@@ -455,6 +479,7 @@ fn openai_part_to_gemini(part: &serde_json::Value) -> Option<serde_json::Value> 
             let data = audio.get("data").and_then(|d| d.as_str()).unwrap_or("");
             let format = audio.get("format").and_then(|f| f.as_str()).unwrap_or("wav");
             if data.len() > MAX_DECODED_BYTES {
+                tracing::warn!(data_len = data.len(), format, "gemini: input_audio dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
                 return None;
             }
             let mime = format!("audio/{}", format);
@@ -469,6 +494,7 @@ fn openai_part_to_gemini(part: &serde_json::Value) -> Option<serde_json::Value> 
             let file_data = file.get("file_data").and_then(|d| d.as_str()).unwrap_or("");
             let filename = file.get("filename").and_then(|f| f.as_str()).unwrap_or("");
             if file_data.len() > MAX_DECODED_BYTES {
+                tracing::warn!(data_len = file_data.len(), %filename, "gemini: file dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
                 return None;
             }
             let mime = mime_from_filename(filename);
