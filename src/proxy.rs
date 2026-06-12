@@ -807,14 +807,49 @@ async fn wait_for_selection(
         if let Some(sel) = state.select_for_model(model, billing_key_level, now_ms()) {
             return Ok((sel, start.elapsed().as_millis() as u64));
         }
-        tokio::select! {
-            _ = &mut timeout => {
-                state.stats.queue_timeout_total.fetch_add(1, Ordering::Relaxed);
-                return Err(queue_rejected_response(server.queue_timeout_ms));
+
+        if let Some(delay) = next_cooldown_delay(state, model) {
+            let cooldown = tokio::time::sleep(delay);
+            tokio::pin!(cooldown);
+            tokio::select! {
+                _ = &mut timeout => {
+                    state.stats.queue_timeout_total.fetch_add(1, Ordering::Relaxed);
+                    return Err(queue_rejected_response(server.queue_timeout_ms));
+                }
+                _ = state.queue_notify.notified() => {}
+                _ = &mut cooldown => {}
             }
-            _ = state.queue_notify.notified() => {}
+        } else {
+            tokio::select! {
+                _ = &mut timeout => {
+                    state.stats.queue_timeout_total.fetch_add(1, Ordering::Relaxed);
+                    return Err(queue_rejected_response(server.queue_timeout_ms));
+                }
+                _ = state.queue_notify.notified() => {}
+            }
         }
     }
+}
+
+fn next_cooldown_delay(state: &RouterState, model: &str) -> Option<std::time::Duration> {
+    let now = now_ms();
+    let snap = state.snapshot.load_full();
+    let mut next_until: Option<u64> = None;
+    for upstream in snap.upstreams.iter() {
+        if !upstream.models.load().contains(model) {
+            continue;
+        }
+        let keys = upstream.active_keys.load_full();
+        for key in keys.iter() {
+            let until = key.cooldown_until_ms.load(Ordering::Relaxed);
+            if until > now {
+                next_until = Some(next_until.map_or(until, |cur| cur.min(until)));
+            }
+        }
+    }
+    next_until.map(|until| {
+        std::time::Duration::from_millis(until.saturating_sub(now).max(1))
+    })
 }
 
 fn queue_rejected_response(queue_timeout_ms: u64) -> Response<Body> {

@@ -187,7 +187,7 @@ impl Service<Uri> for SocksConnector {
                 }
                 None => Socks5Stream::connect(proxy_addr.as_str(), target).await,
             }
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
             Ok(SocksIo { inner: stream })
         })
     }
