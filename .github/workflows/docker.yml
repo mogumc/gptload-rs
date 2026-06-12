@@ -15,9 +15,9 @@ permissions:
   packages: write
 
 env:
-  BINARY_NAME: gptload-rs
+  BINARY_NAME: aequi
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: aequi
 
 jobs:
   build:
