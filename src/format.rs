@@ -497,8 +497,14 @@ fn gemini_json_to_openai(v: &serde_json::Value, model: Option<String>) -> serde_
         .and_then(|u| u.get("thoughtsTokenCount"))
         .and_then(|n| n.as_u64())
         .unwrap_or(0);
+    let total = v
+        .get("usageMetadata")
+        .and_then(|u| u.get("totalTokenCount"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(prompt + completion + thought);
     let mut resp = chat_completion_json("chatcmpl-gemini", &model, content, prompt, completion);
     resp["usage"]["thought_tokens"] = serde_json::json!(thought);
+    resp["usage"]["total_tokens"] = serde_json::json!(total);
     resp
 }
 
@@ -650,6 +656,12 @@ fn gemini_sse_to_openai(v: &serde_json::Value, model: Option<&str>) -> Vec<serde
             .get("thoughtsTokenCount")
             .and_then(|n| n.as_u64())
             .unwrap_or(0);
+        // Use Gemini's native totalTokenCount which includes thoughts.
+        // Fallback to sum if missing.
+        let total = usage
+            .get("totalTokenCount")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(prompt + completion + thought);
         out.push(chat_chunk_json(
             "chatcmpl-gemini",
             model.unwrap_or(""),
@@ -659,7 +671,7 @@ fn gemini_sse_to_openai(v: &serde_json::Value, model: Option<&str>) -> Vec<serde
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,
                 "thought_tokens": thought,
-                "total_tokens": prompt + completion
+                "total_tokens": total
             })),
         ));
     }
