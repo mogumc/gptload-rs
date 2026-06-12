@@ -280,7 +280,7 @@ fn flush_pending(tree: &sled::Tree, pending: &mut AHashMap<String, i64>) {
 }
 
 /// Cost in micro-credits: ceil((prompt×input + completion×output)/1000 × 1_000_000).
-/// Unknown models fall back to input=0, output=1.0. Minimum 1 micro-credit.
+/// Unknown models fall back to input=0.1, output=1.0. Minimum 1 micro-credit.
 pub fn compute_credit_cost(
     prompt_tokens: u64,
     completion_tokens: u64,
@@ -288,7 +288,7 @@ pub fn compute_credit_cost(
     model_costs: &ahash::AHashMap<String, crate::config::ModelCost>,
 ) -> i64 {
     let rate = model_costs.get(model);
-    let input_rate = rate.map(|r| r.input).unwrap_or(0.0);
+    let input_rate = rate.map(|r| r.input).unwrap_or(0.1);
     let output_rate = rate.map(|r| r.output).unwrap_or(1.0);
 
     let raw = (prompt_tokens as f64 * input_rate + completion_tokens as f64 * output_rate) / 1000.0;
