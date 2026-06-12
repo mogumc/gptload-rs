@@ -208,10 +208,9 @@ impl BillingStore {
         result
     }
 
-    /// Settle reserved usage with model-aware credit calculation.
-    /// `RESERVE_MICRO` was deducted on entry; settle the difference.
-    /// If cost > reserve: charge additional, clamped to 0 (no negative balance).
-    /// If cost < reserve: refund the over-deduction.
+    /// Settle reserved usage. 1 µcredit is already pre-deducted.
+    /// If cost > 1: deduct (cost - 1) extra, clamped to 0 (→ 401 on next request).
+    /// If cost <= 1: no-op (the pre-deducted 1 already covers it).
     pub fn settle_reserved_usage(
         &self,
         key: &str,
@@ -226,52 +225,34 @@ impl BillingStore {
 
         let cost = compute_credit_cost(prompt_tokens, completion_tokens, model, model_costs);
 
+        // Cost already covered by pre-deducted 1 µcredit.
+        if cost <= RESERVE_MICRO {
+            return Some(balance.load(Ordering::Relaxed));
+        }
+
+        let extra = cost - RESERVE_MICRO;
         let mut cur = balance.load(Ordering::Relaxed);
-        // -1 means unlimited, no adjustment
+        // -1 means unlimited
         if cur == -1 {
             return Some(-1);
         }
-
-        if cost > RESERVE_MICRO {
-            // Charge the difference (cost - reserve). Clamp to 0.
-            let extra = cost - RESERVE_MICRO;
-            loop {
-                let new_balance = cur.saturating_sub(extra);
-                let clamped = if new_balance < 0 { 0 } else { new_balance };
-                match balance.compare_exchange(cur, clamped, Ordering::Relaxed, Ordering::Relaxed) {
-                    Ok(_) => {
-                        tracing::debug!(
-                            key, cur, clamped, cost, extra,
-                            "billing: settle+charge key={key} cost={cost} extra={extra} {cur} → {clamped}"
-                        );
-                        let _ = self.persist_tx.send(PersistUpdate::Set {
-                            key: key.to_string(),
-                            balance: clamped,
-                        });
-                        return Some(clamped);
-                    }
-                    Err(v) => cur = v,
+        loop {
+            let new_balance = cur.saturating_sub(extra);
+            // Clamp to 0 — next request will get 401 insufficient balance.
+            let clamped = if new_balance < 0 { 0 } else { new_balance };
+            match balance.compare_exchange(cur, clamped, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => {
+                    tracing::debug!(
+                        key, cur, clamped, cost, extra,
+                        "billing: settle key={key} cost={cost} extra={extra} {cur} → {clamped}"
+                    );
+                    let _ = self.persist_tx.send(PersistUpdate::Set {
+                        key: key.to_string(),
+                        balance: clamped,
+                    });
+                    return Some(clamped);
                 }
-            }
-        } else {
-            // Refund the over-deduction (reserve - cost).
-            let refund = RESERVE_MICRO - cost;
-            loop {
-                let new_balance = cur.saturating_add(refund);
-                match balance.compare_exchange(cur, new_balance, Ordering::Relaxed, Ordering::Relaxed) {
-                    Ok(_) => {
-                        tracing::debug!(
-                            key, cur, new_balance, cost, refund,
-                            "billing: settle+refund key={key} cost={cost} refund={refund} {cur} → {new_balance}"
-                        );
-                        let _ = self.persist_tx.send(PersistUpdate::Set {
-                            key: key.to_string(),
-                            balance: new_balance,
-                        });
-                        return Some(new_balance);
-                    }
-                    Err(v) => cur = v,
-                }
+                Err(v) => cur = v,
             }
         }
     }
