@@ -562,7 +562,10 @@ async fn transform_json_response(
     }
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return Response::from_parts(parts, Body::from(body)),
+        Err(e) => {
+            tracing::warn!(error = %e, "upstream JSON parse failed, returning raw body");
+            return Response::from_parts(parts, Body::from(body));
+        }
     };
     let out = f(&value, model);
     Response::from_parts(parts, Body::from(out.to_string()))
@@ -679,7 +682,7 @@ fn gemini_json_to_openai(v: &serde_json::Value, model: Option<String>) -> serde_
         .and_then(|u| u.get("promptTokenCount"))
         .and_then(|n| n.as_u64())
         .unwrap_or(0);
-    let completion = v
+    let candidates = v
         .get("usageMetadata")
         .and_then(|u| u.get("candidatesTokenCount"))
         .and_then(|n| n.as_u64())
@@ -689,11 +692,13 @@ fn gemini_json_to_openai(v: &serde_json::Value, model: Option<String>) -> serde_
         .and_then(|u| u.get("thoughtsTokenCount"))
         .and_then(|n| n.as_u64())
         .unwrap_or(0);
+    // completion_tokens = candidates + thoughts, treating all output as "completion".
+    let completion = candidates.saturating_add(thought);
     let total = v
         .get("usageMetadata")
         .and_then(|u| u.get("totalTokenCount"))
         .and_then(|n| n.as_u64())
-        .unwrap_or(prompt + completion + thought);
+        .unwrap_or(prompt + completion);
     let mut resp = chat_completion_json("chatcmpl-gemini", &model, content, prompt, completion);
     resp["usage"]["thought_tokens"] = serde_json::json!(thought);
     resp["usage"]["total_tokens"] = serde_json::json!(total);
@@ -976,5 +981,153 @@ mod tests {
             .starts_with("/v1beta/models/gemini-1.5-pro:generateContent?key="));
         let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
         assert_eq!(v["contents"][0]["role"], "user");
+    }
+
+    /// Round-trip: Gemini JSON → OpenAI format → serialize → parse → verify usage fields.
+    #[test]
+    fn gemini_json_to_openai_produces_correct_usage() {
+        let gemini_resp = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "Hello from Gemini"}],
+                    "role": "model"
+                },
+                "finishReason": "STOP",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 15,
+                "candidatesTokenCount": 25,
+                "thoughtsTokenCount": 5,
+                "totalTokenCount": 45
+            },
+            "modelVersion": "gemini-2.0-flash"
+        });
+
+        let converted = gemini_json_to_openai(&gemini_resp, Some("gemini-2.0-flash".to_string()));
+
+        assert_eq!(converted["usage"]["prompt_tokens"], 15);
+        assert_eq!(converted["usage"]["completion_tokens"], 30); // 25 + 5 thoughts
+        assert_eq!(converted["usage"]["thought_tokens"], 5);
+        assert_eq!(converted["usage"]["total_tokens"], 45);
+
+        // Serialize → parse back (simulates HTTP body round-trip)
+        let serialized = converted.to_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("should parse serialized JSON");
+
+        assert_eq!(parsed["usage"]["prompt_tokens"], 15);
+        assert_eq!(parsed["usage"]["completion_tokens"], 30);
+        assert_eq!(parsed["usage"]["thought_tokens"], 5);
+        assert_eq!(parsed["usage"]["total_tokens"], 45);
+    }
+
+    /// Round-trip: Anthropic JSON → OpenAI format → serialize → parse → verify usage fields.
+    #[test]
+    fn anthropic_json_to_openai_produces_correct_usage() {
+        let anthropic_resp = serde_json::json!({
+            "id": "msg_xxx",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-20250514",
+            "content": [{"type": "text", "text": "Hello from Claude"}],
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 34
+            }
+        });
+
+        let converted =
+            anthropic_json_to_openai(&anthropic_resp, Some("claude-sonnet-4-20250514".to_string()));
+
+        assert_eq!(converted["usage"]["prompt_tokens"], 12);
+        assert_eq!(converted["usage"]["completion_tokens"], 34);
+        assert_eq!(converted["usage"]["total_tokens"], 46);
+
+        let serialized = converted.to_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("should parse serialized JSON");
+
+        assert_eq!(parsed["usage"]["prompt_tokens"], 12);
+        assert_eq!(parsed["usage"]["completion_tokens"], 34);
+        assert_eq!(parsed["usage"]["total_tokens"], 46);
+    }
+
+    /// Edge case: Gemini safety-blocked response still has usage metadata.
+    #[test]
+    fn gemini_safety_blocked_still_produces_usage() {
+        let gemini_resp = serde_json::json!({
+            "candidates": [{
+                "finishReason": "SAFETY",
+                "safetyRatings": [{"category": "HARM_CATEGORY_HARASSMENT", "probability": "HIGH"}]
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 8,
+                "totalTokenCount": 8
+            },
+            "modelVersion": "gemini-2.0-flash"
+        });
+
+        let converted = gemini_json_to_openai(&gemini_resp, Some("gemini-2.0-flash".to_string()));
+
+        let serialized = converted.to_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("should parse");
+
+        assert_eq!(parsed["usage"]["prompt_tokens"], 8);
+        assert_eq!(parsed["usage"]["completion_tokens"], 0); // no candidatesTokenCount
+        assert_eq!(parsed["usage"]["total_tokens"], 8);
+    }
+
+    /// Edge case: Anthropic response with 0 tokens.
+    #[test]
+    fn anthropic_zero_tokens_produces_correct_usage() {
+        let anthropic_resp = serde_json::json!({
+            "id": "msg_xxx",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-20250514",
+            "content": [{"type": "text", "text": ""}],
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0
+            }
+        });
+
+        let converted =
+            anthropic_json_to_openai(&anthropic_resp, Some("claude-sonnet-4-20250514".to_string()));
+
+        let serialized = converted.to_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("should parse");
+
+        assert_eq!(parsed["usage"]["prompt_tokens"], 0);
+        assert_eq!(parsed["usage"]["completion_tokens"], 0);
+        assert_eq!(parsed["usage"]["total_tokens"], 0);
+    }
+
+    /// Edge case: Gemini response without usageMetadata at all.
+    #[test]
+    fn gemini_response_without_usage_metadata() {
+        let gemini_resp = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "Hello"}],
+                    "role": "model"
+                },
+                "finishReason": "STOP"
+            }]
+            // no usageMetadata
+        });
+
+        let converted = gemini_json_to_openai(&gemini_resp, Some("gemini-2.0-flash".to_string()));
+
+        let serialized = converted.to_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("should parse");
+
+        assert_eq!(parsed["usage"]["prompt_tokens"], 0);
+        assert_eq!(parsed["usage"]["completion_tokens"], 0);
+        assert_eq!(parsed["usage"]["total_tokens"], 0);
     }
 }

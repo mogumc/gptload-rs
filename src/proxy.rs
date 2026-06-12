@@ -7,7 +7,7 @@ use crate::state::{
 };
 use crate::util::now_ms;
 use flate2::{Decompress, FlushDecompress, Status};
-use hyper::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ORIGIN};
+use hyper::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ORIGIN};
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server};
@@ -1010,6 +1010,11 @@ fn build_upstream_request(
     })?;
 
     sanitize_hop_headers(out_req.headers_mut());
+    // Strip compression headers so upstream (especially Cloudflare) does not
+    // compress the response. gptload-rs reads the full body to extract token
+    // usage; decompressing gzip/brotli adds complexity and is unnecessary for
+    // API proxy traffic where response bodies are small.
+    out_req.headers_mut().remove(ACCEPT_ENCODING);
     out_req.headers_mut().remove(HDR_AUTHORIZATION);
     out_req.headers_mut().remove("x-api-key");
     out_req.headers_mut().remove("anthropic-version");
@@ -1133,8 +1138,8 @@ async fn proxy_upstream_response(
         }
 
         if let Some(key) = billing_key.as_deref() {
-            let is_chat = log_ctx.path.starts_with("/v1/chat/completions")
-                || log_ctx.path.starts_with("/v1/completions");
+            let is_billable = log_ctx.path.starts_with("/v1/")
+                && !log_ctx.path.starts_with("/v1/models");
             let is_2xx = status.is_success();
             if let Some(found) = usage {
                 let model_costs = &state.runtime.load_full().model_costs;
@@ -1148,7 +1153,7 @@ async fn proxy_upstream_response(
                 state.stats.thought_tokens_total.fetch_add(found.thought, std::sync::atomic::Ordering::Relaxed);
                 state.stats.tokens_total.fetch_add(found.total, std::sync::atomic::Ordering::Relaxed);
                 let _ = state.store.add_key_usage(key, found.total, cost);
-            } else if !is_chat || !is_2xx {
+            } else if !is_billable || !is_2xx {
                 let _ = state.billing.release_reservation(key);
             }
         }
@@ -1202,18 +1207,49 @@ async fn read_and_bill_body(
 
     let resp_bytes = out_bytes.len();
 
-    let is_chat = log_ctx.path.starts_with("/v1/chat/completions")
-        || log_ctx.path.starts_with("/v1/completions");
+    let is_billable = log_ctx.path.starts_with("/v1/")
+        && !log_ctx.path.starts_with("/v1/models");
     let is_2xx = status.is_success();
 
-    // Only parse usage for /v1/chat/completions 2xx with JSON body.
-    let usage = if is_chat && is_2xx && !overflow && content_type.starts_with("application/json") {
+    // Parse usage for all billable /v1/ paths (chat, images, embeddings, etc.)
+    // with JSON 2xx body. Excludes /v1/models (model listing).
+    let usage = if is_billable && is_2xx && !overflow && content_type.starts_with("application/json") {
         if !out_bytes.is_empty() {
-            usage_from_json_bytes(&out_bytes)
+            match usage_from_json_bytes(&out_bytes) {
+                Some(u) => {
+                    tracing::debug!(
+                        prompt = u.prompt,
+                        completion = u.completion,
+                        thought = u.thought,
+                        total = u.total,
+                        "non-streaming usage extracted"
+                    );
+                    Some(u)
+                }
+                None => {
+                    tracing::warn!(
+                        path = %log_ctx.path,
+                        model = %log_ctx.model.as_deref().unwrap_or(""),
+                        content_type = %content_type,
+                        body_len = out_bytes.len(),
+                        body_preview = %String::from_utf8_lossy(&out_bytes[..out_bytes.len().min(256)]),
+                        "non-streaming usage NOT found in JSON body — upstream may not return usage in non-streaming mode"
+                    );
+                    None
+                }
+            }
         } else {
             None
         }
     } else {
+        if is_billable && is_2xx && !overflow {
+            tracing::debug!(
+                path = %log_ctx.path,
+                content_type = %content_type,
+                content_encoding = %content_encoding,
+                "skipping usage parse: content_type not application/json"
+            );
+        }
         None
     };
 
@@ -1230,10 +1266,10 @@ async fn read_and_bill_body(
             state.stats.thought_tokens_total.fetch_add(found.thought, std::sync::atomic::Ordering::Relaxed);
             state.stats.tokens_total.fetch_add(found.total, std::sync::atomic::Ordering::Relaxed);
             let _ = state.store.add_key_usage(key, found.total, cost);
-        } else if !is_chat || !is_2xx {
+        } else if !is_billable || !is_2xx {
             let _ = state.billing.release_reservation(key);
         }
-        // else: is_chat && is_2xx && usage=None → pre-deducted 1 µcredit stays → min charge
+        // else: is_billable && is_2xx && usage=None → pre-deducted 1 µcredit stays → min charge
     }
     record_request(state, log_ctx, status.as_u16(), resp_bytes, usage);
 
@@ -1521,5 +1557,64 @@ mod tests {
     fn retry_after_past_date_is_zero() {
         let value = HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT");
         assert_eq!(parse_retry_after_ms(Some(&value)), Some(0));
+    }
+
+    /// Test: extract usage from a standard OpenAI chat completion response (non-streaming).
+    #[test]
+    fn extract_usage_from_openai_response() {
+        let body = br#"{
+            "id": "chatcmpl-xxx",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+        }"#;
+        let usage = usage_from_json_bytes(body).expect("should extract usage from standard OpenAI response");
+        assert_eq!(usage.prompt, 10);
+        assert_eq!(usage.completion, 20);
+        assert_eq!(usage.total, 30);
+    }
+
+    /// Edge case: OpenAI response where usage fields are 0
+    #[test]
+    fn openai_zero_token_response() {
+        let body = br#"{
+            "id": "chatcmpl-xxx",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        }"#;
+        let usage = usage_from_json_bytes(body).expect("should extract usage even with zero tokens");
+        assert_eq!(usage.prompt, 0);
+        assert_eq!(usage.completion, 0);
+        assert_eq!(usage.total, 0);
+    }
+
+    /// Edge case: response without usage field at all.
+    #[test]
+    fn response_without_usage_field_returns_none() {
+        let body = br#"{
+            "id": "chatcmpl-xxx",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}]
+        }"#;
+        assert!(usage_from_json_bytes(body).is_none(), "should return None when no usage field");
+    }
+
+    /// Test: extract usage from image generation response format (no total_tokens).
+    #[test]
+    fn extract_usage_from_image_generation_response() {
+        let body = br#"{
+            "data": [{"b64_json": "base64...", "revised_prompt": "A cat"}],
+            "usage": {"prompt_tokens": 50, "completion_tokens": 300}
+        }"#;
+        let usage = usage_from_json_bytes(body)
+            .expect("should extract usage from image generation response");
+        assert_eq!(usage.prompt, 50);
+        assert_eq!(usage.completion, 300);
+        assert_eq!(usage.total, 350, "total should fallback to prompt+completion");
     }
 }
