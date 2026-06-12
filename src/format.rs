@@ -754,13 +754,34 @@ fn anthropic_sse_to_openai(v: &serde_json::Value, model: Option<&str>) -> Vec<se
                 .and_then(|m| m.get("model"))
                 .and_then(|s| s.as_str())
                 .unwrap_or(model.unwrap_or(""));
-            vec![chat_chunk_json(
+            let mut out = vec![chat_chunk_json(
                 id,
                 model_str,
                 serde_json::json!({"role": "assistant", "content": ""}),
                 None,
                 None,
-            )]
+            )];
+            // Emit input_tokens as a usage-bearing chunk so the billing layer
+            // can merge prompt_tokens (here) with completion_tokens (from message_delta).
+            if let Some(input) = v
+                .get("message")
+                .and_then(|m| m.get("usage"))
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(|n| n.as_u64())
+            {
+                out.push(chat_chunk_json(
+                    id,
+                    model_str,
+                    serde_json::json!({}),
+                    None,
+                    Some(serde_json::json!({
+                        "prompt_tokens": input,
+                        "completion_tokens": 0,
+                        "total_tokens": input
+                    })),
+                ));
+            }
+            out
         }
         "content_block_delta" => {
             let text = v

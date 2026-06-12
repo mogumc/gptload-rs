@@ -1232,14 +1232,28 @@ async fn proxy_upstream_response(
                     if tx.send(Ok(chunk.clone())).await.is_err() {
                         break;
                     }
-                    if !want_sse_usage || usage.is_some() {
+                    if !want_sse_usage {
                         continue;
                     }
                     if sse_buf.len().saturating_add(chunk.len()) > MAX_SSE_BUF_BYTES {
                         continue;
                     }
                     if let Some(found) = parse_sse_usage(&mut sse_buf, &chunk) {
-                        usage = Some(found);
+                        // Merge across chunks: some formats (Anthropic) split
+                        // prompt_tokens (message_start) and completion_tokens (message_delta)
+                        // into separate SSE events. Non-zero values from later chunks
+                        // override earlier ones.
+                        usage = Some(match usage {
+                            Some(prev) => UsageTokens {
+                                prompt: if found.prompt > 0 { found.prompt } else { prev.prompt },
+                                completion: if found.completion > 0 { found.completion } else { prev.completion },
+                                thought: if found.thought > 0 { found.thought } else { prev.thought },
+                                total: (found.prompt.max(prev.prompt) + found.completion.max(prev.completion) + found.thought.max(prev.thought))
+                                    .max(found.total)
+                                    .max(prev.total),
+                            },
+                            None => found,
+                        });
                     }
                 }
                 Err(_) => break,
