@@ -22,3 +22,17 @@ pub fn query_get<'a>(uri: &'a http::Uri, key: &'a str) -> Option<&'a str> {
     }
     None
 }
+
+/// Validate key string: only [A-Za-z0-9_-] allowed.
+pub fn validate_key_chars(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("key must not be empty".to_string());
+    }
+    if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(format!(
+            "key contains invalid character '{}' (only A-Za-z0-9 _ - allowed)",
+            key.chars().find(|c| !c.is_ascii_alphanumeric() && *c != '_' && *c != '-').unwrap_or(' ')
+        ));
+    }
+    Ok(())
+}

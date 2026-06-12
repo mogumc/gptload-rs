@@ -128,6 +128,36 @@ fn adapt_anthropic_request(
     if !system_parts.is_empty() {
         out["system"] = serde_json::Value::String(system_parts.join("\n\n"));
     }
+    // Pass through tools and tool_choice.
+    if let Some(tools) = v.get("tools") {
+        let anthropic_tools: Vec<serde_json::Value> = tools
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.get("function"))
+                    .map(|f| {
+                        serde_json::json!({
+                            "name": f.get("name"),
+                            "description": f.get("description"),
+                            "input_schema": f.get("parameters").cloned().unwrap_or(serde_json::json!({})),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !anthropic_tools.is_empty() {
+            out["tools"] = serde_json::Value::Array(anthropic_tools);
+        }
+    }
+    if let Some(tc) = v.get("tool_choice") {
+        if tc.as_str() == Some("auto") || tc.as_str() == Some("any") {
+            out["tool_choice"] = serde_json::json!({"type": "auto"});
+        } else if tc.as_str() == Some("required") {
+            out["tool_choice"] = serde_json::json!({"type": "any"});
+        } else if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
+            out["tool_choice"] = serde_json::json!({"type": "tool", "name": name});
+        }
+    }
     copy_number(&v, &mut out, "temperature", "temperature");
     copy_number(&v, &mut out, "top_p", "top_p");
     if let Some(stop) = v.get("stop") {
@@ -177,18 +207,21 @@ fn adapt_gemini_request(
                 .get("content")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            let text = content_to_text(&content);
-            if text.is_empty() {
+            if role == "system" {
+                let text = content_to_text(&content);
+                if !text.is_empty() {
+                    system_parts.push(text);
+                }
                 continue;
             }
-            if role == "system" {
-                system_parts.push(text);
+            let parts = content_to_gemini_parts(&content);
+            if parts.is_empty() {
                 continue;
             }
             let out_role = if role == "assistant" { "model" } else { "user" };
             contents.push(serde_json::json!({
                 "role": out_role,
-                "parts": [{"text": text}],
+                "parts": parts,
             }));
         }
     }
@@ -286,22 +319,211 @@ fn content_to_text(content: &serde_json::Value) -> String {
     }
 }
 
+/// Max decoded file size: 20 MB (matching OpenAI / Anthropic limits).
+const MAX_DECODED_BYTES: usize = 20 * 1024 * 1024;
+
 fn content_to_anthropic_blocks(content: &serde_json::Value) -> serde_json::Value {
     match content {
         serde_json::Value::Array(parts) => {
             let out: Vec<serde_json::Value> = parts
                 .iter()
-                .filter_map(|part| {
-                    let text = part
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .or_else(|| part.get("content").and_then(|t| t.as_str()))?;
-                    Some(serde_json::json!({"type": "text", "text": text}))
-                })
+                .filter_map(|part| openai_part_to_anthropic(part))
                 .collect();
             serde_json::Value::Array(out)
         }
-        _ => serde_json::json!([{"type": "text", "text": content_to_text(content)}]),
+        _ => {
+            let text = content_to_text(content);
+            if text.len() > MAX_DECODED_BYTES {
+                tracing::warn!(text_len = text.len(), "anthropic: fallback text content dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+                return serde_json::Value::Array(vec![]);
+            }
+            serde_json::json!([{"type": "text", "text": text}])
+        },
+    }
+}
+
+/// Binary data extracted from an OpenAI multimodal content part.
+struct BinaryAttachment {
+    mime: String,
+    data: String,
+}
+
+/// Extract binary data from an OpenAI content part (image_url / input_audio / file).
+/// Handles data URI parsing, size checks, and MIME inference.
+/// `provider` is used for warn logs ("anthropic" or "gemini").
+fn extract_binary_attachment(part: &serde_json::Value, provider: &str) -> Option<BinaryAttachment> {
+    let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+    match part_type {
+        "image_url" => {
+            let url = part.get("image_url").and_then(|u| u.get("url")).and_then(|u| u.as_str());
+            let url = match url {
+                Some(u) => u,
+                None => return None,
+            };
+            match parse_data_uri(url, MAX_DECODED_BYTES) {
+                Some((mime, data)) => Some(BinaryAttachment { mime, data }),
+                None => {
+                    tracing::warn!(%url, "{provider}: image_url dropped (data URI parse failed or exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+                    None
+                }
+            }
+        }
+        "input_audio" => {
+            let audio = part.get("input_audio")?;
+            let data = audio.get("data").and_then(|d| d.as_str()).unwrap_or("");
+            let format = audio.get("format").and_then(|f| f.as_str()).unwrap_or("wav");
+            if data.len() > MAX_DECODED_BYTES {
+                tracing::warn!(data_len = data.len(), format, "{provider}: input_audio dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+                return None;
+            }
+            Some(BinaryAttachment { mime: format!("audio/{}", format), data: data.to_string() })
+        }
+        "file" => {
+            let file = part.get("file")?;
+            let file_data = file.get("file_data").and_then(|d| d.as_str()).unwrap_or("");
+            let filename = file.get("filename").and_then(|f| f.as_str()).unwrap_or("");
+            if file_data.len() > MAX_DECODED_BYTES {
+                tracing::warn!(data_len = file_data.len(), %filename, "{provider}: file dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+                return None;
+            }
+            Some(BinaryAttachment { mime: mime_from_filename(filename), data: file_data.to_string() })
+        }
+        _ => None,
+    }
+}
+
+/// Convert a single OpenAI content part to an Anthropic block.
+fn openai_part_to_anthropic(part: &serde_json::Value) -> Option<serde_json::Value> {
+    let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+    let text = part
+        .get("text")
+        .and_then(|t| t.as_str())
+        .or_else(|| part.get("content").and_then(|t| t.as_str()));
+    if let Some(s) = text {
+        if part_type.is_empty() || part_type == "text" {
+            return Some(serde_json::json!({"type": "text", "text": s}));
+        }
+    }
+
+    if let Some(att) = extract_binary_attachment(part, "anthropic") {
+        let block_type = if part_type == "image_url" { "image" } else { "document" };
+        return Some(serde_json::json!({
+            "type": block_type,
+            "source": {"type": "base64", "media_type": att.mime, "data": att.data}
+        }));
+    }
+    // If we got here and part_type was recognized (image/audio/file), the warn was logged by extract_binary_attachment.
+    if matches!(part_type, "image_url" | "input_audio" | "file") {
+        return None;
+    }
+
+    // Fallback: plain text
+    if let Some(s) = text {
+        if s.len() > MAX_DECODED_BYTES {
+            tracing::warn!(text_len = s.len(), "anthropic: fallback text block dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+            return None;
+        }
+        return Some(serde_json::json!({"type": "text", "text": s}));
+    }
+
+    None
+}
+
+/// Convert OpenAI-format content (string or array) to Gemini parts.
+fn content_to_gemini_parts(content: &serde_json::Value) -> Vec<serde_json::Value> {
+    match content {
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| openai_part_to_gemini(part))
+            .collect(),
+        serde_json::Value::String(s) => {
+            if s.len() > MAX_DECODED_BYTES {
+                tracing::warn!(text_len = s.len(), "gemini: text content dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+                return vec![];
+            }
+            vec![serde_json::json!({"text": s})]
+        }
+        _ => {
+            let text = content_to_text(content);
+            if text.is_empty() { return vec![]; }
+            if text.len() > MAX_DECODED_BYTES {
+                tracing::warn!(text_len = text.len(), "gemini: fallback text content dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+                return vec![];
+            }
+            vec![serde_json::json!({"text": text})]
+        }
+    }
+}
+
+/// Convert a single OpenAI content part to a Gemini part.
+fn openai_part_to_gemini(part: &serde_json::Value) -> Option<serde_json::Value> {
+    let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+    let text = part
+        .get("text")
+        .and_then(|t| t.as_str())
+        .or_else(|| part.get("content").and_then(|t| t.as_str()));
+    if let Some(s) = text {
+        if part_type.is_empty() || part_type == "text" {
+            return Some(serde_json::json!({"text": s}));
+        }
+    }
+
+    if let Some(att) = extract_binary_attachment(part, "gemini") {
+        return Some(serde_json::json!({"inlineData": {"mimeType": att.mime, "data": att.data}}));
+    }
+    if matches!(part_type, "image_url" | "input_audio" | "file") {
+        return None;
+    }
+
+    None
+}
+
+/// Parse a data URI "data:<mime>;base64,<data>" → (mime, data).
+/// Returns None if the decoded data exceeds `max_bytes`.
+fn parse_data_uri(uri: &str, max_bytes: usize) -> Option<(String, String)> {
+    let stripped = uri.strip_prefix("data:")?;
+    let (mime_and_encoding, data) = stripped.split_once(',')?;
+    let mime = mime_and_encoding.trim_end_matches(";base64").trim_end_matches(";BASE64");
+    if mime.is_empty() || data.is_empty() {
+        return None;
+    }
+    if data.len() > max_bytes {
+        return None;
+    }
+    Some((mime.to_string(), data.to_string()))
+}
+
+/// Map a filename extension to MIME type. Falls back to application/octet-stream.
+fn mime_from_filename(filename: &str) -> String {
+    let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "pdf" => "application/pdf".into(),
+        "doc" => "application/msword".into(),
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document".into(),
+        "xls" => "application/vnd.ms-excel".into(),
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".into(),
+        "ppt" => "application/vnd.ms-powerpoint".into(),
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation".into(),
+        "txt" => "text/plain".into(),
+        "csv" => "text/csv".into(),
+        "html" | "htm" => "text/html".into(),
+        "json" => "application/json".into(),
+        "xml" => "application/xml".into(),
+        "zip" => "application/zip".into(),
+        "mp3" => "audio/mpeg".into(),
+        "mp4" => "video/mp4".into(),
+        "wav" => "audio/wav".into(),
+        "ogg" => "audio/ogg".into(),
+        "webm" => "video/webm".into(),
+        "png" => "image/png".into(),
+        "jpg" | "jpeg" => "image/jpeg".into(),
+        "gif" => "image/gif".into(),
+        "webp" => "image/webp".into(),
+        "svg" => "image/svg+xml".into(),
+        _ => "application/octet-stream".into(),
     }
 }
 
@@ -311,16 +533,16 @@ async fn transform_json_response(
     f: fn(&serde_json::Value, Option<String>) -> serde_json::Value,
 ) -> Response<Body> {
     let (mut parts, body) = up_resp.into_parts();
-    parts.headers.remove(CONTENT_LENGTH);
-    parts.headers.remove(CONTENT_ENCODING);
-    parts.headers.insert(
-        CONTENT_TYPE,
-        http::HeaderValue::from_static("application/json"),
-    );
     let body = match hyper::body::to_bytes(body).await {
         Ok(body) => body,
         Err(_) => {
             parts.status = http::StatusCode::BAD_GATEWAY;
+            parts.headers.remove(CONTENT_LENGTH);
+            parts.headers.remove(CONTENT_ENCODING);
+            parts.headers.insert(
+                CONTENT_TYPE,
+                http::HeaderValue::from_static("application/json"),
+            );
             return Response::from_parts(
                 parts,
                 Body::from(r#"{"error":{"message":"failed to read upstream response"}}"#),
@@ -328,11 +550,28 @@ async fn transform_json_response(
         }
     };
     if !parts.status.is_success() {
-        return Response::from_parts(parts, Body::from(body));
+        let error_msg = extract_upstream_error(&body);
+        let error_body = serde_json::json!({
+            "error": {
+                "message": error_msg,
+                "type": "upstream_error",
+                "code": parts.status.as_u16()
+            }
+        });
+        return Response::from_parts(parts, Body::from(error_body.to_string()));
     }
+    parts.headers.remove(CONTENT_LENGTH);
+    parts.headers.remove(CONTENT_ENCODING);
+    parts.headers.insert(
+        CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return Response::from_parts(parts, Body::from(body)),
+        Err(e) => {
+            tracing::warn!(error = %e, "upstream JSON parse failed, returning raw body");
+            return Response::from_parts(parts, Body::from(body));
+        }
     };
     let out = f(&value, model);
     Response::from_parts(parts, Body::from(out.to_string()))
@@ -344,6 +583,9 @@ fn transform_sse_response(
     f: fn(&serde_json::Value, Option<&str>) -> Vec<serde_json::Value>,
 ) -> Response<Body> {
     let (mut parts, body) = up_resp.into_parts();
+    if !parts.status.is_success() {
+        return Response::from_parts(parts, body);
+    }
     parts.headers.remove(CONTENT_LENGTH);
     parts.headers.remove(CONTENT_ENCODING);
     parts.headers.insert(
@@ -449,12 +691,28 @@ fn gemini_json_to_openai(v: &serde_json::Value, model: Option<String>) -> serde_
         .and_then(|u| u.get("promptTokenCount"))
         .and_then(|n| n.as_u64())
         .unwrap_or(0);
-    let completion = v
+    let candidates = v
         .get("usageMetadata")
         .and_then(|u| u.get("candidatesTokenCount"))
         .and_then(|n| n.as_u64())
         .unwrap_or(0);
-    chat_completion_json("chatcmpl-gemini", &model, content, prompt, completion)
+    let thought = v
+        .get("usageMetadata")
+        .and_then(|u| u.get("thoughtsTokenCount"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
+    // completion_tokens = candidates only (visible output).
+    // thought_tokens tracked separately; billing layer sums them via UsageTokens::billing_completion().
+    let completion = candidates;
+    let total = v
+        .get("usageMetadata")
+        .and_then(|u| u.get("totalTokenCount"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(prompt + completion + thought);
+    let mut resp = chat_completion_json("chatcmpl-gemini", &model, content, prompt, completion);
+    resp["usage"]["thought_tokens"] = serde_json::json!(thought);
+    resp["usage"]["total_tokens"] = serde_json::json!(total);
+    resp
 }
 
 fn chat_completion_json(
@@ -485,16 +743,46 @@ fn chat_completion_json(
 fn anthropic_sse_to_openai(v: &serde_json::Value, model: Option<&str>) -> Vec<serde_json::Value> {
     let ty = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
     match ty {
-        "message_start" => vec![chat_chunk_json(
-            v.get("message")
+        "message_start" => {
+            let id = v
+                .get("message")
                 .and_then(|m| m.get("id"))
                 .and_then(|s| s.as_str())
-                .unwrap_or("chatcmpl-anthropic"),
-            model.unwrap_or(""),
-            serde_json::json!({"role": "assistant"}),
-            None,
-            None,
-        )],
+                .unwrap_or("chatcmpl-anthropic");
+            let model_str = v
+                .get("message")
+                .and_then(|m| m.get("model"))
+                .and_then(|s| s.as_str())
+                .unwrap_or(model.unwrap_or(""));
+            let mut out = vec![chat_chunk_json(
+                id,
+                model_str,
+                serde_json::json!({"role": "assistant", "content": ""}),
+                None,
+                None,
+            )];
+            // Emit input_tokens as a usage-bearing chunk so the billing layer
+            // can merge prompt_tokens (here) with completion_tokens (from message_delta).
+            if let Some(input) = v
+                .get("message")
+                .and_then(|m| m.get("usage"))
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(|n| n.as_u64())
+            {
+                out.push(chat_chunk_json(
+                    id,
+                    model_str,
+                    serde_json::json!({}),
+                    None,
+                    Some(serde_json::json!({
+                        "prompt_tokens": input,
+                        "completion_tokens": 0,
+                        "total_tokens": input
+                    })),
+                ));
+            }
+            out
+        }
         "content_block_delta" => {
             let text = v
                 .get("delta")
@@ -592,6 +880,16 @@ fn gemini_sse_to_openai(v: &serde_json::Value, model: Option<&str>) -> Vec<serde
             .get("candidatesTokenCount")
             .and_then(|n| n.as_u64())
             .unwrap_or(0);
+        let thought = usage
+            .get("thoughtsTokenCount")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0);
+        // Use Gemini's native totalTokenCount which includes thoughts.
+        // Fallback to sum if missing.
+        let total = usage
+            .get("totalTokenCount")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(prompt + completion + thought);
         out.push(chat_chunk_json(
             "chatcmpl-gemini",
             model.unwrap_or(""),
@@ -600,11 +898,29 @@ fn gemini_sse_to_openai(v: &serde_json::Value, model: Option<&str>) -> Vec<serde
             Some(serde_json::json!({
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,
-                "total_tokens": prompt + completion
+                "thought_tokens": thought,
+                "total_tokens": total
             })),
         ));
     }
     out
+}
+
+/// Extract a human-readable error message from an upstream error response.
+fn extract_upstream_error(body: &[u8]) -> String {
+    let v: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return String::from_utf8_lossy(body).into_owned(),
+    };
+    // Anthropic / Gemini / OpenAI all use error.message
+    if let Some(msg) = v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+        return msg.to_string();
+    }
+    // Generic fallback: error object as string
+    v.get("error")
+        .and_then(|e| e.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "unknown upstream error".to_string())
 }
 
 fn chat_chunk_json(
@@ -697,4 +1013,128 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&adapted.body).unwrap();
         assert_eq!(v["contents"][0]["role"], "user");
     }
+
+    /// Round-trip: Gemini JSON → OpenAI format → serialize → parse → verify usage fields.
+    #[test]
+    fn gemini_json_to_openai_produces_correct_usage() {
+        let gemini_resp = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "Hello from Gemini"}],
+                    "role": "model"
+                },
+                "finishReason": "STOP",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 15,
+                "candidatesTokenCount": 25,
+                "thoughtsTokenCount": 5,
+                "totalTokenCount": 45
+            },
+            "modelVersion": "gemini-2.0-flash"
+        });
+
+        let converted = gemini_json_to_openai(&gemini_resp, Some("gemini-2.0-flash".to_string()));
+
+        assert_eq!(converted["usage"]["prompt_tokens"], 15);
+        assert_eq!(converted["usage"]["completion_tokens"], 25); // candidates only
+        assert_eq!(converted["usage"]["thought_tokens"], 5);
+        assert_eq!(converted["usage"]["total_tokens"], 45);
+
+        // Serialize → parse back (simulates HTTP body round-trip)
+        let serialized = converted.to_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("should parse serialized JSON");
+
+        assert_eq!(parsed["usage"]["prompt_tokens"], 15);
+        assert_eq!(parsed["usage"]["completion_tokens"], 25);
+        assert_eq!(parsed["usage"]["thought_tokens"], 5);
+        assert_eq!(parsed["usage"]["total_tokens"], 45);
+    }
+
+    /// Round-trip: Anthropic JSON → OpenAI format → serialize → parse → verify usage fields.
+    #[test]
+    fn anthropic_json_to_openai_produces_correct_usage() {
+        let anthropic_resp = serde_json::json!({
+            "id": "msg_xxx",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-20250514",
+            "content": [{"type": "text", "text": "Hello from Claude"}],
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 34
+            }
+        });
+
+        let converted =
+            anthropic_json_to_openai(&anthropic_resp, Some("claude-sonnet-4-20250514".to_string()));
+
+        assert_eq!(converted["usage"]["prompt_tokens"], 12);
+        assert_eq!(converted["usage"]["completion_tokens"], 34);
+        assert_eq!(converted["usage"]["total_tokens"], 46);
+
+        let serialized = converted.to_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("should parse serialized JSON");
+
+        assert_eq!(parsed["usage"]["prompt_tokens"], 12);
+        assert_eq!(parsed["usage"]["completion_tokens"], 34);
+        assert_eq!(parsed["usage"]["total_tokens"], 46);
+    }
+
+    /// Edge case: Gemini safety-blocked response still has usage metadata.
+    #[test]
+    fn gemini_safety_blocked_still_produces_usage() {
+        let gemini_resp = serde_json::json!({
+            "candidates": [{
+                "finishReason": "SAFETY",
+                "safetyRatings": [{"category": "HARM_CATEGORY_HARASSMENT", "probability": "HIGH"}]
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 8,
+                "totalTokenCount": 8
+            },
+            "modelVersion": "gemini-2.0-flash"
+        });
+
+        let converted = gemini_json_to_openai(&gemini_resp, Some("gemini-2.0-flash".to_string()));
+
+        let serialized = converted.to_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("should parse");
+
+        assert_eq!(parsed["usage"]["prompt_tokens"], 8);
+        assert_eq!(parsed["usage"]["completion_tokens"], 0); // no candidatesTokenCount
+        assert_eq!(parsed["usage"]["total_tokens"], 8);
+    }
+
+    /// Edge case: Anthropic response with 0 tokens.
+    #[test]
+    fn anthropic_zero_tokens_produces_correct_usage() {
+        let anthropic_resp = serde_json::json!({
+            "id": "msg_xxx",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-20250514",
+            "content": [{"type": "text", "text": ""}],
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0
+            }
+        });
+
+        let converted =
+            anthropic_json_to_openai(&anthropic_resp, Some("claude-sonnet-4-20250514".to_string()));
+
+        let serialized = converted.to_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("should parse");
+
+        assert_eq!(parsed["usage"]["prompt_tokens"], 0);
+        assert_eq!(parsed["usage"]["completion_tokens"], 0);
+        assert_eq!(parsed["usage"]["total_tokens"], 0);
+    }
+
 }

@@ -1,86 +1,65 @@
-# gptload-rs v0.2 config example
+# ============================================================
+# gptload-rs 配置示例
+# ============================================================
 
-# Where the proxy listens (HTTP only). Admin UI/API are served under /admin on the same port.
-listen_addr = "0.0.0.0:8080"
+# 代理监听地址（HTTP），/admin 管理后台同端口
+listen_addr = "0.0.0.0:3000"
 
-# Tokio worker threads. If omitted, defaults to CPU core count.
+# Tokio 工作线程数，省略则自动取 CPU 核心数
 # worker_threads = 4
 
-# Hard timeout for upstream requests (connect + response).
+# 上游请求超时（毫秒），含连接+响应
 request_timeout_ms = 60000
 
-# Maximum retry attempts for retryable upstream responses.
-# Set to 0 to disable retries.
+# 最大重试次数，0 为禁用重试
 max_retries = 5
 
-# Upstream status codes that should trigger retry.
-# Default is [429] when omitted.
+# 触发重试的上游 HTTP 状态码，省略时默认 [429]
 retry_status_codes = [429, 500, 502, 503, 504, 401, 403]
 
-# Optional tokens for normal proxy traffic: clients must pass X-Proxy-Token.
-# If omitted or empty, proxy requests are allowed without token.
+# 代理流量鉴权令牌（可选），客户端须携带 X-Proxy-Token 头
+# 省略或留空则不校验
 # proxy_tokens = ["proxy-token-1"]
 
-# Tokens for Admin UI/API: requests must pass X-Admin-Token (API) or ?token= (SSE).
-# NOTE: If you expose this server publicly, set strong tokens.
+# 管理后台鉴权令牌（必填），API 须携带 X-Admin-Token，SSE 使用 ?token=
+# 公网部署请务必设置强密码
 admin_tokens = ["admin-token-1"]
 
-# Separate token for sensitive operations (key export).
-# Clients must pass X-Export-Token header for export endpoints.
-export_token = "your-export-secret"
-
-# Where to store the embedded key database (sled). Will be created if missing.
+# 持久化数据目录（sled 内嵌数据库），不存在则自动创建
 data_dir = "./data"
 
-# Enable stream usage injection for these upstream ids (adds stream_options.include_usage).
-# usage_inject_upstreams = ["openai"]
-
+# ── 服务端行为 ──────────────────────────────────────────────
 [server]
-# Wait for inflight requests after SIGINT/SIGTERM.
+# 优雅关闭等待时间（秒）：收到 SIGINT/SIGTERM 后等待进行中请求完成
 graceful_shutdown_timeout_secs = 30
 
-# Browser CORS allow-list. ["*"] allows every Origin.
+# 浏览器跨域白名单，["*"] 允许任意来源
 cors_origins = ["*"]
 
-# Queue requests instead of returning 503 when keys are busy or cooling down.
+# 请求排队：当所有密钥繁忙/冷却时排队等待，而非直接返回 503
 queue_enabled = false
-queue_max_depth = 100
-queue_timeout_ms = 10000
+queue_max_depth = 100          # 最大排队数
+queue_timeout_ms = 10000       # 排队超时（毫秒）
 
+# 请求日志保留天数，超期自动删除。0 为禁用，默认 7
+# request_log_retention_days = 7
+
+# ── 密钥全局行为 ────────────────────────────────────────────
 [key]
-# Number of auth failures (401/403) before a key is auto-invalidated.
-# 0 = disabled (keys are never auto-blacklisted).
+# 认证失败阈值（401/403），达到后自动标记失效，0 为禁用
 blacklist_threshold = 3
 
-# Max concurrent requests per key. Keys at this limit are skipped during selection.
-# Prevents upstream 429 from concurrent overload. 0 = no limit.
+# 单密钥最大并发，超过则跳过选择，0 为不限制
 max_concurrent_per_key = 5
 
-# Default cooldown after 429 when Retry-After is absent.
+# 遇到 429 且无 Retry-After 时的默认冷却（毫秒）
 rate_limit_cooldown_ms = 3000
 
-# Upper bound for Retry-After cooldown.
+# Retry-After 冷却上限（毫秒），防止上游返回过长冷却
 max_rate_limit_cooldown_ms = 30000
 
-# How often (seconds) to re-validate invalid keys for automatic recovery.
+# 失效密钥自动恢复检测间隔（秒）
 revalidation_interval_secs = 300
 
-# Timeout (seconds) for each re-validation request.
+# 每次恢复检测请求超时（秒）
 revalidation_timeout_secs = 20
-
-[[upstreams]]
-id = "openai"
-base_url = "https://api.openai.com"
-weight = 1
-format = "openai"
-# proxy = "socks5://127.0.0.1:1080"
-# Per-upstream override for max concurrent requests per key.
-# Overrides the global [key].max_concurrent_per_key default.
-# max_concurrent_per_key = 5
-
-# Example: second upstream (OpenAI-compatible) weighted 2x
-[[upstreams]]
-id = "alt"
-base_url = "https://your-openai-compatible-upstream.example.com"
-weight = 2
-# max_concurrent_per_key = 10

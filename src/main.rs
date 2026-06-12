@@ -9,6 +9,7 @@ mod billing;
 mod config;
 mod format;
 mod proxy;
+mod route;
 mod state;
 mod storage;
 mod upstream_client;
@@ -37,16 +38,11 @@ struct Cli {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .with_level(true)
-        .init();
-
     let config_path = cli.config.clone();
     let cfg = config::Config::load(&config_path)?;
+
+    // Init tracing subscriber with optional OTLP layer.
+    init_tracing()?;
 
     let worker_threads = cfg.worker_threads.unwrap_or_else(num_cpus::get);
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -78,11 +74,17 @@ fn print_startup_info(state: &Arc<state::RouterState>, addr: SocketAddr) {
     let upstreams = &snapshot.upstreams;
     let admin_tokens = &state.admin_tokens;
 
+    let display_addr = if addr.ip().is_unspecified() {
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), addr.port())
+    } else {
+        addr
+    };
+
     tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     tracing::info!("  gptload-rs v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     tracing::info!(%addr, "listening");
-    tracing::info!(url = %format!("http://{}/web/", addr), "admin panel");
+    tracing::info!(url = %format!("http://{}/web/", display_addr), "admin panel");
 
     // Admin tokens
     let token_count = admin_tokens.len();
@@ -194,6 +196,16 @@ async fn wait_shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+fn init_tracing() -> anyhow::Result<()> {
+    let log_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(log_filter)
+        .with_target(false)
+        .with_level(true)
+        .init();
+    Ok(())
 }
 
 fn spawn_config_reload(state: Arc<state::RouterState>, config_path: String) {

@@ -4,6 +4,10 @@ on:
   push:
     branches: [ "main" ]
 
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -16,6 +20,15 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        
+      - name: Check
+        run: cargo check --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Build Optimized Binary
         run: |

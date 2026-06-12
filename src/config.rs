@@ -1,6 +1,22 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+
+/// Model cost rates (credits per 1K tokens).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ModelCost {
+    /// Credits per 1K prompt tokens.
+    #[serde(default)]
+    pub input: f64,
+    /// Credits per 1K completion tokens.
+    #[serde(default = "default_output_rate")]
+    pub output: f64,
+}
+
+fn default_output_rate() -> f64 {
+    1.0
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -25,11 +41,6 @@ pub struct Config {
     /// List of tokens required in `X-Admin-Token` for admin API requests.
     pub admin_tokens: Vec<String>,
 
-    /// Separate token for sensitive operations (key export). Optional.
-    /// If not set, export endpoints are disabled.
-    #[serde(default)]
-    pub export_token: Option<String>,
-
     /// Directory for persistent data (keys DB).
     pub data_dir: PathBuf,
 
@@ -41,8 +52,6 @@ pub struct Config {
     pub server: ServerConfig,
 
     pub key: KeyConfig,
-
-    pub upstreams: Vec<UpstreamConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -66,6 +75,10 @@ pub struct ServerConfig {
     /// Maximum time a queued request waits for capacity.
     #[serde(default = "default_queue_timeout_ms")]
     pub queue_timeout_ms: u64,
+
+    /// Auto-delete request logs older than this many days. 0 = disabled, default 7.
+    #[serde(default = "default_request_log_retention_days")]
+    pub request_log_retention_days: u64,
 }
 
 impl Default for ServerConfig {
@@ -76,6 +89,7 @@ impl Default for ServerConfig {
             queue_enabled: false,
             queue_max_depth: default_queue_max_depth(),
             queue_timeout_ms: default_queue_timeout_ms(),
+            request_log_retention_days: default_request_log_retention_days(),
         }
     }
 }
@@ -94,6 +108,10 @@ fn default_queue_max_depth() -> usize {
 
 fn default_queue_timeout_ms() -> u64 {
     10_000
+}
+
+fn default_request_log_retention_days() -> u64 {
+    7
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -177,6 +195,13 @@ pub struct UpstreamConfig {
     /// Optional outbound proxy URL: http://..., https://..., socks5://...
     #[serde(default)]
     pub proxy: Option<String>,
+    /// Model name mapping: incoming model → upstream model.
+    /// Example: `model_map = { "gpt-4o" = "deepseek-chat" }`.
+    #[serde(default)]
+    pub model_map: HashMap<String, String>,
+    /// Minimum key level required to use this upstream. Default 0. -1 = no restriction.
+    #[serde(default)]
+    pub min_key_level: i32,
 }
 
 impl Config {
@@ -227,48 +252,12 @@ impl Config {
         if self.server.cors_origins.is_empty() {
             self.server.cors_origins = default_cors_origins();
         }
-        for u in self.upstreams.iter_mut() {
-            u.id = u.id.trim().to_string();
-            u.base_url = u.base_url.trim().trim_end_matches('/').to_string();
-            if let Some(proxy) = &mut u.proxy {
-                *proxy = proxy.trim().to_string();
-                if proxy.is_empty() {
-                    u.proxy = None;
-                }
-            }
-            if u.format.is_none() {
-                u.format = Some(UpstreamFormat::detect(&u.base_url));
-            }
-        }
         Ok(())
     }
 
     fn validate(&self) -> anyhow::Result<()> {
         if self.admin_tokens.is_empty() {
             anyhow::bail!("config: admin_tokens must not be empty");
-        }
-        if self.upstreams.is_empty() {
-            anyhow::bail!("config: upstreams must not be empty");
-        }
-        for (i, u) in self.upstreams.iter().enumerate() {
-            if u.id.trim().is_empty() {
-                anyhow::bail!("config: upstreams[{i}].id must not be empty");
-            }
-            if !(u.base_url.starts_with("http://") || u.base_url.starts_with("https://")) {
-                anyhow::bail!(
-                    "config: upstreams[{i}].base_url must start with http:// or https://"
-                );
-            }
-            if let Some(proxy) = &u.proxy {
-                if !(proxy.starts_with("http://")
-                    || proxy.starts_with("https://")
-                    || proxy.starts_with("socks5://"))
-                {
-                    anyhow::bail!(
-                        "config: upstreams[{i}].proxy must start with http://, https://, or socks5://"
-                    );
-                }
-            }
         }
         if let Some(codes) = &self.retry_status_codes {
             for code in codes {

@@ -16,7 +16,7 @@ use hyper_rustls::HttpsConnectorBuilder;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -34,13 +34,14 @@ pub struct RouterState {
 
     pub proxy_tokens: Option<Arc<AHashSet<String>>>,
     pub admin_tokens: Arc<AHashSet<String>>,
-    pub export_token: Option<String>,
     pub usage_inject_upstreams: Option<Arc<AHashSet<String>>>,
 
     pub store: Arc<KeyStore>,
     pub billing: Arc<BillingStore>,
     pub model_routes_path: PathBuf,
+    pub model_costs_path: PathBuf,
     pub upstreams_path: PathBuf,
+    pub requests_log_path: PathBuf,
 
     pub snapshot: ArcSwap<RouterSnapshot>,
     pub sched_rr: Arc<AtomicUsize>,
@@ -57,6 +58,7 @@ pub struct RouterState {
     pub listen_addr: String,
     pub worker_threads: Option<usize>,
     pub data_dir: PathBuf,
+    pub log_write_pause: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -67,8 +69,8 @@ pub struct RuntimeConfig {
     pub key_config: KeyConfig,
     pub proxy_tokens: Option<Arc<AHashSet<String>>>,
     pub admin_tokens: Arc<AHashSet<String>>,
-    pub export_token: Option<String>,
     pub usage_inject_upstreams: Option<Arc<AHashSet<String>>>,
+    pub model_costs: ahash::AHashMap<String, crate::config::ModelCost>,
     pub server: ServerConfig,
     pub preview: serde_json::Value,
 }
@@ -81,6 +83,24 @@ pub struct QueueGuard<'a> {
 impl Drop for QueueGuard<'_> {
     fn drop(&mut self) {
         self.state.stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// RAII guard: decrements a key's `active_requests` on drop.
+pub struct KeyGuard {
+    key: Arc<KeyState>,
+}
+
+impl KeyGuard {
+    pub fn acquire(key: Arc<KeyState>) -> Self {
+        key.active_requests.fetch_add(1, Ordering::Relaxed);
+        Self { key }
+    }
+}
+
+impl Drop for KeyGuard {
+    fn drop(&mut self) {
+        self.key.active_requests.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -101,12 +121,13 @@ impl Clone for RouterState {
             key_config: self.key_config.clone(),
             proxy_tokens: self.proxy_tokens.clone(),
             admin_tokens: self.admin_tokens.clone(),
-            export_token: self.export_token.clone(),
             usage_inject_upstreams: self.usage_inject_upstreams.clone(),
             store: self.store.clone(),
             billing: self.billing.clone(),
             model_routes_path: self.model_routes_path.clone(),
+            model_costs_path: self.model_costs_path.clone(),
             upstreams_path: self.upstreams_path.clone(),
+            requests_log_path: self.requests_log_path.clone(),
             snapshot: ArcSwap::from(self.snapshot.load_full()),
             sched_rr: Arc::new(AtomicUsize::new(
                 self.sched_rr.load(std::sync::atomic::Ordering::Relaxed),
@@ -122,6 +143,7 @@ impl Clone for RouterState {
             listen_addr: self.listen_addr.clone(),
             worker_threads: self.worker_threads,
             data_dir: self.data_dir.clone(),
+            log_write_pause: self.log_write_pause.clone(),
         }
     }
 }
@@ -136,6 +158,7 @@ pub struct Upstream {
 
     pub weight: usize,
     pub max_concurrent_per_key: u32,
+    pub min_key_level: i32,
     pub format: UpstreamFormat,
     pub proxy: Option<String>,
     pub client: UpstreamClient,
@@ -145,6 +168,10 @@ pub struct Upstream {
     pub keys_update_lock: Mutex<()>,
     pub key_rr: AtomicUsize,
     pub models: ArcSwap<AHashSet<String>>,
+    /// Incoming model name → upstream model name.
+    pub model_map: ahash::AHashMap<String, String>,
+    /// Reverse: upstream model name → incoming model name (for /v1/models listing).
+    pub model_rmap: ahash::AHashMap<String, String>,
 
     pub stats: UpstreamStats,
 }
@@ -159,6 +186,8 @@ pub struct KeyState {
     pub failure_count: AtomicU32,
     pub status: AtomicU8,
     pub active_requests: AtomicU32,
+    /// Permission level: higher = more access. -1 = admin (no restriction).
+    pub level: AtomicI32,
     /// Unix ms timestamp when the 429 cooldown expires. 0 = not in cooldown.
     pub cooldown_until_ms: AtomicU64,
     pub latencies_ms: Mutex<VecDeque<u64>>,
@@ -186,6 +215,11 @@ pub struct Stats {
 
     pub errors_timeout: AtomicU64,
     pub errors_network: AtomicU64,
+
+    pub prompt_tokens_total: AtomicU64,
+    pub completion_tokens_total: AtomicU64,
+    pub thought_tokens_total: AtomicU64,
+    pub tokens_total: AtomicU64,
 
     pub queue_depth: AtomicU64,
     pub queue_timeout_total: AtomicU64,
@@ -233,6 +267,10 @@ impl Stats {
             responses_5xx: AtomicU64::new(0),
             errors_timeout: AtomicU64::new(0),
             errors_network: AtomicU64::new(0),
+            prompt_tokens_total: AtomicU64::new(0),
+            completion_tokens_total: AtomicU64::new(0),
+            thought_tokens_total: AtomicU64::new(0),
+            tokens_total: AtomicU64::new(0),
             queue_depth: AtomicU64::new(0),
             queue_timeout_total: AtomicU64::new(0),
             latency_ns_total: AtomicU64::new(0),
@@ -242,7 +280,7 @@ impl Stats {
     }
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RequestLogEntry {
     pub id: u64,
     pub ts_ms: u64,
@@ -251,19 +289,22 @@ pub struct RequestLogEntry {
     pub path: String,
     pub model: Option<String>,
     pub upstream_id: Option<String>,
+    pub billing_key: Option<String>,
     pub status: u16,
     pub latency_ms: u64,
     pub req_bytes: usize,
     pub resp_bytes: usize,
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
+    pub thought_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
     pub request_headers: Option<BTreeMap<String, String>>,
     pub request_body: Option<String>,
     pub timing: RequestTiming,
+    pub is_stream: Option<bool>,
 }
 
-#[derive(Clone, Default, serde::Serialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RequestTiming {
     pub queue_ms: u64,
     pub upstream_ms: u64,
@@ -282,25 +323,28 @@ pub struct MetricsBucket {
 
 #[derive(Clone, Copy)]
 pub enum MetricsWindow {
-    Minute,
-    Hour,
-    Day,
+    OneMin,
+    FiveMin,
+    ThirtyMin,
+    OneHour,
 }
 
 impl MetricsWindow {
     pub fn from_str(s: &str) -> Self {
         match s {
-            "hour" => MetricsWindow::Hour,
-            "day" => MetricsWindow::Day,
-            _ => MetricsWindow::Minute,
+            "5min" | "5m" => MetricsWindow::FiveMin,
+            "30min" | "30m" => MetricsWindow::ThirtyMin,
+            "1h" | "hour" => MetricsWindow::OneHour,
+            _ => MetricsWindow::OneMin,
         }
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            MetricsWindow::Minute => "minute",
-            MetricsWindow::Hour => "hour",
-            MetricsWindow::Day => "day",
+            MetricsWindow::OneMin => "1min",
+            MetricsWindow::FiveMin => "5min",
+            MetricsWindow::ThirtyMin => "30min",
+            MetricsWindow::OneHour => "1h",
         }
     }
 }
@@ -330,7 +374,18 @@ impl RequestsLog {
         if let Some(tx) = &self.tx {
             let _ = tx.try_send(entry.clone());
         }
+        self.push_entry(entry);
+    }
 
+    /// Load historical entries into memory only — no broadcast or file write.
+    /// Used at startup to restore in-memory state without duplicating the log file.
+    pub fn load_history<I: IntoIterator<Item = RequestLogEntry>>(&self, entries: I) {
+        for entry in entries {
+            self.push_entry(entry);
+        }
+    }
+
+    fn push_entry(&self, entry: RequestLogEntry) {
         {
             let mut entries = self.entries.lock().unwrap();
             entries.push_back(entry.clone());
@@ -338,7 +393,6 @@ impl RequestsLog {
                 entries.pop_front();
             }
         }
-
         {
             let mut metrics = self.metrics.lock().unwrap();
             metrics.update(&entry);
@@ -361,17 +415,19 @@ impl RequestsLog {
 }
 
 pub struct RequestMetrics {
-    minute: VecDeque<MetricsBucket>,
-    hour: VecDeque<MetricsBucket>,
-    day: VecDeque<MetricsBucket>,
+    m1: VecDeque<MetricsBucket>,
+    m5: VecDeque<MetricsBucket>,
+    m30: VecDeque<MetricsBucket>,
+    h1: VecDeque<MetricsBucket>,
 }
 
 impl RequestMetrics {
     pub fn new() -> Self {
         Self {
-            minute: VecDeque::new(),
-            hour: VecDeque::new(),
-            day: VecDeque::new(),
+            m1: VecDeque::new(),
+            m5: VecDeque::new(),
+            m30: VecDeque::new(),
+            h1: VecDeque::new(),
         }
     }
 
@@ -379,40 +435,18 @@ impl RequestMetrics {
         let (success, failure, ignored) = classify_status(entry.status);
         let ts_ms = entry.ts_ms;
 
-        update_bucket(
-            &mut self.minute,
-            ts_ms,
-            60_000,
-            60,
-            success,
-            failure,
-            ignored,
-        );
-        update_bucket(
-            &mut self.hour,
-            ts_ms,
-            3_600_000,
-            48,
-            success,
-            failure,
-            ignored,
-        );
-        update_bucket(
-            &mut self.day,
-            ts_ms,
-            86_400_000,
-            30,
-            success,
-            failure,
-            ignored,
-        );
+        update_bucket(&mut self.m1, ts_ms, 60_000, 60, success, failure, ignored);
+        update_bucket(&mut self.m5, ts_ms, 300_000, 60, success, failure, ignored);
+        update_bucket(&mut self.m30, ts_ms, 1_800_000, 48, success, failure, ignored);
+        update_bucket(&mut self.h1, ts_ms, 3_600_000, 24, success, failure, ignored);
     }
 
     pub fn snapshot(&self, window: MetricsWindow) -> Vec<MetricsBucket> {
         match window {
-            MetricsWindow::Minute => self.minute.iter().cloned().collect(),
-            MetricsWindow::Hour => self.hour.iter().cloned().collect(),
-            MetricsWindow::Day => self.day.iter().cloned().collect(),
+            MetricsWindow::OneMin => self.m1.iter().cloned().collect(),
+            MetricsWindow::FiveMin => self.m5.iter().cloned().collect(),
+            MetricsWindow::ThirtyMin => self.m30.iter().cloned().collect(),
+            MetricsWindow::OneHour => self.h1.iter().cloned().collect(),
         }
     }
 }
@@ -463,6 +497,8 @@ impl RuntimeConfig {
             }
         });
 
+        let model_costs = ahash::AHashMap::new();
+
         Self {
             request_timeout: Duration::from_millis(cfg.request_timeout_ms),
             max_retries: cfg.max_retries.unwrap_or(5),
@@ -470,8 +506,8 @@ impl RuntimeConfig {
             key_config: cfg.key.clone(),
             proxy_tokens,
             admin_tokens: Arc::new(admin_set),
-            export_token: cfg.export_token.clone(),
             usage_inject_upstreams,
+            model_costs,
             server: cfg.server.clone(),
             preview: config_preview(cfg),
         }
@@ -480,7 +516,7 @@ impl RuntimeConfig {
 
 impl RouterState {
     pub fn new(cfg: Config, config_path: Option<PathBuf>) -> anyhow::Result<Self> {
-        let runtime = Arc::new(RuntimeConfig::from_config(&cfg));
+        let mut runtime = Arc::new(RuntimeConfig::from_config(&cfg));
         let queue_max_depth = runtime.server.queue_max_depth;
         let request_timeout = runtime.request_timeout;
         let max_retries = runtime.max_retries;
@@ -494,12 +530,44 @@ impl RouterState {
         let store = Arc::new(KeyStore::open(&data_dir)?);
         let billing = Arc::new(BillingStore::new(&store)?);
         let model_routes_path = data_dir.join("models_routes.json");
+        let model_costs_path = data_dir.join("models_costs.json");
         let upstreams_path = data_dir.join("upstreams.json");
         let requests_log_path = data_dir.join("requests.jsonl");
-        let log_tx = start_request_log_writer(requests_log_path);
+        let log_pause = Arc::new(AtomicBool::new(false));
+        let log_tx = start_request_log_writer(requests_log_path.clone(), log_pause.clone());
         let requests = Arc::new(RequestsLog::new(5000, log_tx));
 
-        let mut upstream_configs = cfg.upstreams.clone();
+        // Load last 5000 entries from file into memory (no file write, already persisted).
+        if let Ok(content) = std::fs::read_to_string(&requests_log_path) {
+            let mut loaded = 0usize;
+            let entries: Vec<RequestLogEntry> = content
+                .lines()
+                .rev()
+                .take(5000)
+                .filter_map(|line| {
+                    let entry = serde_json::from_str::<RequestLogEntry>(line.trim()).ok()?;
+                    loaded += 1;
+                    Some(entry)
+                })
+                .collect();
+            requests.load_history(entries.into_iter().rev());
+            tracing::info!(
+                path = %requests_log_path.display(),
+                loaded,
+                "loaded historical request logs"
+            );
+        }
+
+        // Check monthly usage reset.
+        if let Err(e) = store.check_monthly_reset() {
+            tracing::warn!("monthly usage reset check failed: {e}");
+        }
+        spawn_monthly_reset_check(store.clone());
+
+        let retention_days = runtime.server.request_log_retention_days;
+        spawn_request_log_cleanup(requests_log_path.clone(), retention_days, log_pause.clone());
+
+        let mut upstream_configs: Vec<UpstreamConfig> = Vec::new();
         if let Ok(list) = load_upstreams_override(&upstreams_path) {
             upstream_configs = list;
         } else if upstreams_path.exists() {
@@ -532,6 +600,18 @@ impl RouterState {
             );
         }
 
+        // Load persisted model costs (set via admin API).
+        if let Ok(data) = std::fs::read_to_string(&model_costs_path) {
+            if let Ok(costs) = serde_json::from_str::<std::collections::HashMap<String, crate::config::ModelCost>>(&data) {
+                let mut rt = (*runtime).clone();
+                rt.model_costs = costs.into_iter().collect();
+                runtime = Arc::new(rt);
+                tracing::info!(path = %model_costs_path.display(), "loaded persisted model costs");
+            }
+        } else if model_costs_path.exists() {
+            tracing::warn!(path = %model_costs_path.display(), "failed to read model costs file");
+        }
+
         Ok(Self {
             runtime: ArcSwap::from(runtime),
             request_timeout,
@@ -540,12 +620,13 @@ impl RouterState {
             key_config: cfg.key.clone(),
             proxy_tokens,
             admin_tokens,
-            export_token: cfg.export_token.clone(),
             usage_inject_upstreams,
             store,
             billing,
             model_routes_path,
+            model_costs_path,
             upstreams_path,
+            requests_log_path,
             snapshot: ArcSwap::from(Arc::new(snapshot)),
             sched_rr: Arc::new(AtomicUsize::new(0)),
             client,
@@ -559,6 +640,7 @@ impl RouterState {
             listen_addr: cfg.listen_addr.clone(),
             worker_threads: cfg.worker_threads,
             data_dir,
+            log_write_pause: log_pause,
         })
     }
 
@@ -646,10 +728,6 @@ impl RouterState {
         self.runtime.load().key_config.clone()
     }
 
-    pub fn export_token(&self) -> Option<String> {
-        self.runtime.load().export_token.clone()
-    }
-
     pub fn config_preview(&self) -> serde_json::Value {
         self.runtime.load().preview.clone()
     }
@@ -683,8 +761,18 @@ impl RouterState {
     }
 
     /// Select an upstream + key that supports the given model.
-    /// Returns None only if no upstream has active keys for the model.
-    pub fn select_for_model(&self, model: &str, _now_ms: u64) -> Option<Selected> {
+    /// `billing_key_level`: the request user's billing key permission level.
+    /// -1 = admin (no restriction). Returns None if no upstream+key is eligible.
+    pub fn select_for_model(&self, model: &str, billing_key_level: i32, _now_ms: u64) -> Option<Selected> {
+        self.select_for_model_excluding(model, billing_key_level, None)
+    }
+
+    pub fn select_for_model_excluding(
+        &self,
+        model: &str,
+        billing_key_level: i32,
+        exclude: Option<(&str, &str)>,
+    ) -> Option<Selected> {
         if self.is_shutting_down() {
             return None;
         }
@@ -701,7 +789,12 @@ impl RouterState {
             let u_idx = snap.schedule[rr % sched_len];
             let u = &snap.upstreams[u_idx];
 
-            if !u.models.load().contains(model) {
+            if !u.models.load().contains(model) && !u.model_map.contains_key(model) {
+                continue;
+            }
+
+            // Billing-key level gate: user must have level >= upstream min.
+            if billing_key_level != -1 && billing_key_level < u.min_key_level {
                 continue;
             }
 
@@ -712,7 +805,10 @@ impl RouterState {
                 global_max
             };
 
-            if let Some(k) = u.select_key(max) {
+            let excluded_key = exclude
+                .and_then(|(upstream_id, key)| (upstream_id == u.id.as_ref()).then_some(key));
+
+            if let Some(k) = u.select_key(max, u.min_key_level, excluded_key) {
                 self.stats
                     .upstream_selected_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -731,7 +827,7 @@ impl RouterState {
         let snap = self.snapshot.load_full();
         snap.upstreams
             .iter()
-            .any(|u| u.models.load().contains(model))
+            .any(|u| u.models.load().contains(model) || u.model_map.contains_key(model))
     }
 
     pub fn any_models_loaded(&self) -> bool {
@@ -970,6 +1066,7 @@ impl RouterState {
                                 key.failure_count.store(0, Ordering::Relaxed);
                                 key.status.store(KEY_STATUS_ACTIVE, Ordering::Relaxed);
                                 upstream.rebuild_active_keys();
+                                state.queue_notify.notify_waiters();
                                 total_restored += 1;
                                 tracing::info!(
                                     key = %key.key,
@@ -1087,7 +1184,7 @@ impl Upstream {
     /// Select an active key via atomic round-robin, skipping keys at their
     /// concurrency limit and keys in 429 cooldown. Returns None if no active
     /// keys available.
-    fn select_key(&self, max_concurrent: u32) -> Option<Arc<KeyState>> {
+    fn select_key(&self, max_concurrent: u32, min_level: i32, exclude_key: Option<&str>) -> Option<Arc<KeyState>> {
         let keys = self.active_keys.load_full();
         let n = keys.len();
         if n == 0 {
@@ -1098,7 +1195,10 @@ impl Upstream {
         for i in 0..n {
             let idx = (start + i) % n;
             let k = &keys[idx];
-            // Skip keys in 429 cooldown.
+            // Skip excluded key (for retries).
+            if exclude_key.is_some_and(|excluded| excluded == k.key.as_ref()) {
+                continue;
+            }
             let until = k.cooldown_until_ms.load(Ordering::Relaxed);
             if until > 0 && now < until {
                 continue;
@@ -1111,9 +1211,14 @@ impl Upstream {
             if max_concurrent > 0 && k.active_requests.load(Ordering::Relaxed) >= max_concurrent {
                 continue;
             }
+            // Skip keys below required level. -1 = admin (passes any level).
+            let key_level = k.level.load(Ordering::Relaxed);
+            if key_level != -1 && key_level < min_level {
+                continue;
+            }
             return Some(k.clone());
         }
-        // All keys at limit or in cooldown — return None to signal backpressure.
+        // All keys at limit, in cooldown, or below required level.
         None
     }
 
@@ -1269,6 +1374,13 @@ fn parse_upstream(u: UpstreamConfig, weight: usize) -> anyhow::Result<Arc<Upstre
         base_path
     };
 
+    let mut model_map = ahash::AHashMap::new();
+    let mut model_rmap = ahash::AHashMap::new();
+    for (k, v) in u.model_map.iter() {
+        model_map.insert(k.clone(), v.clone());
+        model_rmap.insert(v.clone(), k.clone());
+    }
+
     let upstream = Upstream {
         id: Arc::<str>::from(u.id),
         base_url: Arc::<str>::from(u.base_url.clone()),
@@ -1277,6 +1389,7 @@ fn parse_upstream(u: UpstreamConfig, weight: usize) -> anyhow::Result<Arc<Upstre
         base_path: Arc::<str>::from(base_path),
         weight,
         max_concurrent_per_key: u.max_concurrent_per_key.unwrap_or(0),
+        min_key_level: u.min_key_level,
         format,
         proxy,
         client,
@@ -1285,28 +1398,36 @@ fn parse_upstream(u: UpstreamConfig, weight: usize) -> anyhow::Result<Arc<Upstre
         keys_update_lock: Mutex::new(()),
         key_rr: AtomicUsize::new(0),
         models: ArcSwap::from_pointee(AHashSet::new()),
+        model_map,
+        model_rmap,
         stats: UpstreamStats::default(),
     };
 
     Ok(Arc::new(upstream))
 }
 
-pub fn build_key_states(keys: Vec<String>) -> anyhow::Result<Arc<Vec<Arc<KeyState>>>> {
+pub fn build_key_states(keys: Vec<String>, store: Option<&crate::storage::KeyStore>) -> anyhow::Result<Arc<Vec<Arc<KeyState>>>> {
     let mut out: Vec<Arc<KeyState>> = Vec::with_capacity(keys.len());
     for k in keys {
         let k = k.trim();
         if k.is_empty() {
             continue;
         }
+        if let Err(e) = crate::util::validate_key_chars(k) {
+            tracing::warn!(key = %k, error = %e, "key rejected");
+            continue;
+        }
         let key_arc: Arc<str> = Arc::<str>::from(k.to_string());
         let auth_header = hyper::header::HeaderValue::from_str(&format!("Bearer {}", key_arc))
             .map_err(|_| anyhow::anyhow!("invalid key (cannot be used in HTTP header)"))?;
+        let level = store.map(|s| s.get_key_level(k)).unwrap_or(0);
         out.push(Arc::new(KeyState {
             key: key_arc,
             auth_header,
             failure_count: AtomicU32::new(0),
             status: AtomicU8::new(KEY_STATUS_ACTIVE),
             active_requests: AtomicU32::new(0),
+            level: AtomicI32::new(level),
             cooldown_until_ms: AtomicU64::new(0),
             latencies_ms: Mutex::new(VecDeque::with_capacity(256)),
         }));
@@ -1514,7 +1635,7 @@ impl RouterState {
         if key_value.is_empty() {
             anyhow::bail!("key must not be empty");
         }
-        let key = build_key_states(vec![key_value.to_string()])?
+        let key = build_key_states(vec![key_value.to_string()], None)?
             .first()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("invalid key"))?;
@@ -1593,6 +1714,8 @@ impl RouterState {
                 },
                 format: Some(u.format),
                 proxy: u.proxy.clone(),
+                model_map: u.model_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                min_key_level: u.min_key_level,
             })
             .collect()
     }
@@ -1678,9 +1801,6 @@ fn build_snapshot_from_configs(
     store: &KeyStore,
 ) -> anyhow::Result<RouterSnapshot> {
     const MAX_WEIGHT: usize = 100;
-    if configs.is_empty() {
-        anyhow::bail!("no upstreams configured");
-    }
 
     let mut upstreams: Vec<Arc<Upstream>> = Vec::new();
     let mut upstream_index: AHashMap<String, usize> = AHashMap::new();
@@ -1696,7 +1816,7 @@ fn build_snapshot_from_configs(
         upstream_index.insert(u.id.to_string(), idx);
 
         let keys = store.load_all_keys(&u.id)?;
-        let key_states = build_key_states(keys)?;
+        let key_states = build_key_states(keys, Some(store))?;
         // active_keys starts as a copy of all keys (all active by default).
         let active = key_states.iter().cloned().collect::<Vec<_>>();
         u.keys.store(key_states);
@@ -1736,6 +1856,26 @@ fn apply_routes_to_upstreams(
     }
 }
 
+impl RouterState {
+    /// Update model costs at runtime (via admin API).
+    pub fn set_model_costs(&self, costs: ahash::AHashMap<String, crate::config::ModelCost>) {
+        let old = self.runtime.load_full();
+        let mut rt: RuntimeConfig = (*old).clone();
+
+        // Persist to disk before storing (clone for serialization).
+        let ser_costs: std::collections::HashMap<&str, &crate::config::ModelCost> =
+            costs.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        if let Ok(json) = serde_json::to_string_pretty(&ser_costs) {
+            if let Err(e) = std::fs::write(&self.model_costs_path, &json) {
+                tracing::warn!(path = %self.model_costs_path.display(), error = %e, "failed to persist model costs");
+            }
+        }
+
+        rt.model_costs = costs;
+        self.runtime.store(Arc::new(rt));
+    }
+}
+
 #[cfg(unix)]
 impl RouterState {
     pub fn apply_config_reload(&self, cfg: Config) -> anyhow::Result<()> {
@@ -1761,8 +1901,10 @@ impl RouterState {
             );
         }
 
-        let runtime = Arc::new(RuntimeConfig::from_config(&cfg));
         let old = self.runtime.load_full();
+        let mut runtime = RuntimeConfig::from_config(&cfg);
+        runtime.model_costs = old.model_costs.clone(); // preserve admin-set model costs
+        let runtime = Arc::new(runtime);
         if runtime.server.queue_max_depth > old.server.queue_max_depth {
             self.queue_slots
                 .add_permits(runtime.server.queue_max_depth - old.server.queue_max_depth);
@@ -1780,7 +1922,6 @@ impl RouterState {
             .admin_write_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("admin write lock poisoned"))?;
-        self.replace_upstreams(cfg.upstreams)?;
         self.queue_notify.notify_waiters();
         Ok(())
     }
@@ -1948,7 +2089,7 @@ fn update_bucket(
     }
 }
 
-fn start_request_log_writer(path: PathBuf) -> Option<mpsc::Sender<RequestLogEntry>> {
+fn start_request_log_writer(path: PathBuf, pause: Arc<AtomicBool>) -> Option<mpsc::Sender<RequestLogEntry>> {
     let (tx, mut rx) = mpsc::channel::<RequestLogEntry>(2048);
 
     tokio::spawn(async move {
@@ -1967,11 +2108,17 @@ fn start_request_log_writer(path: PathBuf) -> Option<mpsc::Sender<RequestLogEntr
 
         let mut pending = 0usize;
         let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut pause_buf: Vec<RequestLogEntry> = Vec::new();
+        let mut was_paused = false;
 
         loop {
             tokio::select! {
                 entry = rx.recv() => {
                     let Some(entry) = entry else { break; };
+                    if pause.load(Ordering::Relaxed) {
+                        pause_buf.push(entry);
+                        continue;
+                    }
                     if let Ok(line) = serde_json::to_string(&entry) {
                         if file.write_all(line.as_bytes()).await.is_ok() {
                             let _ = file.write_all(b"\n").await;
@@ -1984,9 +2131,44 @@ fn start_request_log_writer(path: PathBuf) -> Option<mpsc::Sender<RequestLogEntr
                     }
                 }
                 _ = tick.tick() => {
-                    if pending > 0 {
-                        let _ = file.flush().await;
-                        pending = 0;
+                    let paused = pause.load(Ordering::Relaxed);
+                    if paused {
+                        was_paused = true;
+                    } else {
+                        // Reopen file after cleanup may have renamed it.
+                        if was_paused {
+                            was_paused = false;
+                            let _ = file.flush().await;
+                            match tokio::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&path)
+                                .await
+                            {
+                                Ok(f) => file = f,
+                                Err(e) => tracing::warn!(
+                                    path = %path.display(), error = %e,
+                                    "request log reopen failed after cleanup"
+                                ),
+                            }
+                        }
+                        // Drain any buffered entries in FIFO order.
+                        for entry in pause_buf.drain(..) {
+                            if let Ok(line) = serde_json::to_string(&entry) {
+                                if file.write_all(line.as_bytes()).await.is_ok() {
+                                    let _ = file.write_all(b"\n").await;
+                                    pending += 1;
+                                }
+                            }
+                            if pending >= 256 {
+                                let _ = file.flush().await;
+                                pending = 0;
+                            }
+                        }
+                        if pending > 0 {
+                            let _ = file.flush().await;
+                            pending = 0;
+                        }
                     }
                 }
             }
@@ -1996,6 +2178,124 @@ fn start_request_log_writer(path: PathBuf) -> Option<mpsc::Sender<RequestLogEntr
     });
 
     Some(tx)
+}
+
+/// Clean old request log entries from the JSONL file.
+/// Uses temp-file + rename to avoid data loss from concurrent writes.
+/// Returns (entries_kept, entries_removed).
+async fn cleanup_request_log(
+    path: &Path,
+    retention_days: u64,
+    pause: &AtomicBool,
+) -> (usize, usize) {
+    if retention_days == 0 {
+        return (0, 0);
+    }
+    let cutoff_ms = now_ms().saturating_sub(retention_days * 86_400_000);
+
+    // Pause log writer to prevent concurrent writes.
+    pause.store(true, Ordering::Relaxed);
+    // Brief wait for in-flight writes to finish (writer flushes every 1s).
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let content = match tokio::fs::read_to_string(path).await {
+        Ok(c) => c,
+        Err(_) => {
+            pause.store(false, Ordering::Relaxed);
+            return (0, 0);
+        }
+    };
+
+    let mut kept = 0usize;
+    let mut removed = 0usize;
+    let mut new_content = String::with_capacity(content.len());
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(ts) = v.get("ts_ms").and_then(|t| t.as_u64()) {
+                if ts < cutoff_ms {
+                    removed += 1;
+                    continue;
+                }
+            }
+        }
+        new_content.push_str(line);
+        new_content.push('\n');
+        kept += 1;
+    }
+
+    if removed > 0 {
+        let tmp_path = path.with_extension("jsonl.tmp");
+        let result = async {
+            tokio::fs::write(&tmp_path, &new_content).await?;
+            tokio::fs::rename(&tmp_path, path).await?;
+            Ok::<_, std::io::Error>(())
+        }.await;
+
+        if let Err(e) = result {
+            tracing::warn!(path = %path.display(), error = %e, "request log cleanup write failed");
+            pause.store(false, Ordering::Relaxed);
+            return (0, 0);
+        }
+    }
+
+    pause.store(false, Ordering::Relaxed);
+    (kept, removed)
+}
+
+/// Spawn a task that cleans old request log entries once daily at a fixed time (03:00 UTC).
+pub fn spawn_request_log_cleanup(path: PathBuf, retention_days: u64, pause: Arc<AtomicBool>) {
+    if retention_days == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            // Sleep until next 03:00 UTC.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let day_secs = 86_400;
+            let target_hour = 3;
+            let target_secs = target_hour * 3600;
+            let today_target = (now.as_secs() / day_secs as u64) * day_secs as u64 + target_secs as u64;
+            let next_target = if today_target > now.as_secs() { today_target } else { today_target + day_secs as u64 };
+            let wait_secs = next_target.saturating_sub(now.as_secs());
+            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+
+            let (kept, removed) = cleanup_request_log(&path, retention_days, &pause).await;
+            tracing::info!(
+                path = %path.display(),
+                kept,
+                removed,
+                retention_days,
+                "request log cleanup: {kept} kept, {removed} removed (>{retention_days}d)"
+            );
+        }
+    });
+}
+
+/// Spawn a task that checks monthly key usage reset daily at 03:05 UTC.
+pub fn spawn_monthly_reset_check(store: Arc<crate::storage::KeyStore>) {
+    tokio::spawn(async move {
+        loop {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let day_secs = 86_400;
+            let target_secs = 3 * 3600 + 300; // 03:05 UTC
+            let today_target = (now.as_secs() / day_secs as u64) * day_secs as u64 + target_secs as u64;
+            let next_target = if today_target > now.as_secs() { today_target } else { today_target + day_secs as u64 };
+            tokio::time::sleep(Duration::from_secs(next_target.saturating_sub(now.as_secs()))).await;
+
+            if let Err(e) = store.check_monthly_reset() {
+                tracing::warn!("monthly usage reset failed: {e}");
+            }
+        }
+    });
 }
 
 #[inline]
