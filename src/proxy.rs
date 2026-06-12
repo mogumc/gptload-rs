@@ -630,6 +630,7 @@ async fn forward(
         0,
     );
     log_ctx.is_stream = Some(stream_request);
+    log_ctx.billing_key = Some(billing_key.clone());
 
     let Some(mut model) = model else {
         return logged_json_error(
@@ -1267,9 +1268,7 @@ fn sanitize_log_headers(
     let mut out = std::collections::BTreeMap::new();
     for (name, value) in headers.iter() {
         let key = name.as_str().to_ascii_lowercase();
-        // Billing key is stored separately in RequestLogEntry.billing_key — keep headers visible.
-        // Only redact proxy/admin/export tokens.
-        if key.contains("proxy-token") || key.contains("admin-token") || key.contains("export-token") {
+        if key == "authorization" || key == "x-api-key" || key.contains("token") {
             out.insert(key, "<redacted>".to_string());
         } else if let Ok(v) = value.to_str() {
             out.insert(key, v.chars().take(512).collect());
