@@ -86,25 +86,6 @@ impl Drop for QueueGuard<'_> {
     }
 }
 
-/// RAII guard: decrements `requests_inflight` on drop.
-/// Survives future cancellation — Drop always runs.
-pub struct InflightGuard<'a> {
-    counter: &'a AtomicU64,
-}
-
-impl<'a> InflightGuard<'a> {
-    pub fn enter(counter: &'a AtomicU64) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
-        Self { counter }
-    }
-}
-
-impl Drop for InflightGuard<'_> {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 /// RAII guard: decrements a key's `active_requests` on drop.
 pub struct KeyGuard {
     key: Arc<KeyState>,

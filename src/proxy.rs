@@ -3,7 +3,7 @@ use crate::billing::ReserveResult;
 use crate::config::UpstreamFormat;
 use crate::format::{self, AuthStyle};
 use crate::state::{
-    sanitize_hop_headers, InflightGuard, KeyGuard, RequestLogEntry, RouterState, Selected, HDR_AUTHORIZATION,
+    sanitize_hop_headers, KeyGuard, RequestLogEntry, RouterState, Selected, HDR_AUTHORIZATION,
 };
 use crate::util::now_ms;
 use flate2::{Decompress, FlushDecompress, Status};
@@ -22,6 +22,43 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
 
 static REQUEST_LOG_ID: AtomicU64 = AtomicU64::new(1);
+
+/// RAII guard: tracks inflight count and request latency.
+/// For streaming responses, moved into the spawned body-consumption task
+/// so the inflight counter stays accurate until the stream finishes.
+struct RequestLifecycle {
+    state: Arc<RouterState>,
+    start: Instant,
+    active: bool,
+}
+
+impl RequestLifecycle {
+    fn start(state: Arc<RouterState>) -> Self {
+        state.stats.requests_total.fetch_add(1, Ordering::Relaxed);
+        state.stats.requests_inflight.fetch_add(1, Ordering::Relaxed);
+        Self {
+            state,
+            start: Instant::now(),
+            active: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.active {
+            return;
+        }
+        let dur = self.start.elapsed();
+        self.state.record_latency(dur.as_nanos() as u64);
+        self.state.stats.requests_inflight.fetch_sub(1, Ordering::Relaxed);
+        self.active = false;
+    }
+}
+
+impl Drop for RequestLifecycle {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
 
 /// Resolve the real client IP from headers set by reverse proxies (nginx, etc.).
 ///
@@ -254,15 +291,9 @@ async fn handle_inner(
     };
     base_log_ctx.billing_key = Some(billing_key.clone());
 
-    // Stats: request start (only /v1 paths).
-    if path.starts_with("/v1") {
-        state
-            .stats
-            .requests_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    let _inflight = InflightGuard::enter(&state.stats.requests_inflight);
-    let t0 = Instant::now();
+    // Stats: request start. The guard is moved into proxied response streams
+    // so streaming requests stay inflight until the body finishes or is dropped.
+    let lifecycle = RequestLifecycle::start(state.clone());
 
     let resp =
         if req.method() == hyper::Method::GET && (path == "/v1/models" || path == "/v1/models/") {
@@ -279,6 +310,7 @@ async fn handle_inner(
             forward(
                 req,
                 state.clone(),
+                lifecycle,
                 start,
                 client_ip,
                 method,
@@ -287,11 +319,6 @@ async fn handle_inner(
             )
             .await
         };
-
-    // Stats: latency + inflight.
-    let dur = t0.elapsed();
-    state.record_latency(dur.as_nanos() as u64);
-    // _inflight dropped here → fetch_sub
 
     resp
     }
@@ -320,6 +347,7 @@ async fn execute_attempt(
     billing_key: &str,
     log_ctx: &RequestLogContext,
     stream_request: bool,
+    lifecycle: &mut Option<RequestLifecycle>,
 ) -> AttemptResult {
     let now = now_ms();
     let attempt_start = Instant::now();
@@ -456,6 +484,7 @@ async fn execute_attempt(
                 log_ctx.clone(),
                 stream_request,
                 Some(billing_key.to_string()),
+                lifecycle.take(),
             )
             .await)
         }
@@ -566,6 +595,7 @@ fn is_allowed_api_path(path: &str) -> bool {
 async fn forward(
     req: Request<Body>,
     state: Arc<RouterState>,
+    lifecycle: RequestLifecycle,
     start: Instant,
     client_ip: String,
     method: hyper::Method,
@@ -580,6 +610,8 @@ async fn forward(
             "unsupported_endpoint",
         );
     }
+
+    let mut lifecycle = Some(lifecycle);
 
     let (parts, body) = req.into_parts();
 
@@ -746,6 +778,7 @@ async fn forward(
             &billing_key,
             &log_ctx_c,
             stream_request,
+            &mut lifecycle,
         )
         .await;
 
@@ -1117,6 +1150,7 @@ async fn proxy_upstream_response(
     log_ctx: RequestLogContext,
     stream_request: bool,
     billing_key: Option<String>,
+    lifecycle: Option<RequestLifecycle>,
 ) -> Response<Body> {
     let (mut parts, body) = up_resp.into_parts();
     sanitize_hop_headers(&mut parts.headers);
@@ -1163,6 +1197,7 @@ async fn proxy_upstream_response(
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, io::Error>>(32);
     tokio::spawn(async move {
+        let _lifecycle = lifecycle;
         use hyper::body::HttpBody;
         const MAX_SSE_BUF_BYTES: usize = 2 * 1024 * 1024;
 
