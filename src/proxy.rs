@@ -463,7 +463,8 @@ async fn execute_attempt(
                 log_ctx.clone(),
                 stream_request,
                 Some(billing_key.to_string()),
-            ))
+            )
+            .await)
         }
         Ok(Err(_e)) => {
             sel.key
@@ -1059,7 +1060,7 @@ fn should_retry_status(state: &RouterState, status: http::StatusCode) -> bool {
         || state.should_retry_status(status)
 }
 
-fn proxy_upstream_response(
+async fn proxy_upstream_response(
     up_resp: Response<Body>,
     state: Arc<RouterState>,
     log_ctx: RequestLogContext,
@@ -1081,32 +1082,40 @@ fn proxy_upstream_response(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let is_event_stream = content_type.starts_with("text/event-stream");
-    let want_sse_usage = stream_request && is_event_stream;
-    let want_json_usage =
-        !stream_request || (content_type.starts_with("application/json") && !want_sse_usage);
-    let want_usage = want_sse_usage || want_json_usage;
+    // ── Non-streaming: read body synchronously, extract usage, bill, return ──
+    if !stream_request {
+        let resp_bytes = read_and_bill_body(
+            body,
+            content_type,
+            content_encoding,
+            status,
+            &state,
+            &log_ctx,
+            billing_key.as_deref(),
+        )
+        .await;
 
-    let mut decoder = if want_usage && content_encoding.contains("gzip") {
-        Some(GzipDecoder::new())
-    } else {
-        None
-    };
+        let body = Body::from(resp_bytes.clone());
+        if let Ok(v) = http::HeaderValue::from_str(&resp_bytes.len().to_string()) {
+            parts.headers.insert(CONTENT_LENGTH, v);
+        }
+        // remove content-encoding since we decompressed if needed
+        parts.headers.remove(CONTENT_ENCODING);
+        return Response::from_parts(parts, body);
+    }
+
+    // ── Streaming: spawn task to forward chunks and extract SSE usage ──
+    let is_event_stream = content_type.starts_with("text/event-stream");
+    let want_sse_usage = is_event_stream;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, io::Error>>(32);
     tokio::spawn(async move {
         use hyper::body::HttpBody;
-        const MAX_PARSE_BYTES: usize = 32 * 1024 * 1024;
         const MAX_SSE_BUF_BYTES: usize = 2 * 1024 * 1024;
-        const MAX_DECOMPRESSED_BYTES: usize = 128 * 1024 * 1024;
 
         let mut resp_bytes = 0usize;
         let mut usage: Option<UsageTokens> = None;
-        let mut parse_enabled = want_usage;
         let mut sse_buf = String::new();
-        let mut json_buf: Vec<u8> = Vec::new();
-        let mut json_overflow = false;
-        let mut decompressed_bytes = 0usize;
 
         let mut body = body;
         while let Some(chunk) = body.data().await {
@@ -1116,56 +1125,18 @@ fn proxy_upstream_response(
                     if tx.send(Ok(chunk.clone())).await.is_err() {
                         break;
                     }
-
-                    if !parse_enabled || usage.is_some() {
+                    if !want_sse_usage || usage.is_some() {
                         continue;
                     }
-
-                    let parse_bytes = if let Some(dec) = decoder.as_mut() {
-                        match dec.decompress_chunk(&chunk) {
-                            Ok(out) => out,
-                            Err(_) => {
-                                parse_enabled = false;
-                                Vec::new()
-                            }
-                        }
-                    } else {
-                        chunk.to_vec()
-                    };
-
-                    if parse_bytes.is_empty() {
+                    if sse_buf.len().saturating_add(chunk.len()) > MAX_SSE_BUF_BYTES {
                         continue;
                     }
-
-                    if decompressed_bytes.saturating_add(parse_bytes.len()) > MAX_DECOMPRESSED_BYTES
-                    {
-                        parse_enabled = false;
-                        continue;
-                    }
-                    decompressed_bytes = decompressed_bytes.saturating_add(parse_bytes.len());
-
-                    if want_sse_usage {
-                        if sse_buf.len().saturating_add(parse_bytes.len()) > MAX_SSE_BUF_BYTES {
-                            parse_enabled = false;
-                            continue;
-                        }
-                        if let Some(found) = parse_sse_usage(&mut sse_buf, &parse_bytes) {
-                            usage = Some(found);
-                        }
-                    } else if want_json_usage && !json_overflow {
-                        if json_buf.len().saturating_add(parse_bytes.len()) > MAX_PARSE_BYTES {
-                            json_overflow = true;
-                            continue;
-                        }
-                        json_buf.extend_from_slice(&parse_bytes);
+                    if let Some(found) = parse_sse_usage(&mut sse_buf, &chunk) {
+                        usage = Some(found);
                     }
                 }
                 Err(_) => break,
             }
-        }
-
-        if usage.is_none() && want_json_usage && !json_overflow {
-            usage = usage_from_json_bytes(&json_buf);
         }
 
         if let Some(key) = billing_key.as_deref() {
@@ -1175,11 +1146,11 @@ fn proxy_upstream_response(
                 let _ = state.billing.settle_reserved_usage(
                     key, found.prompt, found.completion, model, model_costs,
                 );
-                let cost = crate::billing::compute_credit_cost(found.prompt, found.completion, model, model_costs);
                 state.stats.prompt_tokens_total.fetch_add(found.prompt, std::sync::atomic::Ordering::Relaxed);
                 state.stats.completion_tokens_total.fetch_add(found.completion, std::sync::atomic::Ordering::Relaxed);
                 state.stats.thought_tokens_total.fetch_add(found.thought, std::sync::atomic::Ordering::Relaxed);
                 state.stats.tokens_total.fetch_add(found.total, std::sync::atomic::Ordering::Relaxed);
+                let cost = crate::billing::compute_credit_cost(found.prompt, found.completion, model, model_costs);
                 let _ = state.store.add_key_usage(key, found.total, cost);
             } else {
                 let _ = state.billing.release_reservation(key);
@@ -1189,6 +1160,88 @@ fn proxy_upstream_response(
     });
 
     Response::from_parts(parts, Body::wrap_stream(ReceiverStream::new(rx)))
+}
+
+/// Read non-streaming body, extract usage, bill. Returns the raw body bytes.
+async fn read_and_bill_body(
+    body: Body,
+    content_type: &str,
+    content_encoding: &str,
+    status: http::StatusCode,
+    state: &Arc<RouterState>,
+    log_ctx: &RequestLogContext,
+    billing_key: Option<&str>,
+) -> Vec<u8> {
+    use hyper::body::HttpBody;
+    const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+    let mut raw = Vec::new();
+    let mut body = body;
+    let mut overflow = false;
+    while let Some(chunk) = body.data().await {
+        match chunk {
+            Ok(chunk) => {
+                if raw.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
+                    overflow = true;
+                    continue;
+                }
+                raw.extend_from_slice(&chunk);
+            }
+            Err(_) => break,
+        }
+    }
+
+    let resp_bytes = raw.len();
+
+    // Only parse usage for /v1/chat/completions with 200 status.
+    let should_bill = status == http::StatusCode::OK
+        && content_type.starts_with("application/json")
+        && (log_ctx.path.starts_with("/v1/chat/completions")
+            || log_ctx.path.starts_with("/v1/completions"));
+
+    let usage = if should_bill && !overflow {
+        let body_for_parse = if content_encoding.contains("gzip") {
+            match decompress_gzip(&raw) {
+                Ok(decompressed) => decompressed,
+                Err(_) => Vec::new(),
+            }
+        } else {
+            raw.clone()
+        };
+        if !body_for_parse.is_empty() {
+            usage_from_json_bytes(&body_for_parse)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(key) = billing_key {
+        if let Some(found) = usage {
+            let model_costs = &state.runtime.load_full().model_costs;
+            let model = log_ctx.billing_model.as_deref().unwrap_or("");
+            let _ = state.billing.settle_reserved_usage(
+                key, found.prompt, found.completion, model, model_costs,
+            );
+            let cost = crate::billing::compute_credit_cost(found.prompt, found.completion, model, model_costs);
+            state.stats.prompt_tokens_total.fetch_add(found.prompt, std::sync::atomic::Ordering::Relaxed);
+            state.stats.completion_tokens_total.fetch_add(found.completion, std::sync::atomic::Ordering::Relaxed);
+            state.stats.thought_tokens_total.fetch_add(found.thought, std::sync::atomic::Ordering::Relaxed);
+            state.stats.tokens_total.fetch_add(found.total, std::sync::atomic::Ordering::Relaxed);
+            let _ = state.store.add_key_usage(key, found.total, cost);
+        } else {
+            let _ = state.billing.release_reservation(key);
+        }
+    }
+    record_request(state, log_ctx, status.as_u16(), resp_bytes, usage);
+
+    raw
+}
+
+fn decompress_gzip(input: &[u8]) -> Result<Vec<u8>, io::Error> {
+    let mut decoder = GzipDecoder::new();
+    decoder.decompress_chunk(input)
 }
 
 fn parse_retry_after_ms(value: Option<&http::HeaderValue>) -> Option<u64> {
