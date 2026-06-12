@@ -783,6 +783,15 @@ impl RouterState {
     /// `billing_key_level`: the request user's billing key permission level.
     /// -1 = admin (no restriction). Returns None if no upstream+key is eligible.
     pub fn select_for_model(&self, model: &str, billing_key_level: i32, _now_ms: u64) -> Option<Selected> {
+        self.select_for_model_excluding(model, billing_key_level, None)
+    }
+
+    pub fn select_for_model_excluding(
+        &self,
+        model: &str,
+        billing_key_level: i32,
+        exclude: Option<(&str, &str)>,
+    ) -> Option<Selected> {
         if self.is_shutting_down() {
             return None;
         }
@@ -815,7 +824,10 @@ impl RouterState {
                 global_max
             };
 
-            if let Some(k) = u.select_key(max, u.min_key_level) {
+            let excluded_key = exclude
+                .and_then(|(upstream_id, key)| (upstream_id == u.id.as_ref()).then_some(key));
+
+            if let Some(k) = u.select_key(max, u.min_key_level, excluded_key) {
                 self.stats
                     .upstream_selected_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -1073,6 +1085,7 @@ impl RouterState {
                                 key.failure_count.store(0, Ordering::Relaxed);
                                 key.status.store(KEY_STATUS_ACTIVE, Ordering::Relaxed);
                                 upstream.rebuild_active_keys();
+                                state.queue_notify.notify_waiters();
                                 total_restored += 1;
                                 tracing::info!(
                                     key = %key.key,
@@ -1190,7 +1203,7 @@ impl Upstream {
     /// Select an active key via atomic round-robin, skipping keys at their
     /// concurrency limit and keys in 429 cooldown. Returns None if no active
     /// keys available.
-    fn select_key(&self, max_concurrent: u32, min_level: i32) -> Option<Arc<KeyState>> {
+    fn select_key(&self, max_concurrent: u32, min_level: i32, exclude_key: Option<&str>) -> Option<Arc<KeyState>> {
         let keys = self.active_keys.load_full();
         let n = keys.len();
         if n == 0 {
@@ -1201,7 +1214,10 @@ impl Upstream {
         for i in 0..n {
             let idx = (start + i) % n;
             let k = &keys[idx];
-            // Skip keys in 429 cooldown.
+            // Skip excluded key (for retries).
+            if exclude_key.is_some_and(|excluded| excluded == k.key.as_ref()) {
+                continue;
+            }
             let until = k.cooldown_until_ms.load(Ordering::Relaxed);
             if until > 0 && now < until {
                 continue;

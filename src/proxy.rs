@@ -427,10 +427,9 @@ async fn execute_attempt(
             let should_retry = should_retry_status(state, status);
 
             if should_retry {
-                let now = now_ms();
                 let billing_key_level = state.store.get_key_level(billing_key);
                 if let Some(new_sel) =
-                    state.select_for_model(&log_ctx.model.clone().unwrap_or_default(), billing_key_level, now)
+                    state.select_for_model_excluding(&log_ctx.model.clone().unwrap_or_default(), billing_key_level, Some((&sel.upstream.id, &sel.key.key)))
                 {
                     drop(up_resp);
                     tracing::debug!(
@@ -467,7 +466,7 @@ async fn execute_attempt(
 
             let billing_key_level = state.store.get_key_level(billing_key);
             if let Some(new_sel) =
-                state.select_for_model(&log_ctx.model.clone().unwrap_or_default(), billing_key_level, now)
+                state.select_for_model_excluding(&log_ctx.model.clone().unwrap_or_default(), billing_key_level, Some((&sel.upstream.id, &sel.key.key)))
             {
                 tracing::debug!(
                     old_upstream = %sel.upstream.id,
@@ -497,7 +496,7 @@ async fn execute_attempt(
 
             let billing_key_level = state.store.get_key_level(billing_key);
             if let Some(new_sel) =
-                state.select_for_model(&log_ctx.model.clone().unwrap_or_default(), billing_key_level, now)
+                state.select_for_model_excluding(&log_ctx.model.clone().unwrap_or_default(), billing_key_level, Some((&sel.upstream.id, &sel.key.key)))
             {
                 tracing::debug!(
                     old_upstream = %sel.upstream.id,
