@@ -701,13 +701,14 @@ fn gemini_json_to_openai(v: &serde_json::Value, model: Option<String>) -> serde_
         .and_then(|u| u.get("thoughtsTokenCount"))
         .and_then(|n| n.as_u64())
         .unwrap_or(0);
-    // completion_tokens = candidates + thoughts, treating all output as "completion".
-    let completion = candidates.saturating_add(thought);
+    // completion_tokens = candidates only (visible output).
+    // thought_tokens tracked separately; billing layer sums them via UsageTokens::billing_completion().
+    let completion = candidates;
     let total = v
         .get("usageMetadata")
         .and_then(|u| u.get("totalTokenCount"))
         .and_then(|n| n.as_u64())
-        .unwrap_or(prompt + completion);
+        .unwrap_or(prompt + completion + thought);
     let mut resp = chat_completion_json("chatcmpl-gemini", &model, content, prompt, completion);
     resp["usage"]["thought_tokens"] = serde_json::json!(thought);
     resp["usage"]["total_tokens"] = serde_json::json!(total);
@@ -1016,7 +1017,7 @@ mod tests {
         let converted = gemini_json_to_openai(&gemini_resp, Some("gemini-2.0-flash".to_string()));
 
         assert_eq!(converted["usage"]["prompt_tokens"], 15);
-        assert_eq!(converted["usage"]["completion_tokens"], 30); // 25 + 5 thoughts
+        assert_eq!(converted["usage"]["completion_tokens"], 25); // candidates only
         assert_eq!(converted["usage"]["thought_tokens"], 5);
         assert_eq!(converted["usage"]["total_tokens"], 45);
 
@@ -1026,7 +1027,7 @@ mod tests {
             serde_json::from_str(&serialized).expect("should parse serialized JSON");
 
         assert_eq!(parsed["usage"]["prompt_tokens"], 15);
-        assert_eq!(parsed["usage"]["completion_tokens"], 30);
+        assert_eq!(parsed["usage"]["completion_tokens"], 25);
         assert_eq!(parsed["usage"]["thought_tokens"], 5);
         assert_eq!(parsed["usage"]["total_tokens"], 45);
     }
