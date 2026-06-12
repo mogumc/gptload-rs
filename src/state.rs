@@ -772,12 +772,7 @@ impl RouterState {
                 global_max
             };
 
-            if let Some(k) = u.select_key(max) {
-                // Key level check: -1 = admin (pass always); otherwise need level >= upstream min.
-                let key_level = k.level.load(Ordering::Relaxed);
-                if key_level != -1 && key_level < u.min_key_level {
-                    continue;
-                }
+            if let Some(k) = u.select_key(max, u.min_key_level) {
                 self.stats
                     .upstream_selected_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -1152,7 +1147,7 @@ impl Upstream {
     /// Select an active key via atomic round-robin, skipping keys at their
     /// concurrency limit and keys in 429 cooldown. Returns None if no active
     /// keys available.
-    fn select_key(&self, max_concurrent: u32) -> Option<Arc<KeyState>> {
+    fn select_key(&self, max_concurrent: u32, min_level: i32) -> Option<Arc<KeyState>> {
         let keys = self.active_keys.load_full();
         let n = keys.len();
         if n == 0 {
@@ -1176,9 +1171,14 @@ impl Upstream {
             if max_concurrent > 0 && k.active_requests.load(Ordering::Relaxed) >= max_concurrent {
                 continue;
             }
+            // Skip keys below required level. -1 = admin (passes any level).
+            let key_level = k.level.load(Ordering::Relaxed);
+            if key_level != -1 && key_level < min_level {
+                continue;
+            }
             return Some(k.clone());
         }
-        // All keys at limit or in cooldown — return None to signal backpressure.
+        // All keys at limit, in cooldown, or below required level.
         None
     }
 
