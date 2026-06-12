@@ -1141,6 +1141,9 @@ async fn proxy_upstream_response(
         }
 
         if let Some(key) = billing_key.as_deref() {
+            let is_chat = log_ctx.path.starts_with("/v1/chat/completions")
+                || log_ctx.path.starts_with("/v1/completions");
+            let is_2xx = status.is_success();
             if let Some(found) = usage {
                 let model_costs = &state.runtime.load_full().model_costs;
                 let model = log_ctx.billing_model.as_deref().unwrap_or("");
@@ -1153,7 +1156,9 @@ async fn proxy_upstream_response(
                 state.stats.tokens_total.fetch_add(found.total, std::sync::atomic::Ordering::Relaxed);
                 let cost = crate::billing::compute_credit_cost(found.prompt, found.completion, model, model_costs);
                 let _ = state.store.add_key_usage(key, found.total, cost);
-            } else {
+            } else if !is_chat || !is_2xx {
+                // Only refund for non-chat-completion or non-2xx streams.
+                // Chat completions 2xx: keep reservation even if no SSE usage was parsed.
                 let _ = state.billing.release_reservation(key);
             }
         }
@@ -1194,13 +1199,12 @@ async fn read_and_bill_body(
 
     let resp_bytes = raw.len();
 
-    // Only parse usage for /v1/chat/completions with 200 status.
-    let should_bill = status == http::StatusCode::OK
-        && content_type.starts_with("application/json")
-        && (log_ctx.path.starts_with("/v1/chat/completions")
-            || log_ctx.path.starts_with("/v1/completions"));
+    let is_chat = log_ctx.path.starts_with("/v1/chat/completions")
+        || log_ctx.path.starts_with("/v1/completions");
+    let is_2xx = status.is_success();
 
-    let usage = if should_bill && !overflow {
+    // Only parse usage for /v1/chat/completions 2xx with JSON body.
+    let usage = if is_chat && is_2xx && !overflow && content_type.starts_with("application/json") {
         let body_for_parse = if content_encoding.contains("gzip") {
             match decompress_gzip(&raw) {
                 Ok(decompressed) => decompressed,
@@ -1231,9 +1235,12 @@ async fn read_and_bill_body(
             state.stats.thought_tokens_total.fetch_add(found.thought, std::sync::atomic::Ordering::Relaxed);
             state.stats.tokens_total.fetch_add(found.total, std::sync::atomic::Ordering::Relaxed);
             let _ = state.store.add_key_usage(key, found.total, cost);
-        } else {
+        } else if !is_chat || !is_2xx {
+            // Only refund for non-chat-completion or non-2xx paths.
+            // Chat completions 2xx: keep reservation (minimum 1 credit) even if usage is absent.
             let _ = state.billing.release_reservation(key);
         }
+        // else: is_chat && is_2xx && usage is None → reservation retained → min 1 credit charge
     }
     record_request(state, log_ctx, status.as_u16(), resp_bytes, usage);
 
