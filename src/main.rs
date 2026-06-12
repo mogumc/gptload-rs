@@ -21,10 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::Layer;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -202,17 +199,12 @@ async fn wait_shutdown_signal() {
 }
 
 fn init_tracing() -> anyhow::Result<()> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-
-    let fmt_layer = tracing_subscriber::fmt::layer()
+    let log_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(log_filter)
         .with_target(false)
         .with_level(true)
-        .with_filter(filter);
-
-    tracing_subscriber::registry()
-        .with(fmt_layer)
         .init();
-
     Ok(())
 }
 
