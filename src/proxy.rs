@@ -1085,7 +1085,7 @@ async fn proxy_upstream_response(
 
     // ── Non-streaming: read body synchronously, extract usage, bill, return ──
     if !stream_request {
-        let resp_bytes = read_and_bill_body(
+        let (resp_bytes, was_decompressed) = read_and_bill_body(
             body,
             content_type,
             content_encoding,
@@ -1096,12 +1096,14 @@ async fn proxy_upstream_response(
         )
         .await;
 
-        let body = Body::from(resp_bytes.clone());
-        if let Ok(v) = http::HeaderValue::from_str(&resp_bytes.len().to_string()) {
+        let body_len = resp_bytes.len();
+        let body = Body::from(resp_bytes);
+        if let Ok(v) = http::HeaderValue::from_str(&body_len.to_string()) {
             parts.headers.insert(CONTENT_LENGTH, v);
         }
-        // remove content-encoding since we decompressed if needed
-        parts.headers.remove(CONTENT_ENCODING);
+        if was_decompressed {
+            parts.headers.remove(CONTENT_ENCODING);
+        }
         return Response::from_parts(parts, body);
     }
 
@@ -1166,7 +1168,8 @@ async fn proxy_upstream_response(
     Response::from_parts(parts, Body::wrap_stream(ReceiverStream::new(rx)))
 }
 
-/// Read non-streaming body, extract usage, bill. Returns the raw body bytes.
+/// Read non-streaming body, extract usage, bill.
+/// Returns (body_bytes, was_decompressed). If gzip, body is decompressed.
 async fn read_and_bill_body(
     body: Body,
     content_type: &str,
@@ -1175,9 +1178,9 @@ async fn read_and_bill_body(
     state: &Arc<RouterState>,
     log_ctx: &RequestLogContext,
     billing_key: Option<&str>,
-) -> Vec<u8> {
+) -> (Vec<u8>, bool) {
     use hyper::body::HttpBody;
-    const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+    const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
     let mut raw = Vec::new();
     let mut body = body;
@@ -1195,7 +1198,19 @@ async fn read_and_bill_body(
         }
     }
 
-    let resp_bytes = raw.len();
+    let is_gzip = content_encoding.contains("gzip");
+
+    // If gzip, decompress the response body for the client AND for usage parsing.
+    let (out_bytes, was_decompressed) = if is_gzip {
+        match decompress_gzip(&raw) {
+            Ok(decompressed) => (decompressed, true),
+            Err(_) => (raw, false), // decompression failed, return raw as-is
+        }
+    } else {
+        (raw, false)
+    };
+
+    let resp_bytes = out_bytes.len();
 
     let is_chat = log_ctx.path.starts_with("/v1/chat/completions")
         || log_ctx.path.starts_with("/v1/completions");
@@ -1203,16 +1218,8 @@ async fn read_and_bill_body(
 
     // Only parse usage for /v1/chat/completions 2xx with JSON body.
     let usage = if is_chat && is_2xx && !overflow && content_type.starts_with("application/json") {
-        let body_for_parse = if content_encoding.contains("gzip") {
-            match decompress_gzip(&raw) {
-                Ok(decompressed) => decompressed,
-                Err(_) => Vec::new(),
-            }
-        } else {
-            raw.clone()
-        };
-        if !body_for_parse.is_empty() {
-            usage_from_json_bytes(&body_for_parse)
+        if !out_bytes.is_empty() {
+            usage_from_json_bytes(&out_bytes)
         } else {
             None
         }
@@ -1240,7 +1247,7 @@ async fn read_and_bill_body(
     }
     record_request(state, log_ctx, status.as_u16(), resp_bytes, usage);
 
-    raw
+    (out_bytes, was_decompressed)
 }
 
 fn decompress_gzip(input: &[u8]) -> Result<Vec<u8>, io::Error> {
