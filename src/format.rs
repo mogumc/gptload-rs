@@ -342,13 +342,61 @@ fn content_to_anthropic_blocks(content: &serde_json::Value) -> serde_json::Value
     }
 }
 
+/// Binary data extracted from an OpenAI multimodal content part.
+struct BinaryAttachment {
+    mime: String,
+    data: String,
+}
+
+/// Extract binary data from an OpenAI content part (image_url / input_audio / file).
+/// Handles data URI parsing, size checks, and MIME inference.
+/// `provider` is used for warn logs ("anthropic" or "gemini").
+fn extract_binary_attachment(part: &serde_json::Value, provider: &str) -> Option<BinaryAttachment> {
+    let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+    match part_type {
+        "image_url" => {
+            let url = part.get("image_url").and_then(|u| u.get("url")).and_then(|u| u.as_str());
+            let url = match url {
+                Some(u) => u,
+                None => return None,
+            };
+            match parse_data_uri(url, MAX_DECODED_BYTES) {
+                Some((mime, data)) => Some(BinaryAttachment { mime, data }),
+                None => {
+                    tracing::warn!(%url, "{provider}: image_url dropped (data URI parse failed or exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+                    None
+                }
+            }
+        }
+        "input_audio" => {
+            let audio = part.get("input_audio")?;
+            let data = audio.get("data").and_then(|d| d.as_str()).unwrap_or("");
+            let format = audio.get("format").and_then(|f| f.as_str()).unwrap_or("wav");
+            if data.len() > MAX_DECODED_BYTES {
+                tracing::warn!(data_len = data.len(), format, "{provider}: input_audio dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+                return None;
+            }
+            Some(BinaryAttachment { mime: format!("audio/{}", format), data: data.to_string() })
+        }
+        "file" => {
+            let file = part.get("file")?;
+            let file_data = file.get("file_data").and_then(|d| d.as_str()).unwrap_or("");
+            let filename = file.get("filename").and_then(|f| f.as_str()).unwrap_or("");
+            if file_data.len() > MAX_DECODED_BYTES {
+                tracing::warn!(data_len = file_data.len(), %filename, "{provider}: file dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+                return None;
+            }
+            Some(BinaryAttachment { mime: mime_from_filename(filename), data: file_data.to_string() })
+        }
+        _ => None,
+    }
+}
+
 /// Convert a single OpenAI content part to an Anthropic block.
-/// Handles: text, image_url, input_audio, file.
-/// Files/audio become Anthropic `document` blocks.
 fn openai_part_to_anthropic(part: &serde_json::Value) -> Option<serde_json::Value> {
     let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-    // Plain text ("text" or nested "content")
     let text = part
         .get("text")
         .and_then(|t| t.as_str())
@@ -359,57 +407,19 @@ fn openai_part_to_anthropic(part: &serde_json::Value) -> Option<serde_json::Valu
         }
     }
 
-    // Image: data URI
-    if part_type == "image_url" {
-        if let Some(url) = part.get("image_url").and_then(|u| u.get("url")).and_then(|u| u.as_str()) {
-            if let Some((mime, data)) = parse_data_uri(url, MAX_DECODED_BYTES) {
-                return Some(serde_json::json!({
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": mime, "data": data}
-                }));
-            }
-        }
-        tracing::warn!(part_type, "anthropic: image_url dropped (data URI parse failed or exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
+    if let Some(att) = extract_binary_attachment(part, "anthropic") {
+        let block_type = if part_type == "image_url" { "image" } else { "document" };
+        return Some(serde_json::json!({
+            "type": block_type,
+            "source": {"type": "base64", "media_type": att.mime, "data": att.data}
+        }));
+    }
+    // If we got here and part_type was recognized (image/audio/file), the warn was logged by extract_binary_attachment.
+    if matches!(part_type, "image_url" | "input_audio" | "file") {
         return None;
     }
 
-    // Audio: base64 data + format → Anthropic document block
-    if part_type == "input_audio" {
-        if let Some(audio) = part.get("input_audio") {
-            let data = audio.get("data").and_then(|d| d.as_str()).unwrap_or("");
-            let format = audio.get("format").and_then(|f| f.as_str()).unwrap_or("wav");
-            if data.len() > MAX_DECODED_BYTES {
-                tracing::warn!(data_len = data.len(), format, "anthropic: input_audio dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
-                return None;
-            }
-            let mime = format!("audio/{}", format);
-            return Some(serde_json::json!({
-                "type": "document",
-                "source": {"type": "base64", "media_type": mime, "data": data}
-            }));
-        }
-        return None;
-    }
-
-    // File: base64 data + filename → Anthropic document block
-    if part_type == "file" {
-        if let Some(file) = part.get("file") {
-            let file_data = file.get("file_data").and_then(|d| d.as_str()).unwrap_or("");
-            let filename = file.get("filename").and_then(|f| f.as_str()).unwrap_or("");
-            if file_data.len() > MAX_DECODED_BYTES {
-                tracing::warn!(data_len = file_data.len(), %filename, "anthropic: file dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
-                return None;
-            }
-            let mime = mime_from_filename(filename);
-            return Some(serde_json::json!({
-                "type": "document",
-                "source": {"type": "base64", "media_type": mime, "data": file_data}
-            }));
-        }
-        return None;
-    }
-
-    // Fallback: plain text (when type field is absent)
+    // Fallback: plain text
     if let Some(s) = text {
         if s.len() > MAX_DECODED_BYTES {
             tracing::warn!(text_len = s.len(), "anthropic: fallback text block dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
@@ -448,7 +458,6 @@ fn content_to_gemini_parts(content: &serde_json::Value) -> Vec<serde_json::Value
 }
 
 /// Convert a single OpenAI content part to a Gemini part.
-/// Handles: text, image_url, input_audio, file.
 fn openai_part_to_gemini(part: &serde_json::Value) -> Option<serde_json::Value> {
     let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
@@ -462,44 +471,10 @@ fn openai_part_to_gemini(part: &serde_json::Value) -> Option<serde_json::Value> 
         }
     }
 
-    // Image: data URI → Gemini inlineData
-    if part_type == "image_url" {
-        if let Some(url) = part.get("image_url").and_then(|u| u.get("url")).and_then(|u| u.as_str()) {
-            if let Some((mime, data)) = parse_data_uri(url, MAX_DECODED_BYTES) {
-                return Some(serde_json::json!({"inlineData": {"mimeType": mime, "data": data}}));
-            }
-        }
-        tracing::warn!(part_type, "gemini: image_url dropped (data URI parse failed or exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
-        return None;
+    if let Some(att) = extract_binary_attachment(part, "gemini") {
+        return Some(serde_json::json!({"inlineData": {"mimeType": att.mime, "data": att.data}}));
     }
-
-    // Audio → Gemini inlineData
-    if part_type == "input_audio" {
-        if let Some(audio) = part.get("input_audio") {
-            let data = audio.get("data").and_then(|d| d.as_str()).unwrap_or("");
-            let format = audio.get("format").and_then(|f| f.as_str()).unwrap_or("wav");
-            if data.len() > MAX_DECODED_BYTES {
-                tracing::warn!(data_len = data.len(), format, "gemini: input_audio dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
-                return None;
-            }
-            let mime = format!("audio/{}", format);
-            return Some(serde_json::json!({"inlineData": {"mimeType": mime, "data": data}}));
-        }
-        return None;
-    }
-
-    // File → Gemini inlineData
-    if part_type == "file" {
-        if let Some(file) = part.get("file") {
-            let file_data = file.get("file_data").and_then(|d| d.as_str()).unwrap_or("");
-            let filename = file.get("filename").and_then(|f| f.as_str()).unwrap_or("");
-            if file_data.len() > MAX_DECODED_BYTES {
-                tracing::warn!(data_len = file_data.len(), %filename, "gemini: file dropped (exceeds {}MB)", MAX_DECODED_BYTES / 1024 / 1024);
-                return None;
-            }
-            let mime = mime_from_filename(filename);
-            return Some(serde_json::json!({"inlineData": {"mimeType": mime, "data": file_data}}));
-        }
+    if matches!(part_type, "image_url" | "input_audio" | "file") {
         return None;
     }
 
