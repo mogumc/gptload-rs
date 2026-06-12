@@ -552,6 +552,18 @@ async fn read_request_body(body: Body) -> Result<bytes::Bytes, Response<Body>> {
     Ok(bytes::Bytes::from(body_bytes))
 }
 
+/// OpenAI-compatible API paths that are allowed to be proxied to upstream.
+/// Any /v1/* path NOT in this list is rejected to avoid unbilled upstream charges.
+const ALLOWED_API_PATHS: &[&str] = &["/v1/chat/completions"];
+
+fn is_allowed_api_path(path: &str) -> bool {
+    if !path.starts_with("/v1/") {
+        return true; // non-API paths pass through (admin, web, health, etc.)
+    }
+    let normalized = path.trim_end_matches('/');
+    ALLOWED_API_PATHS.iter().any(|p| *p == normalized)
+}
+
 async fn forward(
     req: Request<Body>,
     state: Arc<RouterState>,
@@ -561,6 +573,15 @@ async fn forward(
     path: String,
     billing_key: String,
 ) -> Response<Body> {
+    // Reject unknown /v1/* paths — they would be proxied but NOT billed.
+    if !is_allowed_api_path(&path) {
+        return RouterState::json_error(
+            http::StatusCode::NOT_FOUND,
+            "endpoint not supported",
+            "unsupported_endpoint",
+        );
+    }
+
     let (parts, body) = req.into_parts();
 
     // Extract URI and method early (before moving parts)
