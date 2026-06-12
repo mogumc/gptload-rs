@@ -1156,9 +1156,12 @@ async fn proxy_upstream_response(
                 state.stats.tokens_total.fetch_add(found.total, std::sync::atomic::Ordering::Relaxed);
                 let cost = crate::billing::compute_credit_cost(found.prompt, found.completion, model, model_costs);
                 let _ = state.store.add_key_usage(key, found.total, cost);
-            } else if !is_chat || !is_2xx {
-                // Only refund for non-chat-completion or non-2xx streams.
-                // Chat completions 2xx: keep reservation even if no SSE usage was parsed.
+            } else if is_chat && is_2xx {
+                let model_costs = &state.runtime.load_full().model_costs;
+                let model = log_ctx.billing_model.as_deref().unwrap_or("");
+                let _ = state.billing.settle_reserved_usage(key, 0, 0, model, model_costs);
+                let _ = state.store.add_key_usage(key, 0, 1);
+            } else {
                 let _ = state.billing.release_reservation(key);
             }
         }
@@ -1235,12 +1238,16 @@ async fn read_and_bill_body(
             state.stats.thought_tokens_total.fetch_add(found.thought, std::sync::atomic::Ordering::Relaxed);
             state.stats.tokens_total.fetch_add(found.total, std::sync::atomic::Ordering::Relaxed);
             let _ = state.store.add_key_usage(key, found.total, cost);
-        } else if !is_chat || !is_2xx {
-            // Only refund for non-chat-completion or non-2xx paths.
-            // Chat completions 2xx: keep reservation (minimum 1 credit) even if usage is absent.
+        } else if is_chat && is_2xx {
+            // Chat completions 2xx with missing usage: settle at 0 tokens.
+            // compute_credit_cost enforces MIN_COST_MICRO=1 → net charge = 1 micro-credit.
+            let model_costs = &state.runtime.load_full().model_costs;
+            let model = log_ctx.billing_model.as_deref().unwrap_or("");
+            let _ = state.billing.settle_reserved_usage(key, 0, 0, model, model_costs);
+            let _ = state.store.add_key_usage(key, 0, 1);
+        } else {
             let _ = state.billing.release_reservation(key);
         }
-        // else: is_chat && is_2xx && usage is None → reservation retained → min 1 credit charge
     }
     record_request(state, log_ctx, status.as_u16(), resp_bytes, usage);
 
