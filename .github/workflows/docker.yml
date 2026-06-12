@@ -15,7 +15,7 @@ permissions:
   packages: write
 
 env:
-  BINARY_NAME: aequi
+  BINARY_NAME: gptload-rs
   REGISTRY: ghcr.io
   IMAGE_NAME: mogumc/aequi
 
