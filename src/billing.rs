@@ -15,6 +15,8 @@ pub const MICRO_PER_CREDIT: i64 = 1_000_000;
 pub const MAX_BALANCE_CREDITS: i64 = i64::MAX / MICRO_PER_CREDIT;
 /// Minimum charge: 1 micro-credit.
 const MIN_COST_MICRO: i64 = 1;
+/// Reservation amount in micro-credits: 1 µcredit as a light gate.
+const RESERVE_MICRO: i64 = 1;
 
 pub struct BillingStore {
     balances: Arc<RwLock<AHashMap<String, Arc<AtomicI64>>>>,
@@ -162,10 +164,10 @@ impl BillingStore {
             return ReserveResult::Reserved;
         }
         loop {
-            if cur < MICRO_PER_CREDIT {
+            if cur < RESERVE_MICRO {
                 return ReserveResult::Insufficient;
             }
-            let new_balance = cur.saturating_sub(MICRO_PER_CREDIT);
+            let new_balance = cur.saturating_sub(RESERVE_MICRO);
             match balance.compare_exchange(cur, new_balance, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => {
                     tracing::debug!(
@@ -201,14 +203,15 @@ impl BillingStore {
         if self.get_balance(key) == Some(-1) {
             return Some(-1);
         }
-        let result = self.adjust_balance(key, MICRO_PER_CREDIT);
+        let result = self.adjust_balance(key, RESERVE_MICRO);
         tracing::debug!(key, ?result, "billing: release key={key}");
         result
     }
 
     /// Settle reserved usage with model-aware credit calculation.
-    /// Cost = ceil((prompt_tokens × input_rate + completion_tokens × output_rate) / 1000).
-    /// Minimum cost is 1 credit.
+    /// `RESERVE_MICRO` was deducted on entry; settle the difference.
+    /// If cost > reserve: charge additional, clamped to 0 (no negative balance).
+    /// If cost < reserve: refund the over-deduction.
     pub fn settle_reserved_usage(
         &self,
         key: &str,
@@ -228,26 +231,47 @@ impl BillingStore {
         if cur == -1 {
             return Some(-1);
         }
-        // Cost is positive (micro-credits); reserve already deducted MICRO_PER_CREDIT.
-        // Net adjustment = MICRO_PER_CREDIT - cost
-        let adjustment = MICRO_PER_CREDIT.saturating_sub(cost);
-        loop {
-            let new_balance = cur.saturating_add(adjustment);
-            let clamped = if new_balance < 0 { 0 } else { new_balance };
-            match balance.compare_exchange(cur, clamped, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => {
-                    tracing::debug!(
-                        key, cur, new_balance, clamped, cost, adjustment,
-                        "billing: settle key={} cost={} cur={} adj={} → {clamped}",
-                        key, cost, cur, adjustment
-                    );
-                    let _ = self.persist_tx.send(PersistUpdate::Set {
-                        key: key.to_string(),
-                        balance: clamped,
-                    });
-                    return Some(clamped);
+
+        if cost > RESERVE_MICRO {
+            // Charge the difference (cost - reserve). Clamp to 0.
+            let extra = cost - RESERVE_MICRO;
+            loop {
+                let new_balance = cur.saturating_sub(extra);
+                let clamped = if new_balance < 0 { 0 } else { new_balance };
+                match balance.compare_exchange(cur, clamped, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => {
+                        tracing::debug!(
+                            key, cur, clamped, cost, extra,
+                            "billing: settle+charge key={key} cost={cost} extra={extra} {cur} → {clamped}"
+                        );
+                        let _ = self.persist_tx.send(PersistUpdate::Set {
+                            key: key.to_string(),
+                            balance: clamped,
+                        });
+                        return Some(clamped);
+                    }
+                    Err(v) => cur = v,
                 }
-                Err(v) => cur = v,
+            }
+        } else {
+            // Refund the over-deduction (reserve - cost).
+            let refund = RESERVE_MICRO - cost;
+            loop {
+                let new_balance = cur.saturating_add(refund);
+                match balance.compare_exchange(cur, new_balance, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => {
+                        tracing::debug!(
+                            key, cur, new_balance, cost, refund,
+                            "billing: settle+refund key={key} cost={cost} refund={refund} {cur} → {new_balance}"
+                        );
+                        let _ = self.persist_tx.send(PersistUpdate::Set {
+                            key: key.to_string(),
+                            balance: new_balance,
+                        });
+                        return Some(new_balance);
+                    }
+                    Err(v) => cur = v,
+                }
             }
         }
     }
