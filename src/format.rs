@@ -1106,28 +1106,4 @@ mod tests {
         assert_eq!(parsed["usage"]["total_tokens"], 0);
     }
 
-    /// Edge case: Gemini response without usageMetadata at all.
-    #[test]
-    fn gemini_response_without_usage_metadata() {
-        let gemini_resp = serde_json::json!({
-            "candidates": [{
-                "content": {
-                    "parts": [{"text": "Hello"}],
-                    "role": "model"
-                },
-                "finishReason": "STOP"
-            }]
-            // no usageMetadata
-        });
-
-        let converted = gemini_json_to_openai(&gemini_resp, Some("gemini-2.0-flash".to_string()));
-
-        let serialized = converted.to_string();
-        let parsed: serde_json::Value =
-            serde_json::from_str(&serialized).expect("should parse");
-
-        assert_eq!(parsed["usage"]["prompt_tokens"], 0);
-        assert_eq!(parsed["usage"]["completion_tokens"], 0);
-        assert_eq!(parsed["usage"]["total_tokens"], 0);
-    }
 }

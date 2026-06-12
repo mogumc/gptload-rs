@@ -1138,8 +1138,7 @@ async fn proxy_upstream_response(
         }
 
         if let Some(key) = billing_key.as_deref() {
-            let is_billable = log_ctx.path.starts_with("/v1/")
-                && !log_ctx.path.starts_with("/v1/models");
+            let is_billable = log_ctx.path.starts_with("/v1/chat/completions");
             let is_2xx = status.is_success();
             if let Some(found) = usage {
                 let model_costs = &state.runtime.load_full().model_costs;
@@ -1207,12 +1206,9 @@ async fn read_and_bill_body(
 
     let resp_bytes = out_bytes.len();
 
-    let is_billable = log_ctx.path.starts_with("/v1/")
-        && !log_ctx.path.starts_with("/v1/models");
+    let is_billable = log_ctx.path.starts_with("/v1/chat/completions");
     let is_2xx = status.is_success();
 
-    // Parse usage for all billable /v1/ paths (chat, images, embeddings, etc.)
-    // with JSON 2xx body. Excludes /v1/models (model listing).
     let usage = if is_billable && is_2xx && !overflow && content_type.starts_with("application/json") {
         if !out_bytes.is_empty() {
             match usage_from_json_bytes(&out_bytes) {
