@@ -207,18 +207,21 @@ fn adapt_gemini_request(
                 .get("content")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            let text = content_to_text(&content);
-            if text.is_empty() {
+            if role == "system" {
+                let text = content_to_text(&content);
+                if !text.is_empty() {
+                    system_parts.push(text);
+                }
                 continue;
             }
-            if role == "system" {
-                system_parts.push(text);
+            let parts = content_to_gemini_parts(&content);
+            if parts.is_empty() {
                 continue;
             }
             let out_role = if role == "assistant" { "model" } else { "user" };
             contents.push(serde_json::json!({
                 "role": out_role,
-                "parts": [{"text": text}],
+                "parts": parts,
             }));
         }
     }
@@ -321,18 +324,97 @@ fn content_to_anthropic_blocks(content: &serde_json::Value) -> serde_json::Value
         serde_json::Value::Array(parts) => {
             let out: Vec<serde_json::Value> = parts
                 .iter()
-                .filter_map(|part| {
-                    let text = part
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .or_else(|| part.get("content").and_then(|t| t.as_str()))?;
-                    Some(serde_json::json!({"type": "text", "text": text}))
-                })
+                .filter_map(|part| openai_part_to_anthropic(part))
                 .collect();
             serde_json::Value::Array(out)
         }
         _ => serde_json::json!([{"type": "text", "text": content_to_text(content)}]),
     }
+}
+
+/// Convert a single OpenAI content part to an Anthropic block.
+/// Handles `text`, `image_url` (data URI only), and nested `content` fields.
+fn openai_part_to_anthropic(part: &serde_json::Value) -> Option<serde_json::Value> {
+    // Plain text ("text" or nested "content")
+    let text = part
+        .get("text")
+        .and_then(|t| t.as_str())
+        .or_else(|| part.get("content").and_then(|t| t.as_str()));
+    if let Some(s) = text {
+        return Some(serde_json::json!({"type": "text", "text": s}));
+    }
+
+    // Image: { "type": "image_url", "image_url": { "url": "data:..." } }
+    if part.get("type").and_then(|t| t.as_str()) == Some("image_url") {
+        if let Some(url) = part.get("image_url").and_then(|u| u.get("url")).and_then(|u| u.as_str()) {
+            if let Some((mime, data)) = parse_data_uri(url) {
+                return Some(serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": mime,
+                        "data": data
+                    }
+                }));
+            }
+        }
+    }
+
+    None
+}
+
+/// Convert OpenAI-format content (string or array) to Gemini parts.
+fn content_to_gemini_parts(content: &serde_json::Value) -> Vec<serde_json::Value> {
+    match content {
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| openai_part_to_gemini(part))
+            .collect(),
+        serde_json::Value::String(s) => {
+            vec![serde_json::json!({"text": s})]
+        }
+        _ => {
+            let text = content_to_text(content);
+            if text.is_empty() { vec![] } else { vec![serde_json::json!({"text": text})] }
+        }
+    }
+}
+
+/// Convert a single OpenAI content part to a Gemini part.
+fn openai_part_to_gemini(part: &serde_json::Value) -> Option<serde_json::Value> {
+    let text = part
+        .get("text")
+        .and_then(|t| t.as_str())
+        .or_else(|| part.get("content").and_then(|t| t.as_str()));
+    if let Some(s) = text {
+        return Some(serde_json::json!({"text": s}));
+    }
+
+    if part.get("type").and_then(|t| t.as_str()) == Some("image_url") {
+        if let Some(url) = part.get("image_url").and_then(|u| u.get("url")).and_then(|u| u.as_str()) {
+            if let Some((mime, data)) = parse_data_uri(url) {
+                return Some(serde_json::json!({
+                    "inlineData": {
+                        "mimeType": mime,
+                        "data": data
+                    }
+                }));
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse a data URI "data:<mime>;base64,<data>" → (mime, data).
+fn parse_data_uri(uri: &str) -> Option<(String, String)> {
+    let stripped = uri.strip_prefix("data:")?;
+    let (mime_and_encoding, data) = stripped.split_once(',')?;
+    let mime = mime_and_encoding.trim_end_matches(";base64").trim_end_matches(";BASE64");
+    if mime.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some((mime.to_string(), data.to_string()))
 }
 
 async fn transform_json_response(
