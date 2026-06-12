@@ -206,6 +206,15 @@ async fn handle_inner(
         return check_health(&state);
     }
 
+    // Root redirect to admin web UI.
+    if (method == hyper::Method::GET || method == hyper::Method::HEAD) && (path == "/" || path == "") {
+        return Response::builder()
+            .status(http::StatusCode::FOUND)
+            .header(http::header::LOCATION, "/web")
+            .body(Body::empty())
+            .unwrap();
+    }
+
     // Prometheus metrics.
     if method == hyper::Method::GET && path == "/metrics" {
         return admin::prometheus_metrics(state).await;
