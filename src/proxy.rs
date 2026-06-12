@@ -3,7 +3,7 @@ use crate::billing::ReserveResult;
 use crate::config::UpstreamFormat;
 use crate::format::{self, AuthStyle};
 use crate::state::{
-    sanitize_hop_headers, RequestLogEntry, RouterState, Selected, HDR_AUTHORIZATION,
+    sanitize_hop_headers, InflightGuard, KeyGuard, RequestLogEntry, RouterState, Selected, HDR_AUTHORIZATION,
 };
 use crate::util::now_ms;
 use flate2::{Decompress, FlushDecompress, Status};
@@ -261,10 +261,7 @@ async fn handle_inner(
             .requests_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    state
-        .stats
-        .requests_inflight
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _inflight = InflightGuard::enter(&state.stats.requests_inflight);
     let t0 = Instant::now();
 
     let resp =
@@ -294,10 +291,7 @@ async fn handle_inner(
     // Stats: latency + inflight.
     let dur = t0.elapsed();
     state.record_latency(dur.as_nanos() as u64);
-    state
-        .stats
-        .requests_inflight
-        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    // _inflight dropped here → fetch_sub
 
     resp
     }
@@ -715,10 +709,8 @@ async fn forward(
         log_ctx_c.upstream_id = Some(sel.upstream.id.to_string());
         let upstream = &sel.upstream;
 
-        // Track per-key concurrency for this attempt.
-        sel.key
-            .active_requests
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Track per-key concurrency for this attempt. Guard decrements on drop.
+        let _key_guard = KeyGuard::acquire(sel.key.clone());
 
         let result = execute_attempt(
             &state_c,
@@ -737,10 +729,8 @@ async fn forward(
         )
         .await;
 
-        // Decrement per-key concurrency after each attempt.
-        sel.key
-            .active_requests
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        // _key_guard dropped here → fetch_sub, then notify
+        drop(_key_guard);
         state_c.notify_capacity();
 
         match result {
