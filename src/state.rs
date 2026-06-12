@@ -743,8 +743,9 @@ impl RouterState {
     }
 
     /// Select an upstream + key that supports the given model.
-    /// Returns None only if no upstream has active keys for the model.
-    pub fn select_for_model(&self, model: &str, _now_ms: u64) -> Option<Selected> {
+    /// `billing_key_level`: the request user's billing key permission level.
+    /// -1 = admin (no restriction). Returns None if no upstream+key is eligible.
+    pub fn select_for_model(&self, model: &str, billing_key_level: i32, _now_ms: u64) -> Option<Selected> {
         if self.is_shutting_down() {
             return None;
         }
@@ -762,6 +763,11 @@ impl RouterState {
             let u = &snap.upstreams[u_idx];
 
             if !u.models.load().contains(model) && !u.model_map.contains_key(model) {
+                continue;
+            }
+
+            // Billing-key level gate: user must have level >= upstream min.
+            if billing_key_level != -1 && billing_key_level < u.min_key_level {
                 continue;
             }
 

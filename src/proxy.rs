@@ -425,8 +425,9 @@ async fn execute_attempt(
 
             if should_retry {
                 let now = now_ms();
+                let billing_key_level = state.store.get_key_level(billing_key);
                 if let Some(new_sel) =
-                    state.select_for_model(&log_ctx.model.clone().unwrap_or_default(), now)
+                    state.select_for_model(&log_ctx.model.clone().unwrap_or_default(), billing_key_level, now)
                 {
                     drop(up_resp);
                     tracing::debug!(
@@ -460,8 +461,9 @@ async fn execute_attempt(
                 .record_latency_ms(attempt_start.elapsed().as_millis() as u64);
             state.on_network_error(sel, now);
 
+            let billing_key_level = state.store.get_key_level(billing_key);
             if let Some(new_sel) =
-                state.select_for_model(&log_ctx.model.clone().unwrap_or_default(), now)
+                state.select_for_model(&log_ctx.model.clone().unwrap_or_default(), billing_key_level, now)
             {
                 tracing::debug!(
                     old_upstream = %sel.upstream.id,
@@ -489,8 +491,9 @@ async fn execute_attempt(
                 .record_latency_ms(attempt_start.elapsed().as_millis() as u64);
             state.on_timeout(sel, now);
 
+            let billing_key_level = state.store.get_key_level(billing_key);
             if let Some(new_sel) =
-                state.select_for_model(&log_ctx.model.clone().unwrap_or_default(), now)
+                state.select_for_model(&log_ctx.model.clone().unwrap_or_default(), billing_key_level, now)
             {
                 tracing::debug!(
                     old_upstream = %sel.upstream.id,
@@ -638,10 +641,10 @@ async fn forward(
             "model not found",
             "model_not_found",
         );
-    } else if let Some(sel) = state.select_for_model(&model, now) {
+    } else if let Some(sel) = state.select_for_model(&model, state.store.get_key_level(&billing_key), now) {
         sel
     } else {
-        match wait_for_selection(&state, &model).await {
+        match wait_for_selection(&state, &model, state.store.get_key_level(&billing_key)).await {
             Ok((sel, waited)) => {
                 queue_wait_ms = waited;
                 sel
@@ -753,6 +756,7 @@ async fn forward(
 async fn wait_for_selection(
     state: &Arc<RouterState>,
     model: &str,
+    billing_key_level: i32,
 ) -> Result<(Selected, u64), Response<Body>> {
     let server = state.server_config();
     if !server.queue_enabled {
@@ -779,7 +783,7 @@ async fn wait_for_selection(
                 "shutting_down",
             ));
         }
-        if let Some(sel) = state.select_for_model(model, now_ms()) {
+        if let Some(sel) = state.select_for_model(model, billing_key_level, now_ms()) {
             return Ok((sel, start.elapsed().as_millis() as u64));
         }
         tokio::select! {
