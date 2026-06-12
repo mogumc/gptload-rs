@@ -17,7 +17,7 @@ permissions:
 env:
   BINARY_NAME: aequi
   REGISTRY: ghcr.io
-  IMAGE_NAME: aequi
+  IMAGE_NAME: mogumc/aequi
 
 jobs:
   build:
