@@ -297,7 +297,7 @@ async fn handle_inner(
 
     let resp =
         if req.method() == hyper::Method::GET && (path == "/v1/models" || path == "/v1/models/") {
-            let (resp, resp_bytes) = models_list(&state);
+            let (resp, resp_bytes) = models_list(&state, &billing_key);
             record_request(
                 &state,
                 &base_log_ctx,
@@ -1479,17 +1479,36 @@ fn extract_api_key(headers: &hyper::HeaderMap) -> Option<String> {
     None
 }
 
-fn models_list(state: &RouterState) -> (Response<Body>, usize) {
+fn models_list(state: &RouterState, billing_key: &str) -> (Response<Body>, usize) {
     let routes = state.get_model_routes();
     let snap = state.snapshot.load_full();
-    let mut models: Vec<String> = routes.models.keys().cloned().collect();
+    let user_level = state.store.get_key_level(billing_key);
+
+    // Collect upstream IDs accessible at the user's key level.
+    let accessible: Vec<&str> = snap
+        .upstreams
+        .iter()
+        .filter(|u| user_level == -1 || u.min_key_level <= user_level)
+        .map(|u| u.id.as_ref())
+        .collect();
+
+    // Filter models to only those with at least one accessible upstream.
+    let mut models: Vec<String> = routes
+        .models
+        .iter()
+        .filter(|(_model, upstreams)| upstreams.iter().any(|uid| accessible.contains(&uid.as_str())))
+        .map(|(model, _)| model.clone())
+        .collect();
     models.sort();
 
-    // Apply reverse model mapping for each model across all upstreams.
+    // Apply reverse model mapping for each model across accessible upstreams only.
     let mut models: Vec<String> = models
         .into_iter()
         .map(|m| {
             for u in snap.upstreams.iter() {
+                if !accessible.contains(&u.id.as_ref()) {
+                    continue;
+                }
                 if let Some(user_name) = u.model_rmap.get(&m) {
                     return user_name.clone();
                 }
