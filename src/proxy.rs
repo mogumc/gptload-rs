@@ -791,7 +791,12 @@ async fn forward(
             AttemptResult::Retry(new_sel) => {
                 retry_count += 1;
                 if retry_count > max_retries {
-                    return RouterState::json_error(
+                    if billing_reserved {
+                        let _ = state.billing.release_reservation(&billing_key);
+                    }
+                    return logged_json_error(
+                        &state,
+                        &log_ctx,
                         http::StatusCode::BAD_GATEWAY,
                         "max retries exceeded",
                         "max_retries",
@@ -1009,6 +1014,14 @@ struct UsageTokens {
     total: u64,
 }
 
+impl UsageTokens {
+    /// Total output tokens for billing: visible output + thinking tokens.
+    /// Billing charges thinking at the output rate, not a separate rate.
+    fn billing_completion(&self) -> u64 {
+        self.completion.saturating_add(self.thought)
+    }
+}
+
 fn record_request(
     state: &RouterState,
     ctx: &RequestLogContext,
@@ -1033,9 +1046,9 @@ fn record_request(
         latency_ms: total_ms,
         req_bytes: ctx.req_bytes,
         resp_bytes,
-        prompt_tokens: usage.map(|u| u.prompt),
-        completion_tokens: usage.map(|u| u.completion),
-        thought_tokens: usage.map(|u| u.thought),
+        prompt_tokens: usage.as_ref().map(|u| u.prompt),
+        completion_tokens: usage.as_ref().map(|u| u.billing_completion()),
+        thought_tokens: usage.as_ref().map(|u| u.thought),
         total_tokens: usage.map(|u| u.total),
         request_headers: ctx.request_headers.clone(),
         request_body: ctx.request_body.clone(),
@@ -1196,7 +1209,13 @@ async fn proxy_upstream_response(
     let want_sse_usage = is_event_stream;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, io::Error>>(32);
-    tokio::spawn(async move {
+
+    // Clone before the move — watchdog needs copies.
+    let state_w = state.clone();
+    let log_ctx_w = log_ctx.clone();
+    let billing_key_w = billing_key.clone();
+
+    let bill_handle = tokio::spawn(async move {
         let _lifecycle = lifecycle;
         use hyper::body::HttpBody;
         const MAX_SSE_BUF_BYTES: usize = 2 * 1024 * 1024;
@@ -1233,12 +1252,13 @@ async fn proxy_upstream_response(
             if let Some(found) = usage {
                 let model_costs = &state.runtime.load_full().model_costs;
                 let model = log_ctx.billing_model.as_deref().unwrap_or("");
-                let cost = crate::billing::compute_credit_cost(found.prompt, found.completion, model, model_costs);
+                let bill_out = found.billing_completion();
+                let cost = crate::billing::compute_credit_cost(found.prompt, bill_out, model, model_costs);
                 let _ = state.billing.settle_reserved_usage(
-                    key, found.prompt, found.completion, model, model_costs,
+                    key, found.prompt, bill_out, model, model_costs,
                 );
                 state.stats.prompt_tokens_total.fetch_add(found.prompt, std::sync::atomic::Ordering::Relaxed);
-                state.stats.completion_tokens_total.fetch_add(found.completion, std::sync::atomic::Ordering::Relaxed);
+                state.stats.completion_tokens_total.fetch_add(bill_out, std::sync::atomic::Ordering::Relaxed);
                 state.stats.thought_tokens_total.fetch_add(found.thought, std::sync::atomic::Ordering::Relaxed);
                 state.stats.tokens_total.fetch_add(found.total, std::sync::atomic::Ordering::Relaxed);
                 let _ = state.store.add_key_usage(key, found.total, cost);
@@ -1247,6 +1267,19 @@ async fn proxy_upstream_response(
             }
         }
         record_request(&state, &log_ctx, status.as_u16(), resp_bytes, usage);
+    });
+
+    // Watchdog: if the billing task panics, release the reservation so the
+    // pre-deducted 1 µcredit is not permanently lost.
+    tokio::spawn(async move {
+        if let Err(e) = bill_handle.await {
+            if e.is_panic() {
+                if let Some(key) = billing_key_w.as_deref() {
+                    let _ = state_w.billing.release_reservation(key);
+                }
+                record_request(&state_w, &log_ctx_w, status.as_u16(), 0, None);
+            }
+        }
     });
 
     Response::from_parts(parts, Body::wrap_stream(ReceiverStream::new(rx)))
@@ -1343,12 +1376,13 @@ async fn read_and_bill_body(
         if let Some(found) = usage {
             let model_costs = &state.runtime.load_full().model_costs;
             let model = log_ctx.billing_model.as_deref().unwrap_or("");
-            let cost = crate::billing::compute_credit_cost(found.prompt, found.completion, model, model_costs);
+            let bill_out = found.billing_completion();
+            let cost = crate::billing::compute_credit_cost(found.prompt, bill_out, model, model_costs);
             let _ = state.billing.settle_reserved_usage(
-                key, found.prompt, found.completion, model, model_costs,
+                key, found.prompt, bill_out, model, model_costs,
             );
             state.stats.prompt_tokens_total.fetch_add(found.prompt, std::sync::atomic::Ordering::Relaxed);
-            state.stats.completion_tokens_total.fetch_add(found.completion, std::sync::atomic::Ordering::Relaxed);
+            state.stats.completion_tokens_total.fetch_add(bill_out, std::sync::atomic::Ordering::Relaxed);
             state.stats.thought_tokens_total.fetch_add(found.thought, std::sync::atomic::Ordering::Relaxed);
             state.stats.tokens_total.fetch_add(found.total, std::sync::atomic::Ordering::Relaxed);
             let _ = state.store.add_key_usage(key, found.total, cost);
