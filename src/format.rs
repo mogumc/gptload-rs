@@ -319,6 +319,9 @@ fn content_to_text(content: &serde_json::Value) -> String {
     }
 }
 
+/// Max decoded file size: 20 MB (matching OpenAI / Anthropic limits).
+const MAX_DECODED_BYTES: usize = 20 * 1024 * 1024;
+
 fn content_to_anthropic_blocks(content: &serde_json::Value) -> serde_json::Value {
     match content {
         serde_json::Value::Array(parts) => {
@@ -333,31 +336,72 @@ fn content_to_anthropic_blocks(content: &serde_json::Value) -> serde_json::Value
 }
 
 /// Convert a single OpenAI content part to an Anthropic block.
-/// Handles `text`, `image_url` (data URI only), and nested `content` fields.
+/// Handles: text, image_url, input_audio, file.
+/// Files/audio become Anthropic `document` blocks.
 fn openai_part_to_anthropic(part: &serde_json::Value) -> Option<serde_json::Value> {
+    let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
     // Plain text ("text" or nested "content")
     let text = part
         .get("text")
         .and_then(|t| t.as_str())
         .or_else(|| part.get("content").and_then(|t| t.as_str()));
     if let Some(s) = text {
-        return Some(serde_json::json!({"type": "text", "text": s}));
+        if part_type.is_empty() || part_type == "text" {
+            return Some(serde_json::json!({"type": "text", "text": s}));
+        }
     }
 
-    // Image: { "type": "image_url", "image_url": { "url": "data:..." } }
-    if part.get("type").and_then(|t| t.as_str()) == Some("image_url") {
+    // Image: data URI
+    if part_type == "image_url" {
         if let Some(url) = part.get("image_url").and_then(|u| u.get("url")).and_then(|u| u.as_str()) {
-            if let Some((mime, data)) = parse_data_uri(url) {
+            if let Some((mime, data)) = parse_data_uri(url, MAX_DECODED_BYTES) {
                 return Some(serde_json::json!({
                     "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": mime,
-                        "data": data
-                    }
+                    "source": {"type": "base64", "media_type": mime, "data": data}
                 }));
             }
         }
+        return None;
+    }
+
+    // Audio: base64 data + format → Anthropic document block
+    if part_type == "input_audio" {
+        if let Some(audio) = part.get("input_audio") {
+            let data = audio.get("data").and_then(|d| d.as_str()).unwrap_or("");
+            let format = audio.get("format").and_then(|f| f.as_str()).unwrap_or("wav");
+            if data.len() > MAX_DECODED_BYTES {
+                return None;
+            }
+            let mime = format!("audio/{}", format);
+            return Some(serde_json::json!({
+                "type": "document",
+                "source": {"type": "base64", "media_type": mime, "data": data}
+            }));
+        }
+        return None;
+    }
+
+    // File: base64 data + filename → Anthropic document block
+    if part_type == "file" {
+        if let Some(file) = part.get("file") {
+            let file_data = file.get("file_data").and_then(|d| d.as_str()).unwrap_or("");
+            let filename = file.get("filename").and_then(|f| f.as_str()).unwrap_or("");
+            if file_data.len() > MAX_DECODED_BYTES {
+                return None;
+            }
+            let mime = mime_from_filename(filename);
+            return Some(serde_json::json!({
+                "type": "document",
+                "source": {"type": "base64", "media_type": mime, "data": file_data}
+            }));
+        }
+        return None;
+    }
+
+    // Fallback: plain text (when type field is absent)
+    if !text.is_none() {
+        return Some(serde_json::json!({"type": "text", "text": text.unwrap()}));
     }
 
     None
@@ -381,40 +425,105 @@ fn content_to_gemini_parts(content: &serde_json::Value) -> Vec<serde_json::Value
 }
 
 /// Convert a single OpenAI content part to a Gemini part.
+/// Handles: text, image_url, input_audio, file.
 fn openai_part_to_gemini(part: &serde_json::Value) -> Option<serde_json::Value> {
+    let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
     let text = part
         .get("text")
         .and_then(|t| t.as_str())
         .or_else(|| part.get("content").and_then(|t| t.as_str()));
     if let Some(s) = text {
-        return Some(serde_json::json!({"text": s}));
+        if part_type.is_empty() || part_type == "text" {
+            return Some(serde_json::json!({"text": s}));
+        }
     }
 
-    if part.get("type").and_then(|t| t.as_str()) == Some("image_url") {
+    // Image: data URI → Gemini inlineData
+    if part_type == "image_url" {
         if let Some(url) = part.get("image_url").and_then(|u| u.get("url")).and_then(|u| u.as_str()) {
-            if let Some((mime, data)) = parse_data_uri(url) {
-                return Some(serde_json::json!({
-                    "inlineData": {
-                        "mimeType": mime,
-                        "data": data
-                    }
-                }));
+            if let Some((mime, data)) = parse_data_uri(url, MAX_DECODED_BYTES) {
+                return Some(serde_json::json!({"inlineData": {"mimeType": mime, "data": data}}));
             }
         }
+        return None;
+    }
+
+    // Audio → Gemini inlineData
+    if part_type == "input_audio" {
+        if let Some(audio) = part.get("input_audio") {
+            let data = audio.get("data").and_then(|d| d.as_str()).unwrap_or("");
+            let format = audio.get("format").and_then(|f| f.as_str()).unwrap_or("wav");
+            if data.len() > MAX_DECODED_BYTES {
+                return None;
+            }
+            let mime = format!("audio/{}", format);
+            return Some(serde_json::json!({"inlineData": {"mimeType": mime, "data": data}}));
+        }
+        return None;
+    }
+
+    // File → Gemini inlineData
+    if part_type == "file" {
+        if let Some(file) = part.get("file") {
+            let file_data = file.get("file_data").and_then(|d| d.as_str()).unwrap_or("");
+            let filename = file.get("filename").and_then(|f| f.as_str()).unwrap_or("");
+            if file_data.len() > MAX_DECODED_BYTES {
+                return None;
+            }
+            let mime = mime_from_filename(filename);
+            return Some(serde_json::json!({"inlineData": {"mimeType": mime, "data": file_data}}));
+        }
+        return None;
     }
 
     None
 }
 
 /// Parse a data URI "data:<mime>;base64,<data>" → (mime, data).
-fn parse_data_uri(uri: &str) -> Option<(String, String)> {
+/// Returns None if the decoded data exceeds `max_bytes`.
+fn parse_data_uri(uri: &str, max_bytes: usize) -> Option<(String, String)> {
     let stripped = uri.strip_prefix("data:")?;
     let (mime_and_encoding, data) = stripped.split_once(',')?;
     let mime = mime_and_encoding.trim_end_matches(";base64").trim_end_matches(";BASE64");
     if mime.is_empty() || data.is_empty() {
         return None;
     }
+    if data.len() > max_bytes {
+        return None;
+    }
     Some((mime.to_string(), data.to_string()))
+}
+
+/// Map a filename extension to MIME type. Falls back to application/octet-stream.
+fn mime_from_filename(filename: &str) -> String {
+    let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "pdf" => "application/pdf".into(),
+        "doc" => "application/msword".into(),
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document".into(),
+        "xls" => "application/vnd.ms-excel".into(),
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".into(),
+        "ppt" => "application/vnd.ms-powerpoint".into(),
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation".into(),
+        "txt" => "text/plain".into(),
+        "csv" => "text/csv".into(),
+        "html" | "htm" => "text/html".into(),
+        "json" => "application/json".into(),
+        "xml" => "application/xml".into(),
+        "zip" => "application/zip".into(),
+        "mp3" => "audio/mpeg".into(),
+        "mp4" => "video/mp4".into(),
+        "wav" => "audio/wav".into(),
+        "ogg" => "audio/ogg".into(),
+        "webm" => "video/webm".into(),
+        "png" => "image/png".into(),
+        "jpg" | "jpeg" => "image/jpeg".into(),
+        "gif" => "image/gif".into(),
+        "webp" => "image/webp".into(),
+        "svg" => "image/svg+xml".into(),
+        _ => "application/octet-stream".into(),
+    }
 }
 
 async fn transform_json_response(
