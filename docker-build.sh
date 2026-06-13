@@ -1,10 +1,9 @@
 #!/bin/bash
 # 构建 Docker 镜像的脚本
-# 宿主机编译静态二进制，Dockerfile 只做 COPY
 
 set -e
 
-BINARY_NAME="gptload-rs"
+BINARY_NAME="aequi"
 
 # 检测当前架构
 ARCH=$(uname -m)

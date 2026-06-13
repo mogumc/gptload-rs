@@ -128,16 +128,6 @@ fn authenticate_request(
     req: &Request<Body>,
     ctx: &RequestLogContext,
 ) -> Result<String, Response<Body>> {
-    if !state.authorize_proxy(req) {
-        return Err(logged_json_error(
-            state,
-            ctx,
-            http::StatusCode::UNAUTHORIZED,
-            "missing or invalid X-Proxy-Token",
-            "proxy_unauthorized",
-        ));
-    }
-
     let billing_key = match extract_api_key(req.headers()) {
         Some(key) => key,
         None => {
@@ -926,7 +916,7 @@ fn add_cors_headers(
         headers.insert(
             "access-control-allow-headers",
             http::HeaderValue::from_static(
-                "authorization,content-type,x-api-key,x-proxy-token,x-admin-token",
+                "authorization,content-type,x-api-key,x-admin-token",
             ),
         );
         headers.insert(
@@ -973,6 +963,7 @@ struct RequestLogContext {
     request_body: Option<String>,
     queue_ms: u64,
     is_stream: Option<bool>,
+    token_source: Option<String>,
 }
 
 impl RequestLogContext {
@@ -1002,6 +993,7 @@ impl RequestLogContext {
             request_body,
             queue_ms,
             is_stream: None, // set later when parsing req body
+            token_source: None,
         }
     }
 }
@@ -1050,6 +1042,7 @@ fn record_request(
         completion_tokens: usage.as_ref().map(|u| u.billing_completion()),
         thought_tokens: usage.as_ref().map(|u| u.thought),
         total_tokens: usage.map(|u| u.total),
+        token_source: ctx.token_source.clone(),
         request_headers: ctx.request_headers.clone(),
         request_body: ctx.request_body.clone(),
         timing: crate::state::RequestTiming {
@@ -1112,7 +1105,7 @@ fn build_upstream_request(
 
     sanitize_hop_headers(out_req.headers_mut());
     // Strip compression headers so upstream (especially Cloudflare) does not
-    // compress the response. gptload-rs reads the full body to extract token
+    // compress the response. aequi reads the full body to extract token
     // usage; decompressing gzip/brotli adds complexity and is unnecessary for
     // API proxy traffic where response bodies are small.
     out_req.headers_mut().remove(ACCEPT_ENCODING);
@@ -1173,19 +1166,21 @@ async fn proxy_upstream_response(
         .headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     let content_encoding = parts
         .headers
         .get(CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
 
     // ── Non-streaming: read body synchronously, extract usage, bill, return ──
     if !stream_request {
         let (resp_bytes, was_decompressed) = read_and_bill_body(
             body,
-            content_type,
-            content_encoding,
+            &content_type,
+            &content_encoding,
             status,
             &state,
             &log_ctx,
@@ -1205,6 +1200,11 @@ async fn proxy_upstream_response(
     }
 
     // ── Streaming: spawn task to forward chunks and extract SSE usage ──
+    // Strip Content-Length / Content-Encoding so the client receives
+    // true chunked streaming, not a buffered response.
+    parts.headers.remove(CONTENT_LENGTH);
+    parts.headers.remove(CONTENT_ENCODING);
+
     let is_event_stream = content_type.starts_with("text/event-stream");
     let want_sse_usage = is_event_stream;
 
@@ -1223,6 +1223,7 @@ async fn proxy_upstream_response(
         let mut resp_bytes = 0usize;
         let mut usage: Option<UsageTokens> = None;
         let mut sse_buf = String::new();
+        let mut content_buf = String::new(); // accumulated delta.content for fallback
 
         let mut body = body;
         while let Some(chunk) = body.data().await {
@@ -1232,38 +1233,76 @@ async fn proxy_upstream_response(
                     if tx.send(Ok(chunk.clone())).await.is_err() {
                         break;
                     }
-                    if !want_sse_usage {
-                        continue;
-                    }
-                    if sse_buf.len().saturating_add(chunk.len()) > MAX_SSE_BUF_BYTES {
-                        continue;
-                    }
-                    if let Some(found) = parse_sse_usage(&mut sse_buf, &chunk) {
-                        // Merge across chunks: some formats (Anthropic) split
-                        // prompt_tokens (message_start) and completion_tokens (message_delta)
-                        // into separate SSE events. Non-zero values from later chunks
-                        // override earlier ones.
-                        usage = Some(match usage {
-                            Some(prev) => UsageTokens {
-                                prompt: if found.prompt > 0 { found.prompt } else { prev.prompt },
-                                completion: if found.completion > 0 { found.completion } else { prev.completion },
-                                thought: if found.thought > 0 { found.thought } else { prev.thought },
-                                total: (found.prompt.max(prev.prompt) + found.completion.max(prev.completion) + found.thought.max(prev.thought))
-                                    .max(found.total)
-                                    .max(prev.total),
-                            },
-                            None => found,
-                        });
+                    if want_sse_usage {
+                        if sse_buf.len().saturating_add(chunk.len()) <= MAX_SSE_BUF_BYTES {
+                            if let Some(found) = parse_sse_usage(&mut sse_buf, &chunk) {
+                                usage = Some(match usage {
+                                    Some(prev) => UsageTokens {
+                                        prompt: if found.prompt > 0 { found.prompt } else { prev.prompt },
+                                        completion: if found.completion > 0 { found.completion } else { prev.completion },
+                                        thought: if found.thought > 0 { found.thought } else { prev.thought },
+                                        total: (found.prompt.max(prev.prompt) + found.completion.max(prev.completion) + found.thought.max(prev.thought))
+                                            .max(found.total)
+                                            .max(prev.total),
+                                    },
+                                    None => found,
+                                });
+                            }
+                        }
+                        crate::util::extract_sse_content(&chunk, &mut content_buf);
                     }
                 }
                 Err(_) => break,
             }
         }
 
+        let mut token_source: Option<String> = None;
+
+        // Determine effective usage: upstream actual, local estimate, or none.
+        // Trigger fallback when usage is missing OR completion_tokens == 0
+        // (low-quality upstreams may count prompt but not output tokens).
+        let effective: Option<UsageTokens> = match usage {
+            Some(u) if u.completion > 0 => {
+                token_source = Some("upstream".into());
+                Some(u)
+            }
+            _ => {
+                let is_billable = log_ctx.path.starts_with("/v1/chat/completions");
+                let is_2xx = status.is_success();
+                if is_billable && is_2xx && !content_buf.is_empty() {
+                    // Estimate completion from accumulated content.
+                    // Keep upstream prompt count if available, otherwise estimate.
+                    let completion_est = crate::util::estimate_tokens(&content_buf);
+                    // Extract only message content for estimation (not raw JSON),
+                    // mirroring how completion content is extracted on the output side.
+                    let prompt = usage
+                        .as_ref()
+                        .map(|u| u.prompt)
+                        .unwrap_or_else(|| {
+                            log_ctx
+                                .request_body
+                                .as_deref()
+                                .and_then(|b| crate::util::extract_request_content(b))
+                                .map(|content| crate::util::estimate_tokens(&content))
+                                .unwrap_or(1)
+                        });
+                    // Estimate covers ALL output (reasoning + visible).
+                    // Set thought=0 to avoid double-counting with upstream.
+                    token_source = Some("estimated".into());
+                    Some(UsageTokens {
+                        prompt,
+                        completion: completion_est,
+                        thought: 0,
+                        total: prompt + completion_est,
+                    })
+                } else {
+                    None
+                }
+            }
+        };
+
         if let Some(key) = billing_key.as_deref() {
-            let is_billable = log_ctx.path.starts_with("/v1/chat/completions");
-            let is_2xx = status.is_success();
-            if let Some(found) = usage {
+            if let Some(found) = effective.as_ref() {
                 let model_costs = &state.runtime.load_full().model_costs;
                 let model = log_ctx.billing_model.as_deref().unwrap_or("");
                 let bill_out = found.billing_completion();
@@ -1276,11 +1315,19 @@ async fn proxy_upstream_response(
                 state.stats.thought_tokens_total.fetch_add(found.thought, std::sync::atomic::Ordering::Relaxed);
                 state.stats.tokens_total.fetch_add(found.total, std::sync::atomic::Ordering::Relaxed);
                 let _ = state.store.add_key_usage(key, found.total, cost);
-            } else if !is_billable || !is_2xx {
-                let _ = state.billing.release_reservation(key);
+            } else {
+                // No usage, no content → release the pre-deducted 1 µcredit.
+                let is_billable = log_ctx.path.starts_with("/v1/chat/completions");
+                let is_2xx = status.is_success();
+                if !is_billable || !is_2xx {
+                    let _ = state.billing.release_reservation(key);
+                }
             }
         }
-        record_request(&state, &log_ctx, status.as_u16(), resp_bytes, usage);
+
+        let mut ctx_with_source = log_ctx.clone();
+        ctx_with_source.token_source = token_source;
+        record_request(&state, &ctx_with_source, status.as_u16(), resp_bytes, effective);
     });
 
     // Watchdog: if the billing task panics, release the reservation so the
@@ -1386,6 +1433,51 @@ async fn read_and_bill_body(
         None
     };
 
+    let mut token_source: Option<String> = None;
+    let mut final_usage: Option<UsageTokens> = None;
+
+    // Accept upstream usage only if completion_tokens > 0.
+    // completion==0 means the upstream didn't count output tokens (low-quality channel).
+    if let Some(u) = usage {
+        if u.completion > 0 {
+            token_source = Some("upstream".into());
+            final_usage = Some(u);
+        }
+    }
+
+    // Fallback: estimate when upstream usage is missing or completion==0.
+    if final_usage.is_none() && is_billable && is_2xx && !overflow {
+        if let Some(text) = extract_nonstreaming_content(&out_bytes) {
+            let completion_est = crate::util::estimate_tokens(&text);
+            let prompt = usage
+                .as_ref()
+                .map(|u| u.prompt)
+                .unwrap_or_else(|| {
+                    log_ctx
+                        .request_body
+                        .as_deref()
+                    .and_then(|b| crate::util::extract_request_content(b))
+                    .map(|content| crate::util::estimate_tokens(&content))
+                    .unwrap_or(1)
+                });
+            tracing::info!(
+                path = %log_ctx.path,
+                prompt,
+                completion_est,
+                "non-streaming usage estimated (upstream completion=0 or no usage)"
+            );
+            token_source = Some("estimated".into());
+            final_usage = Some(UsageTokens {
+                prompt,
+                completion: completion_est,
+                thought: 0,
+                total: prompt + completion_est,
+            });
+        }
+    }
+
+    let usage = final_usage;
+
     if let Some(key) = billing_key {
         if let Some(found) = usage {
             let model_costs = &state.runtime.load_full().model_costs;
@@ -1403,9 +1495,10 @@ async fn read_and_bill_body(
         } else if !is_billable || !is_2xx {
             let _ = state.billing.release_reservation(key);
         }
-        // else: is_billable && is_2xx && usage=None → pre-deducted 1 µcredit stays → min charge
     }
-    record_request(state, log_ctx, status.as_u16(), resp_bytes, usage);
+    let mut ctx_with_source = log_ctx.clone();
+    ctx_with_source.token_source = token_source;
+    record_request(state, &ctx_with_source, status.as_u16(), resp_bytes, usage);
 
     (out_bytes, was_decompressed)
 }
@@ -1592,6 +1685,22 @@ fn ensure_stream_usage(v: &mut serde_json::Value) -> bool {
 fn usage_from_json_bytes(body: &[u8]) -> Option<UsageTokens> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     extract_usage_from_value(&v)
+}
+
+/// Extract all output content from a non-streaming JSON response body.
+/// Captures both `reasoning_content` (CoT/thinking models) and `content` (visible output)
+/// so the token estimator counts the full output, not just the visible portion.
+fn extract_nonstreaming_content(body: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let message = v["choices"].get(0)?.get("message")?;
+    let mut text = String::new();
+    if let Some(s) = message.get("reasoning_content").and_then(|c| c.as_str()) {
+        text.push_str(s);
+    }
+    if let Some(s) = message.get("content").and_then(|c| c.as_str()) {
+        text.push_str(s);
+    }
+    if text.is_empty() { None } else { Some(text) }
 }
 
 fn extract_usage_from_value(v: &serde_json::Value) -> Option<UsageTokens> {

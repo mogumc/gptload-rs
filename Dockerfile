@@ -7,8 +7,8 @@ RUN apk add --no-cache ca-certificates tzdata libssl3
 
 WORKDIR /app
 
-COPY gptload-rs-${TARGETOS}-${TARGETARCH} /app/gptload-rs
-RUN chmod +x /app/gptload-rs
+COPY aequi-${TARGETOS}-${TARGETARCH} /app/aequi
+RUN chmod +x /app/aequi
 
 RUN mkdir -p /app/data
 
@@ -16,5 +16,5 @@ EXPOSE 8080
 
 VOLUME ["/app/data"]
 
-ENTRYPOINT ["/app/gptload-rs"]
+ENTRYPOINT ["/app/aequi"]
 CMD ["--config", "/app/config.toml"]

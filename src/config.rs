@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-/// Model cost rates (credits per 1K tokens).
+/// Model cost rates (credits per 1K tokens, or flat per-request fee).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelCost {
     /// Credits per 1K prompt tokens.
@@ -12,6 +12,11 @@ pub struct ModelCost {
     /// Credits per 1K completion tokens.
     #[serde(default = "default_output_rate")]
     pub output: f64,
+    /// Flat credits per request. When set, input/output rates are ignored —
+    /// used for image generation and other non-text APIs where token
+    /// counting is meaningless.
+    #[serde(default)]
+    pub per_request: Option<u64>,
 }
 
 fn default_output_rate() -> f64 {
@@ -34,9 +39,6 @@ pub struct Config {
 
     /// Upstream HTTP status codes that should trigger retry.
     pub retry_status_codes: Option<Vec<u16>>,
-
-    /// Optional list of tokens required in `X-Proxy-Token` for non-admin requests.
-    pub proxy_tokens: Option<Vec<String>>,
 
     /// List of tokens required in `X-Admin-Token` for admin API requests.
     pub admin_tokens: Vec<String>,
@@ -215,15 +217,6 @@ impl Config {
 
     fn normalize(&mut self) -> anyhow::Result<()> {
         // Trim tokens.
-        if let Some(v) = &mut self.proxy_tokens {
-            for t in v.iter_mut() {
-                *t = t.trim().to_string();
-            }
-            v.retain(|t| !t.is_empty());
-            if v.is_empty() {
-                self.proxy_tokens = None;
-            }
-        }
         for t in self.admin_tokens.iter_mut() {
             *t = t.trim().to_string();
         }
