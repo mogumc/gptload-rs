@@ -298,6 +298,7 @@ pub struct RequestLogEntry {
     pub completion_tokens: Option<u64>,
     pub thought_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    pub token_source: Option<String>,
     pub request_headers: Option<BTreeMap<String, String>>,
     pub request_body: Option<String>,
     pub timing: RequestTiming,
