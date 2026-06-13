@@ -13,8 +13,6 @@
   <img src="https://img.shields.io/badge/Rust-2021-orange" alt="Rust"/>
 </p>
 
-<div align="center">
-
 > ⚡ **1,700+ RPS** 单机吞吐，毫秒级延迟  
 > 🔐 **二元 key 状态** active/invalid，无 cooldown 定时器  
 > 🛡️ **并发保护** per-key 并发限制，零 429 风暴  
