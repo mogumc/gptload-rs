@@ -1,14 +1,14 @@
 version: '3.8'
 
 services:
-  gptload-rs:
-    build: .
-    container_name: gptload-rs
+  aequi:
+    image: ghcr.io/mogumc/aequi:latest
+    container_name: aequi
     ports:
       - "8080:8080"
     volumes:
-      - /opt/gptload-rs/config.toml:/app/config.toml:ro
-      - /opt/gptload-rs/data:/app/data
+      - /opt/aequi/config.toml:/app/config.toml:ro
+      - /opt/aequi/data:/app/data
     restart: unless-stopped
     environment:
       - RUST_LOG=info

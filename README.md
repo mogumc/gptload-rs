@@ -1,4 +1,4 @@
-# gptload-rs
+# aequi
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Rust](https://img.shields.io/badge/Rust-2021-orange)
@@ -114,7 +114,7 @@ max_concurrent_per_key = 3  # 该渠道限流严格
 ### 启动
 
 ```bash
-RUST_LOG=info ./target/release/gptload-rs --config config.toml
+RUST_LOG=info ./target/release/aequi --config config.toml
 ```
 
 启动后：

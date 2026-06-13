@@ -25,7 +25,7 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "gptload-rs",
+    name = "aequi",
     version,
     about = "High-performance OpenAI-format proxy with admin UI/API, hot key reload, realtime stats"
 )]
@@ -48,7 +48,7 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(worker_threads)
-        .thread_name("gptload-worker")
+        .thread_name("aequi-worker")
         .build()?;
 
     rt.block_on(async move {
@@ -81,7 +81,7 @@ fn print_startup_info(state: &Arc<state::RouterState>, addr: SocketAddr) {
     };
 
     tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    tracing::info!("  gptload-rs v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("  aequi v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     tracing::info!(%addr, "listening");
     tracing::info!(url = %format!("http://{}/web/", display_addr), "admin panel");

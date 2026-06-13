@@ -1,5 +1,5 @@
 [package]
-name = "gptload-rs"
+name = "aequi"
 version = "0.4.2"
 edition = "2021"
 license = "MIT"

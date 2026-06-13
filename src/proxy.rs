@@ -1112,7 +1112,7 @@ fn build_upstream_request(
 
     sanitize_hop_headers(out_req.headers_mut());
     // Strip compression headers so upstream (especially Cloudflare) does not
-    // compress the response. gptload-rs reads the full body to extract token
+    // compress the response. aequi reads the full body to extract token
     // usage; decompressing gzip/brotli adds complexity and is unnecessary for
     // API proxy traffic where response bodies are small.
     out_req.headers_mut().remove(ACCEPT_ENCODING);

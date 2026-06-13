@@ -17,7 +17,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BINARY_NAME: gptload-rs
+  BINARY_NAME: aequi
 
 jobs:
   build:
