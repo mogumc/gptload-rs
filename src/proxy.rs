@@ -128,16 +128,6 @@ fn authenticate_request(
     req: &Request<Body>,
     ctx: &RequestLogContext,
 ) -> Result<String, Response<Body>> {
-    if !state.authorize_proxy(req) {
-        return Err(logged_json_error(
-            state,
-            ctx,
-            http::StatusCode::UNAUTHORIZED,
-            "missing or invalid X-Proxy-Token",
-            "proxy_unauthorized",
-        ));
-    }
-
     let billing_key = match extract_api_key(req.headers()) {
         Some(key) => key,
         None => {
@@ -926,7 +916,7 @@ fn add_cors_headers(
         headers.insert(
             "access-control-allow-headers",
             http::HeaderValue::from_static(
-                "authorization,content-type,x-api-key,x-proxy-token,x-admin-token",
+                "authorization,content-type,x-api-key,x-admin-token",
             ),
         );
         headers.insert(

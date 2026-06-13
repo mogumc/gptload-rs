@@ -17,9 +17,7 @@ max_retries = 5
 # 触发重试的上游 HTTP 状态码，省略时默认 [429]
 retry_status_codes = [429, 500, 502, 503, 504, 401, 403]
 
-# 代理流量鉴权令牌（可选），客户端须携带 X-Proxy-Token 头
-# 省略或留空则不校验
-# proxy_tokens = ["proxy-token-1"]
+# 代理流量鉴权已改用计费密钥（Authorization: Bearer <billing-key>）
 
 # 管理后台鉴权令牌（必填），API 须携带 X-Admin-Token
 # 公网部署请务必设置强密码

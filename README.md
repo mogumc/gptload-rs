@@ -136,7 +136,6 @@ request_timeout_ms = 60000
 max_retries = 5
 retry_status_codes = [429, 500, 502, 503, 504]
 admin_tokens = ["your-admin-token"]   # 必需
-# proxy_tokens = ["proxy-token-1"]      # 可选，不设则放行所有请求
 data_dir = "./data"
 
 [server]
@@ -321,7 +320,7 @@ curl http://localhost:3000/health
   └─ /v1/*       → 代理流程
        │
        ▼
-[proxy] 认证检查（X-Proxy-Token）
+[proxy] 认证检查（API Key）
        │
        ▼
 [proxy] 提取 billing key，检查余额

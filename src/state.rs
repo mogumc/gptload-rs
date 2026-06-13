@@ -32,7 +32,6 @@ pub struct RouterState {
     pub retry_status_codes: Arc<AHashSet<u16>>,
     pub key_config: KeyConfig,
 
-    pub proxy_tokens: Option<Arc<AHashSet<String>>>,
     pub admin_tokens: Arc<AHashSet<String>>,
     pub usage_inject_upstreams: Option<Arc<AHashSet<String>>>,
 
@@ -67,7 +66,6 @@ pub struct RuntimeConfig {
     pub max_retries: usize,
     pub retry_status_codes: Arc<AHashSet<u16>>,
     pub key_config: KeyConfig,
-    pub proxy_tokens: Option<Arc<AHashSet<String>>>,
     pub admin_tokens: Arc<AHashSet<String>>,
     pub usage_inject_upstreams: Option<Arc<AHashSet<String>>>,
     pub model_costs: ahash::AHashMap<String, crate::config::ModelCost>,
@@ -119,7 +117,6 @@ impl Clone for RouterState {
             max_retries: self.max_retries,
             retry_status_codes: self.retry_status_codes.clone(),
             key_config: self.key_config.clone(),
-            proxy_tokens: self.proxy_tokens.clone(),
             admin_tokens: self.admin_tokens.clone(),
             usage_inject_upstreams: self.usage_inject_upstreams.clone(),
             store: self.store.clone(),
@@ -461,21 +458,6 @@ impl RuntimeConfig {
             .into_iter()
             .collect::<AHashSet<u16>>();
 
-        let proxy_tokens = cfg.proxy_tokens.clone().and_then(|v| {
-            let mut set = AHashSet::with_capacity(v.len().max(1));
-            for t in v {
-                let t = t.trim();
-                if !t.is_empty() {
-                    set.insert(t.to_string());
-                }
-            }
-            if set.is_empty() {
-                None
-            } else {
-                Some(Arc::new(set))
-            }
-        });
-
         let mut admin_set = AHashSet::with_capacity(cfg.admin_tokens.len().max(1));
         for t in cfg.admin_tokens.iter() {
             if !t.is_empty() {
@@ -505,7 +487,6 @@ impl RuntimeConfig {
             max_retries: cfg.max_retries.unwrap_or(5),
             retry_status_codes: Arc::new(retry_status_codes),
             key_config: cfg.key.clone(),
-            proxy_tokens,
             admin_tokens: Arc::new(admin_set),
             usage_inject_upstreams,
             model_costs,
@@ -522,7 +503,6 @@ impl RouterState {
         let request_timeout = runtime.request_timeout;
         let max_retries = runtime.max_retries;
         let retry_status_codes = runtime.retry_status_codes.clone();
-        let proxy_tokens = runtime.proxy_tokens.clone();
         let admin_tokens = runtime.admin_tokens.clone();
         let usage_inject_upstreams = runtime.usage_inject_upstreams.clone();
 
@@ -619,7 +599,6 @@ impl RouterState {
             max_retries,
             retry_status_codes,
             key_config: cfg.key.clone(),
-            proxy_tokens,
             admin_tokens,
             usage_inject_upstreams,
             store,
@@ -643,21 +622,6 @@ impl RouterState {
             data_dir,
             log_write_pause: log_pause,
         })
-    }
-
-    #[inline]
-    pub fn authorize_proxy(&self, req: &Request<Body>) -> bool {
-        let rt = self.runtime.load();
-        let Some(tokens) = &rt.proxy_tokens else {
-            return true;
-        };
-        let Some(h) = req.headers().get("x-proxy-token") else {
-            return false;
-        };
-        match h.to_str() {
-            Ok(s) => tokens.contains(s),
-            Err(_) => false,
-        }
     }
 
     #[inline]
