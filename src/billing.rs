@@ -279,14 +279,27 @@ fn flush_pending(tree: &sled::Tree, pending: &mut AHashMap<String, i64>) {
     let _ = tree.flush();
 }
 
-/// Cost in micro-credits: ceil((prompt×input + completion×output)/1000 × 1_000_000).
-/// Unknown models fall back to input=0.1, output=1.0. Minimum 1 micro-credit.
+/// Cost in micro-credits. Two modes:
+/// - Per-request: flat fee when `ModelCost.per_request` is set (image, non-text APIs).
+/// - Token-based: ceil((prompt×input + completion×output)/1000 × 1_000_000).
+///   Unknown models fall back to input=0.1, output=1.0. Minimum 1 micro-credit.
 pub fn compute_credit_cost(
     prompt_tokens: u64,
     completion_tokens: u64,
     model: &str,
     model_costs: &ahash::AHashMap<String, crate::config::ModelCost>,
 ) -> i64 {
+    // Per-request billing: flat fee, no token calculation needed.
+    if let Some(pr) = model_costs.get(model).and_then(|r| r.per_request) {
+        let cost = ((pr as f64) * MICRO_PER_CREDIT as f64).ceil() as i64;
+        let final_cost = cost.max(MIN_COST_MICRO);
+        tracing::debug!(
+            model, per_request = pr, final_cost,
+            "billing: per-request cost={final_cost}"
+        );
+        return final_cost;
+    }
+
     let rate = model_costs.get(model);
     let input_rate = rate.map(|r| r.input).unwrap_or(0.1);
     let output_rate = rate.map(|r| r.output).unwrap_or(1.0);

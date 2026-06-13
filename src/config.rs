@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-/// Model cost rates (credits per 1K tokens).
+/// Model cost rates (credits per 1K tokens, or flat per-request fee).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelCost {
     /// Credits per 1K prompt tokens.
@@ -12,6 +12,11 @@ pub struct ModelCost {
     /// Credits per 1K completion tokens.
     #[serde(default = "default_output_rate")]
     pub output: f64,
+    /// Flat credits per request. When set, input/output rates are ignored —
+    /// used for image generation and other non-text APIs where token
+    /// counting is meaningless.
+    #[serde(default)]
+    pub per_request: Option<u64>,
 }
 
 fn default_output_rate() -> f64 {
