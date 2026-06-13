@@ -1173,19 +1173,21 @@ async fn proxy_upstream_response(
         .headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     let content_encoding = parts
         .headers
         .get(CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
 
     // ── Non-streaming: read body synchronously, extract usage, bill, return ──
     if !stream_request {
         let (resp_bytes, was_decompressed) = read_and_bill_body(
             body,
-            content_type,
-            content_encoding,
+            &content_type,
+            &content_encoding,
             status,
             &state,
             &log_ctx,
@@ -1205,6 +1207,11 @@ async fn proxy_upstream_response(
     }
 
     // ── Streaming: spawn task to forward chunks and extract SSE usage ──
+    // Strip Content-Length / Content-Encoding so the client receives
+    // true chunked streaming, not a buffered response.
+    parts.headers.remove(CONTENT_LENGTH);
+    parts.headers.remove(CONTENT_ENCODING);
+
     let is_event_stream = content_type.starts_with("text/event-stream");
     let want_sse_usage = is_event_stream;
 
