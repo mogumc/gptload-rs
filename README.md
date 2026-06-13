@@ -99,7 +99,7 @@ max_concurrent_per_key = 20
 
 **预留-结算** 模式，防止余额超扣：
 
-1. `reserve_request()` — 原子扣减 1 credit
+1. `reserve_request()` — 预扣除最低扣费额度
 2. `settle_reserved_usage()` — 按实际 token 结算
 3. `release_reservation()` — 失败时归还
 
