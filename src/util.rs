@@ -164,6 +164,45 @@ pub fn extract_sse_content(chunk: &[u8], buf: &mut String) {
     }
 }
 
+/// Extract message content from a chat completions JSON request body for token estimation.
+/// Returns the message text concatenated — mirrors `extract_sse_content` / `extract_nonstreaming_content`
+/// on the output side, so input and output token estimations use comparable text (not raw JSON).
+///
+/// Design note: deliberately skips `image_url` / multimodal non-text parts.
+/// Following new-api's philosophy: fallback estimation sacrifices multimodal precision
+/// for performance and simplicity. Accurate image token counting requires upstream `usage`,
+/// and fallback exists precisely for when upstream doesn't provide it.
+pub fn extract_request_content(request_body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(request_body).ok()?;
+    let messages = v.get("messages")?.as_array()?;
+    let mut buf = String::new();
+    for msg in messages {
+        let Some(content) = msg.get("content") else { continue };
+        match content {
+            serde_json::Value::String(s) => {
+                if !buf.is_empty() {
+                    buf.push('\n');
+                }
+                buf.push_str(s);
+            }
+            serde_json::Value::Array(parts) => {
+                for part in parts {
+                    if let Some("text") = part.get("type").and_then(|t| t.as_str()) {
+                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                            if !buf.is_empty() {
+                                buf.push('\n');
+                            }
+                            buf.push_str(text);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if buf.is_empty() { None } else { Some(buf) }
+}
+
 fn is_cjk(ch: char) -> bool {
     matches!(
         ch as u32,

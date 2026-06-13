@@ -1273,6 +1273,8 @@ async fn proxy_upstream_response(
                     // Estimate completion from accumulated content.
                     // Keep upstream prompt count if available, otherwise estimate.
                     let completion_est = crate::util::estimate_tokens(&content_buf);
+                    // Extract only message content for estimation (not raw JSON),
+                    // mirroring how completion content is extracted on the output side.
                     let prompt = usage
                         .as_ref()
                         .map(|u| u.prompt)
@@ -1280,7 +1282,8 @@ async fn proxy_upstream_response(
                             log_ctx
                                 .request_body
                                 .as_deref()
-                                .map(|b| crate::util::estimate_tokens(b))
+                                .and_then(|b| crate::util::extract_request_content(b))
+                                .map(|content| crate::util::estimate_tokens(&content))
                                 .unwrap_or(1)
                         });
                     // Estimate covers ALL output (reasoning + visible).
@@ -1453,8 +1456,9 @@ async fn read_and_bill_body(
                     log_ctx
                         .request_body
                         .as_deref()
-                        .map(|b| crate::util::estimate_tokens(b))
-                        .unwrap_or(1)
+                    .and_then(|b| crate::util::extract_request_content(b))
+                    .map(|content| crate::util::estimate_tokens(&content))
+                    .unwrap_or(1)
                 });
             tracing::info!(
                 path = %log_ctx.path,
