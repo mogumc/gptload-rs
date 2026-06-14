@@ -1850,6 +1850,48 @@ impl RouterState {
     }
 }
 
+impl RouterState {
+    /// Complete billing settlement for a request: settle if usage found, or release reservation.
+    pub fn settle_billing(
+        &self,
+        billing_key: &str,
+        usage: Option<(u64, u64, u64, u64)>, // (prompt, completion, thought, total)
+        billing_model: &str,
+        is_billable: bool,
+        is_2xx: bool,
+    ) {
+        match usage {
+            Some((prompt, completion, thought, total)) => {
+                let model_costs = &self.runtime.load_full().model_costs;
+                let bill_out = completion.saturating_add(thought);
+                let cost = crate::billing::compute_credit_cost(
+                    prompt, bill_out, billing_model, model_costs,
+                );
+                let _ = self.billing.settle_reserved_usage(
+                    billing_key, prompt, bill_out, billing_model, model_costs,
+                );
+                self.stats
+                    .prompt_tokens_total
+                    .fetch_add(prompt, Ordering::Relaxed);
+                self.stats
+                    .completion_tokens_total
+                    .fetch_add(bill_out, Ordering::Relaxed);
+                self.stats
+                    .thought_tokens_total
+                    .fetch_add(thought, Ordering::Relaxed);
+                self.stats
+                    .tokens_total
+                    .fetch_add(total, Ordering::Relaxed);
+                let _ = self.store.add_key_usage(billing_key, total, cost);
+            }
+            None if !is_billable || !is_2xx => {
+                let _ = self.billing.release_reservation(billing_key);
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(unix)]
 impl RouterState {
     pub fn apply_config_reload(&self, cfg: Config) -> anyhow::Result<()> {
