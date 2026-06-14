@@ -68,7 +68,6 @@ pub(crate) fn build_snapshot(state: &RouterState) -> StatsSnapshot {
 
     let snap = state.snapshot.load_full();
     let global_max = state.key_config().max_concurrent_per_key;
-    let _now = ts;
     let ups: Vec<UpstreamInfo> = snap
         .upstreams
         .iter()

@@ -1,3 +1,4 @@
+use super::try_parse;
 use crate::config::{UpstreamConfig, UpstreamFormat};
 use crate::state::RouterState;
 use crate::util::{now_ms, query_get};
@@ -171,10 +172,7 @@ impl UpstreamBody {
 }
 
 pub(crate) async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
-    let input: UpstreamBody = match super::parse_json_body(req).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let input: UpstreamBody = try_parse!(super::parse_json_body(req).await);
     if input.id.as_deref().unwrap_or("").trim().is_empty() {
         return RouterState::json_error(http::StatusCode::BAD_REQUEST, "missing id", "bad_request");
     }
@@ -199,10 +197,7 @@ async fn api_update_upstream(
     state: Arc<RouterState>,
     upstream_id: &str,
 ) -> Response<Body> {
-    let input: UpstreamBody = match super::parse_json_body(req).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let input: UpstreamBody = try_parse!(super::parse_json_body(req).await);
     let id = upstream_id.to_string();
     let cfg = match input.into_upstream_config(id.clone()) {
         Ok(cfg) => cfg,

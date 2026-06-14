@@ -3,6 +3,8 @@ use hyper::{Body, Request, Response};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use super::try_parse;
+
 #[derive(Deserialize)]
 struct JsonKeysBody {
     keys: Vec<String>,
@@ -14,18 +16,9 @@ pub(super) async fn api_add_keys(
     state: Arc<RouterState>,
     upstream_id: &str,
 ) -> Response<Body> {
-    let Some((_idx, upstream)) = state.upstream_by_id(upstream_id) else {
-        return RouterState::json_error(
-            http::StatusCode::NOT_FOUND,
-            "unknown upstream id",
-            "not_found",
-        );
-    };
+    let (_idx, upstream) = try_parse!(super::upstreams::get_upstream(&state, upstream_id));
 
-    let (keys, dedupe) = match parse_keys_body(req).await {
-        Ok(v) => v,
-        Err(e) => return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request"),
-    };
+    let (keys, dedupe) = try_parse!(parse_keys_body(req).await);
 
     let keys = if dedupe { dedupe_keys(keys) } else { keys };
     if keys.is_empty() {
@@ -88,18 +81,9 @@ pub(super) async fn api_replace_keys(
     state: Arc<RouterState>,
     upstream_id: &str,
 ) -> Response<Body> {
-    let Some((_idx, upstream)) = state.upstream_by_id(upstream_id) else {
-        return RouterState::json_error(
-            http::StatusCode::NOT_FOUND,
-            "unknown upstream id",
-            "not_found",
-        );
-    };
+    let (_idx, upstream) = try_parse!(super::upstreams::get_upstream(&state, upstream_id));
 
-    let (keys, dedupe) = match parse_keys_body(req).await {
-        Ok(v) => v,
-        Err(e) => return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request"),
-    };
+    let (keys, dedupe) = try_parse!(parse_keys_body(req).await);
 
     let keys = if dedupe { dedupe_keys(keys) } else { keys };
     if keys.is_empty() {
@@ -151,18 +135,9 @@ pub(super) async fn api_delete_keys(
     state: Arc<RouterState>,
     upstream_id: &str,
 ) -> Response<Body> {
-    let Some((_idx, upstream)) = state.upstream_by_id(upstream_id) else {
-        return RouterState::json_error(
-            http::StatusCode::NOT_FOUND,
-            "unknown upstream id",
-            "not_found",
-        );
-    };
+    let (_idx, upstream) = try_parse!(super::upstreams::get_upstream(&state, upstream_id));
 
-    let (keys, dedupe) = match parse_keys_body(req).await {
-        Ok(v) => v,
-        Err(e) => return RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request"),
-    };
+    let (keys, dedupe) = try_parse!(parse_keys_body(req).await);
     if keys.is_empty() {
         return RouterState::json_error(
             http::StatusCode::BAD_REQUEST,
@@ -200,10 +175,16 @@ pub(super) async fn api_delete_keys(
     })
     .await;
 
-    match crate::util::spawn_result(res, http::StatusCode::INTERNAL_SERVER_ERROR) {
-        Ok(v) => super::json_ok(&v),
-        Err((status, msg)) => RouterState::json_error(status, &msg, "internal_error"),
-    }
+    let v = match crate::util::spawn_result(res, http::StatusCode::INTERNAL_SERVER_ERROR) {
+        Ok(v) => v,
+        Err((status, msg)) => return RouterState::json_error(status, &msg, "internal_error"),
+    };
+    let state2 = state.clone();
+    let id2 = upstream_id.to_string();
+    tokio::spawn(async move {
+        state2.refresh_missing_models_for_upstream(&id2).await;
+    });
+    super::json_ok(&v)
 }
 
 #[derive(Deserialize, Default)]
@@ -254,10 +235,7 @@ pub(super) async fn api_release_keys(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let body: KeyStatusBody = match super::parse_json_body(req).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let body: KeyStatusBody = try_parse!(super::parse_json_body(req).await);
     let restored = match scoped_key_set(&body) {
         Ok(KeyStatusScope::Keys(set)) => upstream.restore_keys(&set),
         Ok(KeyStatusScope::All) => upstream.restore_all_keys(),
@@ -280,10 +258,7 @@ pub(super) async fn api_invalidate_keys(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let body: KeyStatusBody = match super::parse_json_body(req).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let body: KeyStatusBody = try_parse!(super::parse_json_body(req).await);
     let invalidated = match scoped_key_set(&body) {
         Ok(KeyStatusScope::Keys(set)) => upstream.invalidate_keys(&set),
         Ok(KeyStatusScope::All) => {
@@ -315,10 +290,7 @@ pub(super) async fn api_test_key(
     state: Arc<RouterState>,
     upstream_id: &str,
 ) -> Response<Body> {
-    let body: KeyTestBody = match super::parse_json_body(req).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let body: KeyTestBody = try_parse!(super::parse_json_body(req).await);
     let started = std::time::Instant::now();
     match state.test_key_by_value(upstream_id, &body.key).await {
         Ok(valid) => super::json_ok(&serde_json::json!({
@@ -353,13 +325,7 @@ pub(super) async fn api_list_keys(
     upstream_id: &str,
     uri: &http::Uri,
 ) -> Response<Body> {
-    let Some((_idx, upstream)) = state.upstream_by_id(upstream_id) else {
-        return RouterState::json_error(
-            http::StatusCode::NOT_FOUND,
-            "unknown upstream id",
-            "not_found",
-        );
-    };
+    let (_idx, upstream) = try_parse!(super::upstreams::get_upstream(&state, upstream_id));
 
     let limit: usize = crate::util::query_get(uri, "limit")
         .and_then(|s: &str| s.parse::<usize>().ok())
@@ -432,7 +398,7 @@ pub(super) async fn api_export_keys(state: Arc<RouterState>, upstream_id: &str) 
         })
 }
 
-async fn parse_keys_body(req: Request<Body>) -> Result<(Vec<String>, bool), String> {
+async fn parse_keys_body(req: Request<Body>) -> Result<(Vec<String>, bool), Response<Body>> {
     // Accept:
     // - text/plain: newline-separated keys
     // - application/json: {"keys": ["k1", "k2"], "dedupe": true}
@@ -445,11 +411,13 @@ async fn parse_keys_body(req: Request<Body>) -> Result<(Vec<String>, bool), Stri
 
     let body_bytes = crate::util::read_body_limit(req, 50 * 1024 * 1024)
         .await
-        .map_err(|e| e.to_string())?; // 50MB
+        .map_err(|e| RouterState::json_error(http::StatusCode::BAD_REQUEST, &e.to_string(), "bad_request"))?; // 50MB
 
     if content_type.starts_with("application/json") {
         let v: JsonKeysBody =
-            serde_json::from_slice(&body_bytes).map_err(|e| format!("invalid json: {e}"))?;
+            serde_json::from_slice(&body_bytes).map_err(|e| RouterState::json_error(
+                http::StatusCode::BAD_REQUEST, &format!("invalid json: {e}"), "bad_request",
+            ))?;
         let mut keys: Vec<String> = Vec::with_capacity(v.keys.len());
         for k in v.keys {
             let k = k.trim().to_string();
@@ -457,14 +425,16 @@ async fn parse_keys_body(req: Request<Body>) -> Result<(Vec<String>, bool), Stri
                 continue;
             }
             if let Err(e) = crate::util::validate_key_chars(&k) {
-                return Err(e);
+                return Err(RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request"));
             }
             keys.push(k);
         }
         Ok((keys, v.dedupe.unwrap_or(true)))
     } else {
         // Treat as plain text.
-        let s = std::str::from_utf8(&body_bytes).map_err(|_| "body is not utf-8".to_string())?;
+        let s = std::str::from_utf8(&body_bytes).map_err(|_| RouterState::json_error(
+            http::StatusCode::BAD_REQUEST, "body is not utf-8", "bad_request",
+        ))?;
         let mut keys: Vec<String> = Vec::new();
         for line in s.lines() {
             let k = line.trim();
@@ -472,7 +442,7 @@ async fn parse_keys_body(req: Request<Body>) -> Result<(Vec<String>, bool), Stri
                 continue;
             }
             if let Err(e) = crate::util::validate_key_chars(k) {
-                return Err(e);
+                return Err(RouterState::json_error(http::StatusCode::BAD_REQUEST, &e, "bad_request"));
             }
             keys.push(k.to_string());
         }

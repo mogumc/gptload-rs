@@ -93,8 +93,11 @@ fn print_startup_info(state: &Arc<state::RouterState>, addr: SocketAddr) {
             .iter()
             .take(3)
             .map(|t| {
-                if t.len() > 8 {
-                    format!("{}...{}", &t[..4], &t[t.len() - 4..])
+                let char_count = t.chars().count();
+                if char_count > 8 {
+                    let prefix: String = t.chars().take(4).collect();
+                    let suffix: String = t.chars().skip(char_count - 4).collect();
+                    format!("{prefix}...{suffix}")
                 } else {
                     t.clone()
                 }
@@ -160,11 +163,15 @@ async fn wait_inflight_or_exit(state: Arc<state::RouterState>) {
         }
         tokio::select! {
             _ = &mut deadline => {
-                tracing::warn!(
+                tracing::error!(
                     inflight,
-                    "graceful shutdown: timeout, forcing exit"
+                    "graceful shutdown: timeout reached, forcing exit (some data may be lost)"
                 );
-                std::process::exit(0);
+                // Best-effort flush of persistent storage before forced exit.
+                if let Err(e) = state.store.flush() {
+                    tracing::error!(error = %e, "failed to flush storage before exit");
+                }
+                std::process::exit(1);
             }
             _ = tick.tick() => {
                 tracing::info!(

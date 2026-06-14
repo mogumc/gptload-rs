@@ -532,7 +532,7 @@ impl RouterState {
     /// Select an upstream + key that supports the given model.
     /// `billing_key_level`: the request user's billing key permission level.
     /// -1 = admin (no restriction). Returns None if no upstream+key is eligible.
-    pub fn select_for_model(&self, model: &str, billing_key_level: i32, _now_ms: u64) -> Option<Selected> {
+    pub fn select_for_model(&self, model: &str, billing_key_level: i32) -> Option<Selected> {
         self.select_for_model_excluding(model, billing_key_level, None)
     }
 

@@ -106,7 +106,7 @@ impl RouterState {
     }
 
     #[inline]
-    pub fn on_timeout(&self, sel: &Selected, _now_ms: u64) {
+    pub fn on_timeout(&self, sel: &Selected) {
         self.stats.errors_timeout.fetch_add(1, Ordering::Relaxed);
         sel.upstream
             .stats
@@ -115,7 +115,7 @@ impl RouterState {
     }
 
     #[inline]
-    pub fn on_network_error(&self, sel: &Selected, _now_ms: u64) {
+    pub fn on_network_error(&self, sel: &Selected) {
         self.stats.errors_network.fetch_add(1, Ordering::Relaxed);
         sel.upstream
             .stats

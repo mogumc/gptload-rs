@@ -30,6 +30,18 @@ pub(crate) async fn parse_json_body<T: serde::de::DeserializeOwned>(
     })
 }
 
+/// Unwrap a `Result<T, Response<Body>>`, returning the error response early on failure.
+/// Replaces the 4-line `match parse_json_body(req).await { Ok(v) => v, Err(resp) => return resp }` pattern.
+macro_rules! try_parse {
+    ($expr:expr) => {
+        match $expr {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        }
+    };
+}
+pub(crate) use try_parse;
+
 pub(crate) fn method_not_allowed() -> Response<Body> {
     RouterState::json_error(
         http::StatusCode::METHOD_NOT_ALLOWED,
@@ -49,10 +61,7 @@ struct ModelRoutesBody {
 }
 
 pub(crate) async fn api_put_model_routes(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
-    let routes_body: ModelRoutesBody = match parse_json_body(req).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let routes_body: ModelRoutesBody = try_parse!(parse_json_body(req).await);
     match state.save_model_routes(routes_body.upstreams) {
         Ok(routes) => json_ok(&routes),
         Err(e) => {
@@ -85,10 +94,7 @@ pub(crate) async fn api_get_model_costs(state: Arc<RouterState>) -> Response<Bod
 }
 
 pub(crate) async fn api_set_model_costs(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
-    let input: serde_json::Value = match parse_json_body(req).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let input: serde_json::Value = try_parse!(parse_json_body(req).await);
     let obj = match input.as_object() {
         Some(o) => o,
         None => {

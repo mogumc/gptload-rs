@@ -4,6 +4,8 @@ use std::path::Path;
 
 pub struct KeyStore {
     db: sled::Db,
+    /// Serializes add_key_usage to prevent lost-update races on concurrent calls.
+    usage_lock: std::sync::Mutex<()>,
 }
 
 pub struct AddKeysResult {
@@ -18,7 +20,7 @@ impl KeyStore {
         std::fs::create_dir_all(data_dir)?;
         let db_path = data_dir.join("keys_db");
         let db = sled::open(db_path)?;
-        Ok(Self { db })
+        Ok(Self { db, usage_lock: std::sync::Mutex::new(()) })
     }
 
     fn tree_name(upstream_id: &str) -> String {
@@ -104,6 +106,7 @@ impl KeyStore {
     }
 
     pub fn add_key_usage(&self, key: &str, tokens: u64, credits: i64) -> anyhow::Result<()> {
+        let _guard = self.usage_lock.lock().map_err(|e| anyhow::anyhow!("usage_lock poisoned: {e}"))?;
         let tree = self.open_key_usage_tree()?;
         let (ct, cc) = self.get_key_usage(key);
         let new = [

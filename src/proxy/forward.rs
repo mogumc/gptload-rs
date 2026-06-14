@@ -40,6 +40,37 @@ fn try_retry_alternative(
     state.select_for_model_excluding(model, level, Some((&sel.upstream.id, &sel.key.key)))
 }
 
+/// Decide whether to retry on an alternative upstream. Logs the decision.
+/// Returns `Some(new_sel)` if retry is possible, `None` if the caller should return the error.
+fn try_retry_or_give_up(
+    state: &Arc<RouterState>,
+    model: &str,
+    sel: &Selected,
+    billing_key: &str,
+    reason: &str,
+) -> Option<Selected> {
+    let new_sel = try_retry_alternative(state, model, billing_key, sel)?;
+    tracing::debug!(
+        reason,
+        old_upstream = %sel.upstream.id,
+        new_upstream = %new_sel.upstream.id,
+        "retrying with alternative upstream"
+    );
+    Some(new_sel)
+}
+
+/// When retry is not possible: release the billing reservation and wrap the error as an AttemptResult.
+fn give_up_with_error(
+    state: &Arc<RouterState>,
+    billing_key: &str,
+    billing_reserved: &mut bool,
+    log_ctx: &RequestLogContext,
+    error: Response<Body>,
+) -> AttemptResult {
+    release_if_reserved(state, billing_key, billing_reserved);
+    AttemptResult::Success(logged_response(state, log_ctx, error))
+}
+
 async fn execute_attempt(
     state: &Arc<RouterState>,
     sel: &Selected,
@@ -56,7 +87,6 @@ async fn execute_attempt(
     stream_request: bool,
     lifecycle: &mut Option<RequestLifecycle>,
 ) -> AttemptResult {
-    let now = now_ms();
     let attempt_start = Instant::now();
 
     let model = log_ctx.model.as_deref().unwrap_or_default();
@@ -153,18 +183,10 @@ async fn execute_attempt(
             };
             state.on_upstream_status(sel, status, retry_after_ms);
 
-            let should_retry = should_retry_status(state, status);
-
-            if should_retry {
+            if should_retry_status(state, status) {
                 let model = log_ctx.model.as_deref().unwrap_or_default();
-                if let Some(new_sel) = try_retry_alternative(state, model, billing_key, sel) {
+                if let Some(new_sel) = try_retry_or_give_up(state, model, sel, billing_key, &status.to_string()) {
                     drop(up_resp);
-                    tracing::debug!(
-                        status = %status,
-                        old_upstream = %sel.upstream.id,
-                        new_upstream = %new_sel.upstream.id,
-                        "retrying with different key/upstream"
-                    );
                     return AttemptResult::Retry(new_sel);
                 }
             }
@@ -195,54 +217,40 @@ async fn execute_attempt(
                 error = %e,
                 "upstream request failed"
             );
-            state.on_network_error(sel, now);
+            state.on_network_error(sel);
 
             let model = log_ctx.model.as_deref().unwrap_or_default();
-            if let Some(new_sel) = try_retry_alternative(state, model, billing_key, sel) {
-                tracing::debug!(
-                    old_upstream = %sel.upstream.id,
-                    new_upstream = %new_sel.upstream.id,
-                    "retrying after network error"
-                );
+            if let Some(new_sel) = try_retry_or_give_up(state, model, sel, billing_key, "network_error") {
                 return AttemptResult::Retry(new_sel);
             }
 
-            release_if_reserved(state, billing_key, billing_reserved);
-            AttemptResult::Success(logged_response(
-                state,
-                log_ctx,
+            give_up_with_error(
+                state, billing_key, billing_reserved, log_ctx,
                 RouterState::json_error(
                     http::StatusCode::BAD_GATEWAY,
                     "upstream request failed",
                     "upstream_error",
                 ),
-            ))
+            )
         }
         Err(_) => {
             sel.key
                 .record_latency_ms(attempt_start.elapsed().as_millis() as u64);
-            state.on_timeout(sel, now);
+            state.on_timeout(sel);
 
             let model = log_ctx.model.as_deref().unwrap_or_default();
-            if let Some(new_sel) = try_retry_alternative(state, model, billing_key, sel) {
-                tracing::debug!(
-                    old_upstream = %sel.upstream.id,
-                    new_upstream = %new_sel.upstream.id,
-                    "retrying after timeout"
-                );
+            if let Some(new_sel) = try_retry_or_give_up(state, model, sel, billing_key, "timeout") {
                 return AttemptResult::Retry(new_sel);
             }
 
-            release_if_reserved(state, billing_key, billing_reserved);
-            AttemptResult::Success(logged_response(
-                state,
-                log_ctx,
+            give_up_with_error(
+                state, billing_key, billing_reserved, log_ctx,
                 RouterState::json_error(
                     http::StatusCode::GATEWAY_TIMEOUT,
                     "upstream request timeout",
                     "upstream_timeout",
                 ),
-            ))
+            )
         }
     }
 }
@@ -376,7 +384,6 @@ pub(super) async fn forward(
     };
 
     let mut queue_wait_ms = 0u64;
-    let now = now_ms();
     let mut sel = if !state.model_exists(&model) {
         return logged_json_error(
             &state,
@@ -385,7 +392,7 @@ pub(super) async fn forward(
             "model not found",
             "model_not_found",
         );
-    } else if let Some(sel) = state.select_for_model(&model, state.store.get_key_level(&billing_key), now) {
+    } else if let Some(sel) = state.select_for_model(&model, state.store.get_key_level(&billing_key)) {
         sel
     } else {
         match wait_for_selection(&state, &model, state.store.get_key_level(&billing_key)).await {
@@ -529,7 +536,7 @@ async fn wait_for_selection(
                 "shutting_down",
             ));
         }
-        if let Some(sel) = state.select_for_model(model, billing_key_level, now_ms()) {
+        if let Some(sel) = state.select_for_model(model, billing_key_level) {
             return Ok((sel, start.elapsed().as_millis() as u64));
         }
 

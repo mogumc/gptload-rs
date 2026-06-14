@@ -78,6 +78,8 @@ pub struct RequestsLog {
     cap: usize,
     tx: Option<mpsc::Sender<RequestLogEntry>>,
     broadcast_tx: broadcast::Sender<RequestLogEntry>,
+    /// Set once when the file writer channel is detected as closed, to avoid logging the error on every request.
+    writer_dead: AtomicBool,
 }
 
 impl RequestsLog {
@@ -89,13 +91,18 @@ impl RequestsLog {
             cap,
             tx,
             broadcast_tx,
+            writer_dead: AtomicBool::new(false),
         }
     }
 
     pub fn record(&self, entry: RequestLogEntry) {
         let _ = self.broadcast_tx.send(entry.clone());
         if let Some(tx) = &self.tx {
-            let _ = tx.try_send(entry.clone());
+            if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) = tx.try_send(entry.clone()) {
+                if !self.writer_dead.swap(true, Ordering::Relaxed) {
+                    tracing::error!("request log writer task has died — file logging disabled for remaining process lifetime");
+                }
+            }
         }
         self.push_entry(entry);
     }
@@ -233,21 +240,24 @@ pub(super) fn update_bucket(
 }
 
 pub(super) fn start_request_log_writer(path: PathBuf, pause: Arc<AtomicBool>) -> Option<mpsc::Sender<RequestLogEntry>> {
+    // Open the file synchronously so we can detect failure immediately.
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(path = %path.display(), error = %e, "request log file open failed — file logging disabled");
+            return None;
+        }
+    };
+
     let (tx, mut rx) = mpsc::channel::<RequestLogEntry>(2048);
+    let std_file = file;
 
     tokio::spawn(async move {
-        let file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await;
-        let mut file = match file {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "request log open failed");
-                return;
-            }
-        };
+        let mut file = tokio::fs::File::from_std(std_file);
 
         let mut pending = 0usize;
         let mut tick = tokio::time::interval(Duration::from_secs(1));

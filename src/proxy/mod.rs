@@ -95,6 +95,12 @@ impl RequestLogContext {
             token_source: None,
         }
     }
+
+    /// Whether this request targets a billable chat completions endpoint.
+    #[inline]
+    pub(crate) fn is_billable(&self) -> bool {
+        self.path.starts_with("/v1/chat/completions")
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -110,5 +116,35 @@ impl UsageTokens {
     /// Billing charges thinking at the output rate, not a separate rate.
     pub(crate) fn billing_completion(&self) -> u64 {
         self.completion.saturating_add(self.thought)
+    }
+
+    /// Build a fallback `UsageTokens` by estimating tokens from content text.
+    /// Used when upstream returns no usage or completion==0.
+    /// Returns `None` if content is empty.
+    pub(crate) fn estimate_fallback(
+        upstream_usage: Option<&UsageTokens>,
+        content_text: &str,
+        request_body: Option<&str>,
+    ) -> Option<Self> {
+        if content_text.is_empty() {
+            return None;
+        }
+        let completion_est = crate::util::estimate_tokens(content_text);
+        let prompt = upstream_usage
+            .map(|u| u.prompt)
+            .unwrap_or_else(|| {
+                request_body
+                    .and_then(|b| crate::util::extract_request_content(b))
+                    .map(|content| crate::util::estimate_tokens(&content))
+                    .unwrap_or(1)
+            });
+        // Estimate covers ALL output (reasoning + visible).
+        // Set thought=0 to avoid double-counting with upstream.
+        Some(UsageTokens {
+            prompt,
+            completion: completion_est,
+            thought: 0,
+            total: prompt + completion_est,
+        })
     }
 }

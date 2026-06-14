@@ -292,34 +292,17 @@ pub(super) async fn proxy_upstream_response(
                 Some(u)
             }
             _ => {
-                let is_billable = log_ctx.path.starts_with("/v1/chat/completions");
+                let is_billable = log_ctx.is_billable();
                 let is_2xx = status.is_success();
-                if is_billable && is_2xx && !content_buf.is_empty() {
-                    // Estimate completion from accumulated content.
-                    // Keep upstream prompt count if available, otherwise estimate.
-                    let completion_est = crate::util::estimate_tokens(&content_buf);
-                    // Extract only message content for estimation (not raw JSON),
-                    // mirroring how completion content is extracted on the output side.
-                    let prompt = usage
-                        .as_ref()
-                        .map(|u| u.prompt)
-                        .unwrap_or_else(|| {
-                            log_ctx
-                                .request_body
-                                .as_deref()
-                                .and_then(|b| crate::util::extract_request_content(b))
-                                .map(|content| crate::util::estimate_tokens(&content))
-                                .unwrap_or(1)
-                        });
-                    // Estimate covers ALL output (reasoning + visible).
-                    // Set thought=0 to avoid double-counting with upstream.
-                    token_source = Some("estimated".into());
-                    Some(UsageTokens {
-                        prompt,
-                        completion: completion_est,
-                        thought: 0,
-                        total: prompt + completion_est,
-                    })
+                if is_billable && is_2xx {
+                    if let Some(est) = UsageTokens::estimate_fallback(
+                        usage.as_ref(), &content_buf, log_ctx.request_body.as_deref(),
+                    ) {
+                        token_source = Some("estimated".into());
+                        Some(est)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -328,7 +311,7 @@ pub(super) async fn proxy_upstream_response(
 
         if let Some(key) = billing_key.as_deref() {
             let model = log_ctx.billing_model.as_deref().unwrap_or("");
-            let is_billable = log_ctx.path.starts_with("/v1/chat/completions");
+            let is_billable = log_ctx.is_billable();
             let is_2xx = status.is_success();
             state.settle_billing(
                 key,
@@ -407,7 +390,7 @@ async fn read_and_bill_body(
 
     let resp_bytes = out_bytes.len();
 
-    let is_billable = log_ctx.path.starts_with("/v1/chat/completions");
+    let is_billable = log_ctx.is_billable();
     let is_2xx = status.is_success();
 
     let usage = if is_billable && is_2xx && !overflow && content_type.starts_with("application/json") {
@@ -465,31 +448,18 @@ async fn read_and_bill_body(
     // Fallback: estimate when upstream usage is missing or completion==0.
     if final_usage.is_none() && is_billable && is_2xx && !overflow {
         if let Some(text) = extract_nonstreaming_content(&out_bytes) {
-            let completion_est = crate::util::estimate_tokens(&text);
-            let prompt = usage
-                .as_ref()
-                .map(|u| u.prompt)
-                .unwrap_or_else(|| {
-                    log_ctx
-                        .request_body
-                        .as_deref()
-                    .and_then(|b| crate::util::extract_request_content(b))
-                    .map(|content| crate::util::estimate_tokens(&content))
-                    .unwrap_or(1)
-                });
-            tracing::info!(
-                path = %log_ctx.path,
-                prompt,
-                completion_est,
-                "non-streaming usage estimated (upstream completion=0 or no usage)"
-            );
-            token_source = Some("estimated".into());
-            final_usage = Some(UsageTokens {
-                prompt,
-                completion: completion_est,
-                thought: 0,
-                total: prompt + completion_est,
-            });
+            if let Some(est) = UsageTokens::estimate_fallback(
+                usage.as_ref(), &text, log_ctx.request_body.as_deref(),
+            ) {
+                tracing::info!(
+                    path = %log_ctx.path,
+                    prompt = est.prompt,
+                    completion_est = est.completion,
+                    "non-streaming usage estimated (upstream completion=0 or no usage)"
+                );
+                token_source = Some("estimated".into());
+                final_usage = Some(est);
+            }
         }
     }
 
