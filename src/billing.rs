@@ -422,13 +422,15 @@ pub(crate) async fn api_billing_overview(state: Arc<RouterState>) -> Response<Bo
     let upstream_summary: Vec<serde_json::Value> = snap.upstreams.iter().map(|u| {
         let keys = u.keys.load_full();
         let active = keys.iter().filter(|k| k.is_active()).count();
+        let selected = u.stats.selected_total.load(std::sync::atomic::Ordering::Relaxed);
         serde_json::json!({
             "id": u.id.as_ref(),
             "total_keys": keys.len(),
             "active_keys": active,
             "format": u.format.as_str(),
             "min_key_level": u.min_key_level,
-            "model_map": u.model_map.iter().map(|(k, v)| serde_json::json!({k: v})).collect::<Vec<_>>(),
+            "weight": u.weight,
+            "requests": selected,
         })
     }).collect();
 
