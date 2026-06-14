@@ -204,6 +204,9 @@ pub struct UpstreamConfig {
     /// Minimum key level required to use this upstream. Default 0. -1 = no restriction.
     #[serde(default)]
     pub min_key_level: i32,
+    /// Custom header overrides: header_name → value (Some = set/replace, None = delete).
+    #[serde(default)]
+    pub custom_headers: HashMap<String, Option<String>>,
 }
 
 impl Config {
