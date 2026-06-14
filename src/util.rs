@@ -50,7 +50,10 @@ pub fn json_ok<T: ?Sized + serde::Serialize>(v: &T) -> Response<Body> {
         .header("content-type", "application/json")
         .header("cache-control", "no-store")
         .body(Body::from(body))
-        .unwrap()
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "json_ok response builder failed");
+            json_error(http::StatusCode::INTERNAL_SERVER_ERROR, "response_build", "internal_error")
+        })
 }
 
 /// Read a hyper body with a byte limit. Returns error if the body exceeds `limit`.

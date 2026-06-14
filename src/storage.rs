@@ -87,7 +87,10 @@ impl KeyStore {
     pub fn get_key_usage(&self, key: &str) -> (u64, i64) {
         let tree = match self.open_key_usage_tree() {
             Ok(t) => t,
-            Err(_) => return (0, 0),
+            Err(e) => {
+                tracing::error!(error = %e, "get_key_usage: failed to open tree");
+                return (0, 0);
+            }
         };
         match tree.get(key.as_bytes()) {
             Ok(Some(v)) if v.len() == 16 => {
@@ -157,7 +160,10 @@ impl KeyStore {
     pub fn load_global_tokens(&self) -> (u64, u64, u64, u64) {
         let tree = match self.open_global_stats_tree() {
             Ok(t) => t,
-            Err(_) => return (0, 0, 0, 0),
+            Err(e) => {
+                tracing::error!(error = %e, "load_global_tokens: failed to open tree");
+                return (0, 0, 0, 0);
+            }
         };
         match tree.get(b"tokens") {
             Ok(Some(v)) if v.len() == 32 => {

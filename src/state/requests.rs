@@ -110,25 +110,25 @@ impl RequestsLog {
 
     fn push_entry(&self, entry: RequestLogEntry) {
         {
-            let mut entries = self.entries.lock().unwrap();
+            let Ok(mut entries) = self.entries.lock() else { return };
             entries.push_back(entry.clone());
             while entries.len() > self.cap {
                 entries.pop_front();
             }
         }
         {
-            let mut metrics = self.metrics.lock().unwrap();
+            let Ok(mut metrics) = self.metrics.lock() else { return };
             metrics.update(&entry);
         }
     }
 
     pub fn recent(&self, limit: usize) -> Vec<RequestLogEntry> {
-        let entries = self.entries.lock().unwrap();
+        let Ok(entries) = self.entries.lock() else { return vec![] };
         entries.iter().rev().take(limit).cloned().collect()
     }
 
     pub fn metrics_snapshot(&self, window: MetricsWindow) -> Vec<MetricsBucket> {
-        let metrics = self.metrics.lock().unwrap();
+        let Ok(metrics) = self.metrics.lock() else { return vec![] };
         metrics.snapshot(window)
     }
 
@@ -203,8 +203,8 @@ pub(super) fn update_bucket(
             failure: 0,
             ignored: 0,
         });
-    } else {
-        let last_start = buckets.back().unwrap().ts_ms;
+    } else if let Some(last) = buckets.back() {
+        let last_start = last.ts_ms;
         if bucket_start > last_start {
             let mut next_start = last_start.saturating_add(step_ms);
             while next_start <= bucket_start {

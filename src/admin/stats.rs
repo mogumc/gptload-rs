@@ -178,9 +178,15 @@ pub(crate) async fn api_requests_history(state: Arc<RouterState>, uri: &http::Ur
     let before: Option<u64> = query_get(uri, "before").and_then(|s| s.parse().ok());
 
     let path = state.requests_log_path.clone();
-    let items = tokio::task::spawn_blocking(move || {
+    let items = match tokio::task::spawn_blocking(move || {
         read_request_log_reverse(&path, limit, before)
-    }).await.unwrap_or_default();
+    }).await {
+        Ok(items) => items,
+        Err(e) => {
+            tracing::error!(error = %e, "request log reader task panicked");
+            vec![]
+        }
+    };
 
     super::json_ok(&serde_json::json!({
         "now_ms": now_ms(),
@@ -217,7 +223,10 @@ pub async fn prometheus_metrics(state: Arc<RouterState>) -> Response<Body> {
         .status(200)
         .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
         .body(Body::from(buf))
-        .unwrap()
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "prometheus response builder failed");
+            crate::util::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, "response_build", "internal_error")
+        })
 }
 
 /// Global metrics: uptime, requests, inflight, queue, responses, errors, latency, selection.

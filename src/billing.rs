@@ -260,9 +260,13 @@ fn flush_pending(tree: &sled::Tree, pending: &mut AHashMap<String, i64>) {
     }
     for (key, balance) in pending.drain() {
         let encoded = balance.to_le_bytes();
-        let _ = tree.insert(key.as_bytes(), &encoded);
+        if let Err(e) = tree.insert(key.as_bytes(), &encoded) {
+            tracing::error!(key, error = %e, "billing persist: tree.insert failed");
+        }
     }
-    let _ = tree.flush();
+    if let Err(e) = tree.flush() {
+        tracing::error!(error = %e, "billing persist: tree.flush failed");
+    }
 }
 
 /// Cost in micro-credits. Two modes:

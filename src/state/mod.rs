@@ -695,9 +695,11 @@ impl RouterState {
                 let cost = crate::billing::compute_credit_cost(
                     prompt, bill_out, billing_model, model_costs,
                 );
-                let _ = self.billing.settle_reserved_usage(
+                if self.billing.settle_reserved_usage(
                     billing_key, prompt, bill_out, billing_model, model_costs,
-                );
+                ).is_none() {
+                    tracing::error!(key = billing_key, "settle_reserved_usage failed: key not found");
+                }
                 let p = self.stats
                     .prompt_tokens_total
                     .fetch_add(prompt, Ordering::Relaxed) + prompt;
@@ -710,12 +712,18 @@ impl RouterState {
                 let tot = self.stats
                     .tokens_total
                     .fetch_add(total, Ordering::Relaxed) + total;
-                let _ = self.store.add_key_usage(billing_key, total, cost);
+                if let Err(e) = self.store.add_key_usage(billing_key, total, cost) {
+                    tracing::error!(key = billing_key, error = %e, "add_key_usage failed");
+                }
                 // Persist global token counters (sled caches tree handles, flush is cheap).
-                let _ = self.store.save_global_tokens(p, c, t, tot);
+                if let Err(e) = self.store.save_global_tokens(p, c, t, tot) {
+                    tracing::error!(error = %e, "save_global_tokens failed");
+                }
             }
             None if !is_billable || !is_2xx => {
-                let _ = self.billing.release_reservation(billing_key);
+                if self.billing.release_reservation(billing_key).is_none() {
+                    tracing::error!(key = billing_key, "release_reservation failed: key not found");
+                }
             }
             _ => {}
         }

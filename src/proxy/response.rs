@@ -396,7 +396,10 @@ async fn read_and_bill_body(
     let (out_bytes, was_decompressed) = if is_gzip {
         match decompress_gzip(&raw) {
             Ok(decompressed) => (decompressed, true),
-            Err(_) => (raw, false), // decompression failed, return raw as-is
+            Err(e) => {
+                tracing::warn!(error = %e, "gzip decompression failed, returning raw body");
+                (raw, false)
+            }
         }
     } else {
         (raw, false)

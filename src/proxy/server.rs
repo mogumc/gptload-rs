@@ -87,7 +87,10 @@ async fn handle_inner(
             .status(http::StatusCode::FOUND)
             .header(http::header::LOCATION, "/web/")
             .body(Body::empty())
-            .unwrap();
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "redirect response builder failed");
+                crate::util::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, "response_build", "internal_error")
+            });
     }
 
     // Prometheus metrics.
@@ -191,7 +194,10 @@ fn check_health(state: &Arc<RouterState>) -> Response<Body> {
         .status(200)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
-        .unwrap()
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "health check response builder failed");
+            crate::util::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, "response_build", "internal_error")
+        })
 }
 
 /// Authenticate a proxy request: proxy token → API key → balance check.

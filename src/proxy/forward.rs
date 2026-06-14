@@ -187,9 +187,14 @@ async fn execute_attempt(
             )
             .await)
         }
-        Ok(Err(_e)) => {
+        Ok(Err(e)) => {
             sel.key
                 .record_latency_ms(attempt_start.elapsed().as_millis() as u64);
+            tracing::debug!(
+                upstream = %sel.upstream.id,
+                error = %e,
+                "upstream request failed"
+            );
             state.on_network_error(sel, now);
 
             let model = log_ctx.model.as_deref().unwrap_or_default();

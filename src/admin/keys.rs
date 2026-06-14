@@ -426,7 +426,10 @@ pub(super) async fn api_export_keys(state: Arc<RouterState>, upstream_id: &str) 
         .header("content-type", "text/plain; charset=utf-8")
         .header("content-disposition", format!("attachment; filename=\"{}\"", filename))
         .body(Body::from(body))
-        .unwrap()
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "export keys response builder failed");
+            crate::util::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, "response_build", "internal_error")
+        })
 }
 
 async fn parse_keys_body(req: Request<Body>) -> Result<(Vec<String>, bool), String> {
