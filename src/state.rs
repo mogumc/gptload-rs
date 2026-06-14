@@ -169,6 +169,8 @@ pub struct Upstream {
     pub model_map: ahash::AHashMap<String, String>,
     /// Reverse: upstream model name → incoming model name (for /v1/models listing).
     pub model_rmap: ahash::AHashMap<String, String>,
+    /// Custom header overrides: header_name → value (Some = set/replace, None = delete).
+    pub custom_headers: ahash::AHashMap<String, Option<String>>,
 
     pub stats: UpstreamStats,
 }
@@ -1346,6 +1348,11 @@ fn parse_upstream(u: UpstreamConfig, weight: usize) -> anyhow::Result<Arc<Upstre
         model_rmap.insert(v.clone(), k.clone());
     }
 
+    let mut custom_headers = ahash::AHashMap::new();
+    for (k, v) in u.custom_headers.iter() {
+        custom_headers.insert(k.clone(), v.clone());
+    }
+
     let upstream = Upstream {
         id: Arc::<str>::from(u.id),
         base_url: Arc::<str>::from(u.base_url.clone()),
@@ -1365,6 +1372,7 @@ fn parse_upstream(u: UpstreamConfig, weight: usize) -> anyhow::Result<Arc<Upstre
         models: ArcSwap::from_pointee(AHashSet::new()),
         model_map,
         model_rmap,
+        custom_headers,
         stats: UpstreamStats::default(),
     };
 
@@ -1681,6 +1689,7 @@ impl RouterState {
                 proxy: u.proxy.clone(),
                 model_map: u.model_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                 min_key_level: u.min_key_level,
+                custom_headers: u.custom_headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             })
             .collect()
     }

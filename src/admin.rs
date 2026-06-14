@@ -188,6 +188,8 @@ struct UpstreamBody {
     model_map: Option<std::collections::HashMap<String, String>>,
     #[serde(default)]
     min_key_level: Option<i32>,
+    #[serde(default)]
+    custom_headers: Option<std::collections::HashMap<String, Option<String>>>,
 }
 
 #[derive(Deserialize)]
@@ -201,6 +203,8 @@ struct UpstreamUpdateBody {
     model_map: Option<std::collections::HashMap<String, String>>,
     #[serde(default)]
     min_key_level: Option<i32>,
+    #[serde(default)]
+    custom_headers: Option<std::collections::HashMap<String, Option<String>>>,
 }
 
 pub(crate) async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
@@ -249,6 +253,7 @@ pub(crate) async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>
         proxy: input.proxy.filter(|p| !p.trim().is_empty()),
         model_map: input.model_map.unwrap_or_default(),
         min_key_level: input.min_key_level.unwrap_or(0),
+        custom_headers: input.custom_headers.unwrap_or_default(),
     };
     let state2 = state.clone();
     let res = tokio::task::spawn_blocking(move || state2.add_upstream(cfg)).await;
@@ -317,6 +322,7 @@ async fn api_update_upstream(
         proxy: input.proxy.filter(|p| !p.trim().is_empty()),
         model_map: input.model_map.unwrap_or_default(),
         min_key_level: input.min_key_level.unwrap_or(0),
+        custom_headers: input.custom_headers.unwrap_or_default(),
     };
     let res = tokio::task::spawn_blocking(move || state2.update_upstream(&id, cfg)).await;
     match res {
@@ -365,6 +371,7 @@ pub(crate) struct UpstreamInfo {
     weight: usize,
     max_concurrent_per_key: u32,
     min_key_level: i32,
+    custom_headers: std::collections::HashMap<String, Option<String>>,
     keys_total: usize,
     keys_active: usize,
     keys_invalid: usize,
@@ -405,6 +412,7 @@ fn build_upstream_info(u: &crate::state::Upstream, global_max: u32) -> UpstreamI
         weight: u.weight,
         max_concurrent_per_key: effective_max,
         min_key_level: u.min_key_level,
+        custom_headers: u.custom_headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         keys_total: total,
         keys_active: total.saturating_sub(invalid),
         keys_invalid: invalid,

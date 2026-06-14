@@ -1134,6 +1134,30 @@ fn build_upstream_request(
         }
         AuthStyle::None => {}
     }
+    // Apply custom header overrides (skip protected auth headers).
+    if !sel.upstream.custom_headers.is_empty() {
+        for (name, val) in sel.upstream.custom_headers.iter() {
+            let lower = name.to_ascii_lowercase();
+            if lower == "authorization" || lower == "x-api-key" || lower == "anthropic-version" {
+                continue;
+            }
+            match val {
+                Some(v) => {
+                    if let (Ok(hn), Ok(hv)) = (
+                        http::header::HeaderName::from_bytes(lower.as_bytes()),
+                        http::HeaderValue::from_str(v),
+                    ) {
+                        out_req.headers_mut().insert(hn, hv);
+                    }
+                }
+                None => {
+                    if let Ok(hn) = http::header::HeaderName::from_bytes(lower.as_bytes()) {
+                        out_req.headers_mut().remove(hn);
+                    }
+                }
+            }
+        }
+    }
     if injected || !body_bytes.is_empty() {
         out_req.headers_mut().remove(CONTENT_LENGTH);
         if let Ok(v) = http::HeaderValue::from_str(&body_bytes.len().to_string()) {
