@@ -245,7 +245,7 @@ impl RouterState {
         if key_value.is_empty() {
             anyhow::bail!("key must not be empty");
         }
-        let key = build_key_states(vec![key_value.to_string()], None)?
+        let key = build_key_states(vec![key_value.to_string()])?
             .first()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("invalid key"))?;
@@ -409,7 +409,7 @@ pub(super) fn build_snapshot_from_configs(
         upstream_index.insert(u.id.to_string(), idx);
 
         let keys = store.load_all_keys(&u.id)?;
-        let key_states = build_key_states(keys, Some(store))?;
+        let key_states = build_key_states(keys)?;
         // active_keys starts as a copy of all keys (all active by default).
         let active = key_states.iter().cloned().collect::<Vec<_>>();
         u.keys.store(key_states);

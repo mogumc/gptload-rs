@@ -24,7 +24,7 @@ use hyper_rustls::HttpsConnectorBuilder;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -577,7 +577,7 @@ impl RouterState {
             let excluded_key = exclude
                 .and_then(|(upstream_id, key)| (upstream_id == u.id.as_ref()).then_some(key));
 
-            if let Some(k) = u.select_key(max, u.min_key_level, excluded_key) {
+            if let Some(k) = u.select_key(max, excluded_key) {
                 self.stats
                     .upstream_selected_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -638,20 +638,6 @@ pub(super) fn inc_status(stats: &UpstreamStats, status: http::StatusCode) {
 }
 
 impl RouterState {
-    /// Update the permission level for a key across all upstreams in memory.
-    /// Called after billing API sets the level in sled, to propagate to runtime KeyState.
-    pub fn update_key_level(&self, key: &str, level: i32) {
-        let snap = self.snapshot.load_full();
-        for upstream in snap.upstreams.iter() {
-            let all_keys = upstream.keys.load_full();
-            for k in all_keys.iter() {
-                if k.key.as_ref() == key {
-                    k.level.store(level, Ordering::Relaxed);
-                }
-            }
-        }
-    }
-
     /// Acquire admin write lock + upstream keys update lock in spawn_blocking, then run `f`.
     /// The upstream Arc is passed to the closure so it can mutate keys/rebuild_active_keys.
     /// Returns the nested result wrapped in tokio's JoinHandle result.

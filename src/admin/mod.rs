@@ -137,7 +137,7 @@ pub(crate) async fn api_reload_all(state: Arc<RouterState>) -> Response<Body> {
 
         let res = state.with_key_write_lock(u, move |u2| {
             let keys = store.load_all_keys(&id_clone)?;
-            let ks = build_key_states(keys, None)?;
+            let ks = build_key_states(keys)?;
             let n = ks.len();
             u2.keys.store(ks);
             u2.rebuild_active_keys();

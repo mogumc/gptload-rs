@@ -45,7 +45,7 @@ pub(super) async fn api_add_keys(
         let existed = add_res.existed;
 
         // Build new KeyState arcs only for inserted keys and append to in-memory list.
-        let inserted_states = build_key_states(add_res.inserted_keys, Some(&store))?;
+        let inserted_states = build_key_states(add_res.inserted_keys)?;
         let old = u2.keys.load_full();
         let mut merged: Vec<Arc<crate::state::KeyState>> =
             Vec::with_capacity(old.len() + inserted_states.len());
@@ -106,7 +106,7 @@ pub(super) async fn api_replace_keys(
 
     let res = state.with_key_write_lock(&upstream, move |u2| {
         store.replace_keys(&id, &keys)?;
-        let ks = build_key_states(keys, Some(&store))?;
+        let ks = build_key_states(keys)?;
         let n = ks.len();
         u2.keys.store(ks);
         u2.rebuild_active_keys();
