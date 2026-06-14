@@ -575,7 +575,6 @@ async fn api_billing_set_level(
     let res = tokio::task::spawn_blocking(move || store.set_key_level(&key_str, level)).await;
     match crate::util::spawn_result(res, http::StatusCode::BAD_REQUEST) {
         Ok(()) => {
-            state.update_key_level(key, level);
             crate::util::json_ok(&serde_json::json!({"ok": true, "key": key, "level": level}))
         }
         Err((status, msg)) => RouterState::json_error(status, &msg, if status.as_u16() >= 500 { "internal_error" } else { "bad_request" }),

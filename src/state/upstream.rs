@@ -40,8 +40,6 @@ pub struct KeyState {
     pub failure_count: AtomicU32,
     pub status: AtomicU8,
     pub active_requests: AtomicU32,
-    /// Permission level: higher = more access. -1 = admin (no restriction).
-    pub level: AtomicI32,
     /// Unix ms timestamp when the 429 cooldown expires. 0 = not in cooldown.
     pub cooldown_until_ms: AtomicU64,
     pub latencies_ms: Mutex<VecDeque<u64>>,
@@ -533,7 +531,7 @@ pub(super) fn parse_upstream(u: UpstreamConfig, weight: usize) -> anyhow::Result
     Ok(Arc::new(upstream))
 }
 
-pub fn build_key_states(keys: Vec<String>, store: Option<&crate::storage::KeyStore>) -> anyhow::Result<Arc<Vec<Arc<KeyState>>>> {
+pub fn build_key_states(keys: Vec<String>) -> anyhow::Result<Arc<Vec<Arc<KeyState>>>> {
     let mut out: Vec<Arc<KeyState>> = Vec::with_capacity(keys.len());
     for k in keys {
         let k = k.trim();
@@ -547,14 +545,12 @@ pub fn build_key_states(keys: Vec<String>, store: Option<&crate::storage::KeySto
         let key_arc: Arc<str> = Arc::<str>::from(k.to_string());
         let auth_header = hyper::header::HeaderValue::from_str(&format!("Bearer {}", key_arc))
             .map_err(|_| anyhow::anyhow!("invalid key (cannot be used in HTTP header)"))?;
-        let level = store.map(|s| s.get_key_level(k)).unwrap_or(0);
         out.push(Arc::new(KeyState {
             key: key_arc,
             auth_header,
             failure_count: AtomicU32::new(0),
             status: AtomicU8::new(KEY_STATUS_ACTIVE),
             active_requests: AtomicU32::new(0),
-            level: AtomicI32::new(level),
             cooldown_until_ms: AtomicU64::new(0),
             latencies_ms: Mutex::new(VecDeque::with_capacity(256)),
         }));
