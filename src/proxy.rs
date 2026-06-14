@@ -703,18 +703,20 @@ async fn forward(
 
     // Apply model mapping: incoming name → upstream internal name.
     // Save original name for cost calculation (map key is user-facing model).
+    let mut body_bytes = body_bytes;
     let billing_model = model.clone();
     if let Some(mapped) = sel.upstream.model_map.get(&model) {
         let mapped = mapped.clone();
         if let Some(ref mut json) = req_json {
             json["model"] = serde_json::Value::String(mapped.clone());
+            // Re-serialize body_bytes so the upstream receives the mapped model name.
+            body_bytes = bytes::Bytes::from(serde_json::to_vec(json).unwrap_or_else(|_| body_bytes.to_vec()));
         }
         log_ctx.model = Some(mapped.clone());
         model = mapped;
     }
     log_ctx.billing_model = Some(billing_model);
 
-    let mut body_bytes = body_bytes;
     let mut injected = false;
     if stream_request
         && is_chat_completions
