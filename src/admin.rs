@@ -61,13 +61,7 @@ pub(crate) async fn handle_upstream_subroutes(
         match *req.method() {
             Method::PUT => return api_update_upstream(req, state, upstream_id).await,
             Method::DELETE => return api_delete_upstream(req, state, upstream_id).await,
-            _ => {
-                return Response::builder()
-                    .status(405)
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"error":"method_not_allowed"}"#))
-                    .unwrap();
-            }
+            _ => return method_not_allowed(),
         }
     }
 
@@ -77,25 +71,21 @@ pub(crate) async fn handle_upstream_subroutes(
             if *req.method() == Method::POST {
                 return api_refresh_models(state, upstream_id).await;
             }
-            return Response::builder()
-                .status(405)
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"error":"method_not_allowed"}"#))
-                .unwrap();
+            return method_not_allowed();
         }
-        return Response::builder()
-            .status(404)
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"error":"not_found"}"#))
-            .unwrap();
+        return RouterState::json_error(
+            http::StatusCode::NOT_FOUND,
+            "not found",
+            "not_found",
+        );
     }
 
     if sub != "keys" {
-        return Response::builder()
-            .status(404)
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"error":"not_found"}"#))
-            .unwrap();
+        return RouterState::json_error(
+            http::StatusCode::NOT_FOUND,
+            "not found",
+            "not_found",
+        );
     }
 
     // Third segment selects a key sub-action: "" (CRUD), "release", "test", or "ban".
@@ -124,20 +114,20 @@ pub(crate) async fn handle_upstream_subroutes(
             Method::GET => api_export_keys(state, upstream_id).await,
             _ => method_not_allowed(),
         },
-        _ => Response::builder()
-            .status(404)
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"error":"not_found"}"#))
-            .unwrap(),
+        _ => RouterState::json_error(
+            http::StatusCode::NOT_FOUND,
+            "not found",
+            "not_found",
+        ),
     }
 }
 
 pub(crate) fn method_not_allowed() -> Response<Body> {
-    Response::builder()
-        .status(405)
-        .header("content-type", "application/json")
-        .body(Body::from(r#"{"error":"method_not_allowed"}"#))
-        .unwrap()
+    RouterState::json_error(
+        http::StatusCode::METHOD_NOT_ALLOWED,
+        "method not allowed",
+        "method_not_allowed",
+    )
 }
 
 pub(crate) async fn api_get_model_routes(state: Arc<RouterState>) -> Response<Body> {
@@ -178,7 +168,8 @@ async fn api_refresh_models(state: Arc<RouterState>, upstream_id: &str) -> Respo
 
 #[derive(Deserialize)]
 struct UpstreamBody {
-    id: String,
+    #[serde(default)]
+    id: Option<String>,
     base_url: String,
     weight: Option<usize>,
     max_concurrent_per_key: Option<u32>,
@@ -192,19 +183,54 @@ struct UpstreamBody {
     custom_headers: Option<std::collections::HashMap<String, Option<String>>>,
 }
 
-#[derive(Deserialize)]
-struct UpstreamUpdateBody {
-    base_url: String,
-    weight: Option<usize>,
-    max_concurrent_per_key: Option<u32>,
-    format: Option<UpstreamFormat>,
-    proxy: Option<String>,
-    #[serde(default)]
-    model_map: Option<std::collections::HashMap<String, String>>,
-    #[serde(default)]
-    min_key_level: Option<i32>,
-    #[serde(default)]
-    custom_headers: Option<std::collections::HashMap<String, Option<String>>>,
+impl UpstreamBody {
+    /// Validate common fields and build an UpstreamConfig.
+    /// Returns a structured error Response on validation failure.
+    fn into_upstream_config(
+        self,
+        id: String,
+    ) -> Result<UpstreamConfig, Response<Body>> {
+        if self.base_url.trim().is_empty() {
+            return Err(RouterState::json_error(
+                http::StatusCode::BAD_REQUEST,
+                "missing base_url",
+                "bad_request",
+            ));
+        }
+        if self.weight.unwrap_or(1) > 10_000 {
+            return Err(RouterState::json_error(
+                http::StatusCode::BAD_REQUEST,
+                "weight must be ≤ 10000",
+                "bad_request",
+            ));
+        }
+        if self.max_concurrent_per_key.unwrap_or(0) > 256 {
+            return Err(RouterState::json_error(
+                http::StatusCode::BAD_REQUEST,
+                "max_concurrent_per_key must be ≤ 256",
+                "bad_request",
+            ));
+        }
+        let min_level = self.min_key_level.unwrap_or(0);
+        if min_level < 0 && min_level != -1 {
+            return Err(RouterState::json_error(
+                http::StatusCode::BAD_REQUEST,
+                "min_key_level must be >= 0 or -1",
+                "bad_request",
+            ));
+        }
+        Ok(UpstreamConfig {
+            id,
+            base_url: self.base_url.trim().to_string(),
+            weight: self.weight,
+            max_concurrent_per_key: self.max_concurrent_per_key,
+            format: self.format,
+            proxy: self.proxy.filter(|p| !p.trim().is_empty()),
+            model_map: self.model_map.unwrap_or_default(),
+            min_key_level: min_level,
+            custom_headers: self.custom_headers.unwrap_or_default(),
+        })
+    }
 }
 
 pub(crate) async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
@@ -212,48 +238,13 @@ pub(crate) async fn api_add_upstream(req: Request<Body>, state: Arc<RouterState>
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    if input.id.trim().is_empty() {
+    if input.id.as_deref().unwrap_or("").trim().is_empty() {
         return RouterState::json_error(http::StatusCode::BAD_REQUEST, "missing id", "bad_request");
     }
-    if input.base_url.trim().is_empty() {
-        return RouterState::json_error(
-            http::StatusCode::BAD_REQUEST,
-            "missing base_url",
-            "bad_request",
-        );
-    }
-    if input.weight.unwrap_or(1) > 10_000 {
-        return RouterState::json_error(
-            http::StatusCode::BAD_REQUEST,
-            "weight must be ≤ 10000",
-            "bad_request",
-        );
-    }
-    if input.max_concurrent_per_key.unwrap_or(0) > 256 {
-        return RouterState::json_error(
-            http::StatusCode::BAD_REQUEST,
-            "max_concurrent_per_key must be ≤ 256",
-            "bad_request",
-        );
-    }
-    let min_level = input.min_key_level.unwrap_or(0);
-    if min_level < 0 && min_level != -1 {
-        return RouterState::json_error(
-            http::StatusCode::BAD_REQUEST,
-            "min_key_level must be >= 0 or -1",
-            "bad_request",
-        );
-    }
-    let cfg = UpstreamConfig {
-        id: input.id.trim().to_string(),
-        base_url: input.base_url.trim().to_string(),
-        weight: input.weight,
-        max_concurrent_per_key: input.max_concurrent_per_key,
-        format: input.format,
-        proxy: input.proxy.filter(|p| !p.trim().is_empty()),
-        model_map: input.model_map.unwrap_or_default(),
-        min_key_level: input.min_key_level.unwrap_or(0),
-        custom_headers: input.custom_headers.unwrap_or_default(),
+    let id = input.id.as_deref().unwrap_or("").trim().to_string();
+    let cfg = match input.into_upstream_config(id) {
+        Ok(cfg) => cfg,
+        Err(resp) => return resp,
     };
     let state2 = state.clone();
     let res = tokio::task::spawn_blocking(move || state2.add_upstream(cfg)).await;
@@ -278,52 +269,16 @@ async fn api_update_upstream(
     state: Arc<RouterState>,
     upstream_id: &str,
 ) -> Response<Body> {
-    let input: UpstreamUpdateBody = match parse_json_body(req).await {
+    let input: UpstreamBody = match parse_json_body(req).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    if input.base_url.trim().is_empty() {
-        return RouterState::json_error(
-            http::StatusCode::BAD_REQUEST,
-            "missing base_url",
-            "bad_request",
-        );
-    }
-    if input.weight.unwrap_or(1) > 10_000 {
-        return RouterState::json_error(
-            http::StatusCode::BAD_REQUEST,
-            "weight must be ≤ 10000",
-            "bad_request",
-        );
-    }
-    if input.max_concurrent_per_key.unwrap_or(0) > 256 {
-        return RouterState::json_error(
-            http::StatusCode::BAD_REQUEST,
-            "max_concurrent_per_key must be ≤ 256",
-            "bad_request",
-        );
-    }
-    let min_level = input.min_key_level.unwrap_or(0);
-    if min_level < 0 && min_level != -1 {
-        return RouterState::json_error(
-            http::StatusCode::BAD_REQUEST,
-            "min_key_level must be >= 0 or -1",
-            "bad_request",
-        );
-    }
-    let state2 = state.clone();
     let id = upstream_id.to_string();
-    let cfg = UpstreamConfig {
-        id: id.clone(),
-        base_url: input.base_url.trim().to_string(),
-        weight: input.weight,
-        max_concurrent_per_key: input.max_concurrent_per_key,
-        format: input.format,
-        proxy: input.proxy.filter(|p| !p.trim().is_empty()),
-        model_map: input.model_map.unwrap_or_default(),
-        min_key_level: input.min_key_level.unwrap_or(0),
-        custom_headers: input.custom_headers.unwrap_or_default(),
+    let cfg = match input.into_upstream_config(id.clone()) {
+        Ok(cfg) => cfg,
+        Err(resp) => return resp,
     };
+    let state2 = state.clone();
     let res = tokio::task::spawn_blocking(move || state2.update_upstream(&id, cfg)).await;
     match res {
         Ok(Ok(_)) => json_ok(&serde_json::json!({"ok": true})),

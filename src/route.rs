@@ -121,11 +121,11 @@ async fn handle_api(req: Request<Body>, state: Arc<RouterState>) -> Response<Bod
             if let Some(rest) = path.strip_prefix("/admin/api/v1/upstreams/") {
                 return admin::handle_upstream_subroutes(req, state, rest).await;
             }
-            Response::builder()
-                .status(404)
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"error":"not_found"}"#))
-                .unwrap()
+            RouterState::json_error(
+                http::StatusCode::NOT_FOUND,
+                "not found",
+                "not_found",
+            )
         }
     }
 }

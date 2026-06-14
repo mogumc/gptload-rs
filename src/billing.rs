@@ -369,11 +369,11 @@ pub(crate) async fn handle_billing_key_subroutes(
         };
     }
 
-    Response::builder()
-        .status(404)
-        .header("content-type", "application/json")
-        .body(Body::from(r#"{"error":"not_found"}"#))
-        .unwrap()
+    RouterState::json_error(
+        http::StatusCode::NOT_FOUND,
+        "not found",
+        "not_found",
+    )
 }
 
 pub(crate) async fn api_billing_list_keys(state: Arc<RouterState>) -> Response<Body> {
