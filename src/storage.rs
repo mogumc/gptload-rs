@@ -42,6 +42,10 @@ impl KeyStore {
         Ok(self.db.open_tree("key_usage")?)
     }
 
+    pub fn open_global_stats_tree(&self) -> anyhow::Result<sled::Tree> {
+        Ok(self.db.open_tree("global_stats")?)
+    }
+
     /// Get the permission level for a key. Default 0 if not set.
     pub fn get_key_level(&self, key: &str) -> i32 {
         let tree = match self.open_key_levels_tree() {
@@ -108,7 +112,7 @@ impl KeyStore {
         Ok(())
     }
 
-    /// Check and reset monthly usage if month changed.
+    /// Check and reset monthly usage if month changed. Also clears global token stats.
     pub fn check_monthly_reset(&self) -> anyhow::Result<()> {
         let tree = self.open_key_usage_tree()?;
         let now = std::time::SystemTime::now()
@@ -139,8 +143,45 @@ impl KeyStore {
             tree.clear()?;
             tree.insert(reset_key, &current_month.to_le_bytes())?;
             tree.flush()?;
+            // Also clear global token stats to keep both counters in sync.
+            if let Ok(gs) = self.open_global_stats_tree() {
+                let _ = gs.clear();
+                let _ = gs.flush();
+            }
             tracing::info!(last_month, current_month, "monthly key usage reset");
         }
+        Ok(())
+    }
+
+    /// Load global token counters from persistent storage. Returns (prompt, completion, thought, total).
+    pub fn load_global_tokens(&self) -> (u64, u64, u64, u64) {
+        let tree = match self.open_global_stats_tree() {
+            Ok(t) => t,
+            Err(_) => return (0, 0, 0, 0),
+        };
+        match tree.get(b"tokens") {
+            Ok(Some(v)) if v.len() == 32 => {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&v[0..8]);   let a = u64::from_le_bytes(buf);
+                buf.copy_from_slice(&v[8..16]);  let b = u64::from_le_bytes(buf);
+                buf.copy_from_slice(&v[16..24]); let c = u64::from_le_bytes(buf);
+                buf.copy_from_slice(&v[24..32]); let d = u64::from_le_bytes(buf);
+                (a, b, c, d)
+            }
+            _ => (0, 0, 0, 0),
+        }
+    }
+
+    /// Save global token counters to persistent storage.
+    pub fn save_global_tokens(&self, prompt: u64, completion: u64, thought: u64, total: u64) -> anyhow::Result<()> {
+        let tree = self.open_global_stats_tree()?;
+        let mut buf = Vec::with_capacity(32);
+        buf.extend_from_slice(&prompt.to_le_bytes());
+        buf.extend_from_slice(&completion.to_le_bytes());
+        buf.extend_from_slice(&thought.to_le_bytes());
+        buf.extend_from_slice(&total.to_le_bytes());
+        tree.insert(b"tokens", buf.as_slice())?;
+        tree.flush()?;
         Ok(())
     }
 

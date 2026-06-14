@@ -1,3 +1,6 @@
+use bytes::Bytes;
+use hyper::header::CONTENT_TYPE;
+use hyper::{Body, Response};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[inline]
@@ -6,6 +9,107 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[inline]
+pub fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+// ── Shared HTTP response builders ──
+
+/// Standardized JSON error response.
+/// Wire format: `{"error":{"message":"...","type":"proxy_error","param":null,"code":"..."}}`
+pub fn json_error(status: http::StatusCode, message: &str, code: &str) -> Response<Body> {
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "proxy_error",
+            "param": null,
+            "code": code
+        }
+    });
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap_or_else(|_| Response::new(Body::from("proxy_error")))
+}
+
+/// Standardized JSON success response with `cache-control: no-store`.
+pub fn json_ok<T: ?Sized + serde::Serialize>(v: &T) -> Response<Body> {
+    let body = match serde_json::to_vec(v) {
+        Ok(b) => b,
+        Err(_) => br#"{"error":"json"}"#.to_vec(),
+    };
+    Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .header("cache-control", "no-store")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// Read a hyper body with a byte limit. Returns error if the body exceeds `limit`.
+pub async fn read_body_limit(
+    mut req: hyper::Request<Body>,
+    limit: usize,
+) -> anyhow::Result<Bytes> {
+    use hyper::body::HttpBody;
+    let mut buf = Vec::new();
+    while let Some(chunk) = req.body_mut().data().await {
+        let chunk = chunk?;
+        if buf.len() + chunk.len() > limit {
+            anyhow::bail!("body too large (limit {} bytes)", limit);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(buf))
+}
+
+/// Read raw body bytes with a byte limit. Unlike `read_body_limit` (which takes
+/// a `Request`), this takes a bare `Body` — useful in proxy / response contexts.
+pub async fn read_body_bytes(mut body: Body, limit: usize) -> anyhow::Result<Bytes> {
+    use hyper::body::HttpBody;
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk?;
+        if buf.len() + chunk.len() > limit {
+            anyhow::bail!("body too large (limit {} bytes)", limit);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(buf))
+}
+
+// ── Async helpers ──
+
+/// Collapse a `Result<Result<T, E>, JoinError>` from `spawn_blocking` into
+/// `Result<T, (StatusCode, String)>` suitable for `?`-style error handling.
+///
+/// - Inner `Err(e)` (application error) → `(err_status, e.to_string())`
+/// - Outer `Err` (JoinError, task panicked) → `(500, "spawn_blocking failed")`
+pub fn spawn_result<T, E: std::fmt::Display>(
+    result: Result<Result<T, E>, tokio::task::JoinError>,
+    err_status: http::StatusCode,
+) -> Result<T, (http::StatusCode, String)> {
+    match result {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err((err_status, e.to_string())),
+        Err(_) => Err((
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            "spawn_blocking failed".to_string(),
+        )),
+    }
+}
+
+// ── URL encoding ──
+
+pub fn url_encode(s: &str) -> String {
+    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
 /// Very small query parser for `?a=b&c=d`.

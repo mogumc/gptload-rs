@@ -18,6 +18,16 @@ const MIN_COST_MICRO: i64 = 1;
 /// Reservation amount in micro-credits: 1 µcredit as a light gate.
 const RESERVE_MICRO: i64 = 1;
 
+/// Convert micro-credits to credits (f64). Preserves -1 as -1.0 for unlimited sentinel.
+#[inline]
+fn micro_to_credits(micro: i64) -> f64 {
+    if micro == -1 {
+        -1.0
+    } else {
+        micro as f64 / MICRO_PER_CREDIT as f64
+    }
+}
+
 pub struct BillingStore {
     balances: Arc<RwLock<AHashMap<String, Arc<AtomicI64>>>>,
     persist_tx: Sender<PersistUpdate>,
@@ -124,17 +134,27 @@ impl BillingStore {
         map.get(key).map(|v| v.load(Ordering::Relaxed))
     }
 
-    pub fn adjust_balance(&self, key: &str, delta: i64) -> Option<i64> {
+    /// Get a cloned reference to the balance atomic for lock-free operations.
+    fn get_balance_arc(&self, key: &str) -> Option<Arc<AtomicI64>> {
         let map = self.balances.read().ok()?;
-        let balance = map.get(key)?.clone();
-        drop(map);
+        map.get(key).cloned()
+    }
+
+    /// CAS update on a balance arc. Closure returns `Some(new_val)` to proceed, `None` to abort.
+    /// Returns `Some(new_val)` on success, `None` if aborted by closure (e.g., insufficient).
+    /// The -1 sentinel (unlimited) is returned as-is without modification.
+    fn cas_update(
+        &self,
+        key: &str,
+        balance: &Arc<AtomicI64>,
+        compute: impl Fn(i64) -> Option<i64>,
+    ) -> Option<i64> {
         let mut cur = balance.load(Ordering::Relaxed);
-        // -1 means unlimited, reject any adjustment to protect the sentinel
         if cur == -1 {
             return Some(-1);
         }
         loop {
-            let new_balance = cur.saturating_add(delta);
+            let new_balance = compute(cur)?;
             match balance.compare_exchange(cur, new_balance, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => {
                     let _ = self.persist_tx.send(PersistUpdate::Set {
@@ -148,40 +168,30 @@ impl BillingStore {
         }
     }
 
+    pub fn adjust_balance(&self, key: &str, delta: i64) -> Option<i64> {
+        let balance = self.get_balance_arc(key)?;
+        self.cas_update(key, &balance, |cur| Some(cur.saturating_add(delta)))
+    }
+
     pub fn reserve_request(&self, key: &str) -> ReserveResult {
-        let map = match self.balances.read() {
-            Ok(map) => map,
-            Err(_) => return ReserveResult::Missing,
-        };
-        let Some(balance) = map.get(key).cloned() else {
+        let Some(balance) = self.get_balance_arc(key) else {
             return ReserveResult::Missing;
         };
-        drop(map);
-
-        let mut cur = balance.load(Ordering::Relaxed);
-        // -1 means unlimited, always succeed without decrementing
-        if cur == -1 {
-            return ReserveResult::Reserved;
-        }
-        loop {
+        match self.cas_update(key, &balance, |cur| {
             if cur < RESERVE_MICRO {
-                return ReserveResult::Insufficient;
+                None
+            } else {
+                Some(cur.saturating_sub(RESERVE_MICRO))
             }
-            let new_balance = cur.saturating_sub(RESERVE_MICRO);
-            match balance.compare_exchange(cur, new_balance, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => {
-                    tracing::debug!(
-                        key, cur, new_balance,
-                        "billing: reserve key={key} {cur} → {new_balance}"
-                    );
-                    let _ = self.persist_tx.send(PersistUpdate::Set {
-                        key: key.to_string(),
-                        balance: new_balance,
-                    });
-                    return ReserveResult::Reserved;
-                }
-                Err(v) => cur = v,
+        }) {
+            Some(new_balance) => {
+                tracing::debug!(
+                    key, new_balance,
+                    "billing: reserve key={key} → {new_balance}"
+                );
+                ReserveResult::Reserved
             }
+            None => ReserveResult::Insufficient,
         }
     }
 
@@ -219,10 +229,7 @@ impl BillingStore {
         model: &str,
         model_costs: &ahash::AHashMap<String, crate::config::ModelCost>,
     ) -> Option<i64> {
-        let map = self.balances.read().ok()?;
-        let balance = map.get(key)?.clone();
-        drop(map);
-
+        let balance = self.get_balance_arc(key)?;
         let cost = compute_credit_cost(prompt_tokens, completion_tokens, model, model_costs);
 
         // Cost already covered by pre-deducted 1 µcredit.
@@ -231,30 +238,9 @@ impl BillingStore {
         }
 
         let extra = cost - RESERVE_MICRO;
-        let mut cur = balance.load(Ordering::Relaxed);
-        // -1 means unlimited
-        if cur == -1 {
-            return Some(-1);
-        }
-        loop {
-            let new_balance = cur.saturating_sub(extra);
-            // Clamp to 0 — next request will get 401 insufficient balance.
-            let clamped = if new_balance < 0 { 0 } else { new_balance };
-            match balance.compare_exchange(cur, clamped, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => {
-                    tracing::debug!(
-                        key, cur, clamped, cost, extra,
-                        "billing: settle key={key} cost={cost} extra={extra} {cur} → {clamped}"
-                    );
-                    let _ = self.persist_tx.send(PersistUpdate::Set {
-                        key: key.to_string(),
-                        balance: clamped,
-                    });
-                    return Some(clamped);
-                }
-                Err(v) => cur = v,
-            }
-        }
+        self.cas_update(key, &balance, |cur| {
+            Some(cur.saturating_sub(extra).max(0))
+        })
     }
 }
 
@@ -348,7 +334,7 @@ pub(crate) async fn handle_billing_key_subroutes(
 
     if action.is_empty() {
         return match *req.method() {
-            Method::GET => api_billing_get_balance(state, key).await,
+            Method::GET => api_billing_get_key_info(state, key).await,
             Method::DELETE => api_billing_delete_key(state, key).await,
             _ => crate::admin::method_not_allowed(),
         };
@@ -363,7 +349,7 @@ pub(crate) async fn handle_billing_key_subroutes(
 
     if action == "level" {
         return match *req.method() {
-            Method::GET => api_billing_get_level(state, key).await,
+            Method::GET => api_billing_get_key_info(state, key).await,
             Method::POST => api_billing_set_level(req, state, key).await,
             _ => crate::admin::method_not_allowed(),
         };
@@ -384,12 +370,12 @@ pub(crate) async fn api_billing_list_keys(state: Arc<RouterState>) -> Response<B
             let level = state.store.get_key_level(&key);
             serde_json::json!({
                 "key": key,
-                "balance": if balance == -1 { -1.0_f64 } else { balance as f64 / MICRO_PER_CREDIT as f64 },
+                "balance": micro_to_credits(balance),
                 "level": level
             })
         })
         .collect();
-    crate::admin::json_ok(&serde_json::json!({ "keys": items }))
+    crate::util::json_ok(&serde_json::json!({ "keys": items }))
 }
 
 pub(crate) async fn api_billing_overview(state: Arc<RouterState>) -> Response<Body> {
@@ -419,7 +405,13 @@ pub(crate) async fn api_billing_overview(state: Arc<RouterState>) -> Response<Bo
     let model_costs: serde_json::Value = rt
         .model_costs
         .iter()
-        .map(|(m, c)| serde_json::json!({ "model": m, "input": c.input, "output": c.output }))
+        .map(|(m, c)| {
+            let mut v = serde_json::json!({ "model": m, "input": c.input, "output": c.output });
+            if let Some(pr) = c.per_request {
+                v["per_request"] = serde_json::json!(pr);
+            }
+            v
+        })
         .collect();
 
     let snap = state.snapshot.load_full();
@@ -447,22 +439,22 @@ pub(crate) async fn api_billing_overview(state: Arc<RouterState>) -> Response<Bo
             key_usages.push(serde_json::json!({
                 "key": key,
                 "tokens": tokens,
-                "credits": credits as f64 / MICRO_PER_CREDIT as f64
+                "credits": micro_to_credits(credits)
             }));
         }
 
-        crate::admin::json_ok(&serde_json::json!({
+        crate::util::json_ok(&serde_json::json!({
         "billing": {
             "total_keys": total_keys,
             "unlimited_keys": unlimited_count,
             "active_keys": total_keys - unlimited_count - zero_or_less,
             "exhausted_keys": zero_or_less,
-            "total_balance": total_balance as f64 / MICRO_PER_CREDIT as f64,
+            "total_balance": micro_to_credits(total_balance),
         },
         "model_costs": model_costs,
         "usage": {
             "tokens": platform_tokens,
-            "credits": platform_credits as f64 / MICRO_PER_CREDIT as f64,
+            "credits": micro_to_credits(platform_credits),
         },
         "key_usage": key_usages,
         "upstreams": upstream_summary,
@@ -517,21 +509,25 @@ pub(crate) async fn api_billing_create_key(req: Request<Body>, state: Arc<Router
             "key_exists",
         );
     }
-    crate::admin::json_ok(&serde_json::json!({
+    crate::util::json_ok(&serde_json::json!({
         "key": key,
         "balance": balance_credits,
         "created": true
     }))
 }
 
-async fn api_billing_get_balance(state: Arc<RouterState>, key: &str) -> Response<Body> {
-    match state.billing.get_balance(key) {
+async fn api_billing_get_key_info(state: Arc<RouterState>, key: &str) -> Response<Body> {
+    let balance = state.billing.get_balance(key);
+    let level = state.store.get_key_level(key);
+    let (tokens, credits) = state.store.get_key_usage(key);
+    match balance {
         Some(balance) => {
-            let credits = if balance == -1 { -1.0 } else { balance as f64 / MICRO_PER_CREDIT as f64 };
-            crate::admin::json_ok(&serde_json::json!({
+            crate::util::json_ok(&serde_json::json!({
                 "key": key,
-                "balance": credits,
+                "balance": micro_to_credits(balance),
                 "balance_micro": balance,
+                "level": level,
+                "usage": { "tokens": tokens, "credits": micro_to_credits(credits) }
             }))
         }
         None => RouterState::json_error(
@@ -540,11 +536,6 @@ async fn api_billing_get_balance(state: Arc<RouterState>, key: &str) -> Response
             "key_not_found",
         ),
     }
-}
-
-async fn api_billing_get_level(state: Arc<RouterState>, key: &str) -> Response<Body> {
-    let level = state.store.get_key_level(key);
-    crate::admin::json_ok(&serde_json::json!({"key": key, "level": level}))
 }
 
 async fn api_billing_set_level(
@@ -576,24 +567,18 @@ async fn api_billing_set_level(
     let key_str = key.to_string();
     let store = state.store.clone();
     let res = tokio::task::spawn_blocking(move || store.set_key_level(&key_str, level)).await;
-    match res {
-        Ok(Ok(())) => crate::admin::json_ok(&serde_json::json!({"ok": true, "key": key, "level": level})),
-        Ok(Err(e)) => RouterState::json_error(
-            http::StatusCode::BAD_REQUEST,
-            &e.to_string(),
-            "bad_request",
-        ),
-        Err(_) => RouterState::json_error(
-            http::StatusCode::INTERNAL_SERVER_ERROR,
-            "spawn_blocking failed",
-            "internal_error",
-        ),
+    match crate::util::spawn_result(res, http::StatusCode::BAD_REQUEST) {
+        Ok(()) => {
+            state.update_key_level(key, level);
+            crate::util::json_ok(&serde_json::json!({"ok": true, "key": key, "level": level}))
+        }
+        Err((status, msg)) => RouterState::json_error(status, &msg, if status.as_u16() >= 500 { "internal_error" } else { "bad_request" }),
     }
 }
 
 async fn api_billing_delete_key(state: Arc<RouterState>, key: &str) -> Response<Body> {
     match state.billing.delete_key(key) {
-        Ok(true) => crate::admin::json_ok(&serde_json::json!({
+        Ok(true) => crate::util::json_ok(&serde_json::json!({
             "deleted": true,
             "key": key
         })),
@@ -615,7 +600,7 @@ async fn api_billing_adjust_balance(
     state: Arc<RouterState>,
     key: &str,
 ) -> Response<Body> {
-    let body = match crate::admin::read_body_limit(req, 256 * 1024).await {
+    let body = match crate::util::read_body_limit(req, 256 * 1024).await {
         Ok(b) => b,
         Err(e) => {
             return RouterState::json_error(
@@ -647,8 +632,7 @@ async fn api_billing_adjust_balance(
 
     match state.billing.adjust_balance(key, payload.delta.saturating_mul(MICRO_PER_CREDIT)) {
         Some(balance) => {
-            let credits = if balance == -1 { -1.0 } else { balance as f64 / MICRO_PER_CREDIT as f64 };
-            crate::admin::json_ok(&serde_json::json!({ "key": key, "delta": payload.delta, "balance": credits }))
+            crate::util::json_ok(&serde_json::json!({ "key": key, "delta": payload.delta, "balance": micro_to_credits(balance) }))
         }
         None => RouterState::json_error(
             http::StatusCode::NOT_FOUND,
