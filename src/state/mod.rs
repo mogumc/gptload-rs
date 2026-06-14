@@ -577,7 +577,7 @@ impl RouterState {
             let excluded_key = exclude
                 .and_then(|(upstream_id, key)| (upstream_id == u.id.as_ref()).then_some(key));
 
-            if let Some(k) = u.select_key(max, u.min_key_level, excluded_key) {
+            if let Some(k) = u.select_key(max, excluded_key) {
                 self.stats
                     .upstream_selected_total
                     .fetch_add(1, Ordering::Relaxed);
