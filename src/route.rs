@@ -42,8 +42,15 @@ pub async fn handle_admin(req: Request<Body>, state: Arc<RouterState>) -> Respon
     let path = req.uri().path();
 
     // Serve static files from /web/ (no auth — SPA handles token input).
+    if req.method() == Method::GET && path == "/web" {
+        return Response::builder()
+            .status(http::StatusCode::MOVED_PERMANENTLY)
+            .header(http::header::LOCATION, "/web/")
+            .body(Body::empty())
+            .unwrap();
+    }
     let is_web = req.method() == Method::GET
-        && (path == "/web" || path == "/web/" || path.starts_with("/web/"));
+        && (path == "/web/" || path.starts_with("/web/"));
     if is_web {
         let file = path.strip_prefix("/web").unwrap_or("");
         let file = file.strip_prefix('/').unwrap_or("");
