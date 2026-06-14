@@ -42,8 +42,18 @@ pub async fn handle_admin(req: Request<Body>, state: Arc<RouterState>) -> Respon
     let path = req.uri().path();
 
     // Serve static files from /web/ (no auth — SPA handles token input).
+    if req.method() == Method::GET && path == "/web" {
+        return Response::builder()
+            .status(http::StatusCode::MOVED_PERMANENTLY)
+            .header(http::header::LOCATION, "/web/")
+            .body(Body::empty())
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "redirect response builder failed");
+                RouterState::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, "response_build", "internal_error")
+            });
+    }
     let is_web = req.method() == Method::GET
-        && (path == "/web" || path == "/web/" || path.starts_with("/web/"));
+        && (path == "/web/" || path.starts_with("/web/"));
     if is_web {
         let file = path.strip_prefix("/web").unwrap_or("");
         let file = file.strip_prefix('/').unwrap_or("");
@@ -56,7 +66,10 @@ pub async fn handle_admin(req: Request<Body>, state: Arc<RouterState>) -> Respon
                 .header("content-type", content_type)
                 .header("cache-control", cache_control)
                 .body(Body::from(asset.data.as_ref().to_vec()))
-                .unwrap();
+                .unwrap_or_else(|e| {
+                    tracing::error!(error = %e, "static file response builder failed");
+                    RouterState::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, "response_build", "internal_error")
+                });
         }
 
         // File not found in dist
@@ -64,7 +77,10 @@ pub async fn handle_admin(req: Request<Body>, state: Arc<RouterState>) -> Respon
             .status(404)
             .header("content-type", "text/plain; charset=utf-8")
             .body(Body::from("404 Not Found"))
-            .unwrap();
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "404 response builder failed");
+                RouterState::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, "response_build", "internal_error")
+            });
     }
 
     // API
@@ -76,7 +92,10 @@ pub async fn handle_admin(req: Request<Body>, state: Arc<RouterState>) -> Respon
         .status(404)
         .header("content-type", "text/plain; charset=utf-8")
         .body(Body::from("not found"))
-        .unwrap()
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "404 fallback builder failed");
+            RouterState::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, "response_build", "internal_error")
+        })
 }
 
 async fn handle_api(req: Request<Body>, state: Arc<RouterState>) -> Response<Body> {
@@ -121,11 +140,11 @@ async fn handle_api(req: Request<Body>, state: Arc<RouterState>) -> Response<Bod
             if let Some(rest) = path.strip_prefix("/admin/api/v1/upstreams/") {
                 return admin::handle_upstream_subroutes(req, state, rest).await;
             }
-            Response::builder()
-                .status(404)
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"error":"not_found"}"#))
-                .unwrap()
+            RouterState::json_error(
+                http::StatusCode::NOT_FOUND,
+                "not found",
+                "not_found",
+            )
         }
     }
 }
@@ -170,7 +189,10 @@ async fn stats_stream(state: Arc<RouterState>) -> Response<Body> {
         .header("cache-control", "no-cache")
         .header("connection", "keep-alive")
         .body(Body::wrap_stream(ReceiverStream::new(rx)))
-        .unwrap()
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "stats SSE response builder failed");
+            RouterState::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, "response_build", "internal_error")
+        })
 }
 
 async fn requests_stream(state: Arc<RouterState>) -> Response<Body> {
@@ -200,5 +222,8 @@ async fn requests_stream(state: Arc<RouterState>) -> Response<Body> {
         .header("cache-control", "no-cache")
         .header("connection", "keep-alive")
         .body(Body::wrap_stream(ReceiverStream::new(rx)))
-        .unwrap()
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "requests SSE response builder failed");
+            RouterState::json_error(http::StatusCode::INTERNAL_SERVER_ERROR, "response_build", "internal_error")
+        })
 }
